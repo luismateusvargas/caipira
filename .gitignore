@@ -1,0 +1,8 @@
+database/*
+logs/
+node_modules
+node22
+test
+models/*
+experiments/*
+data.db*
