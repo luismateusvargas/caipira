@@ -5,7 +5,7 @@
 
 const { MemoryStore } = require('./store');
 const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces } = require('./workspace');
-const { FactStore } = require('./facts');
+const { FactStore, searchWorkspaces } = require('./facts');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -256,13 +256,18 @@ async function handle(msg) {
           },
           {
             name: 'search_facts',
-            description: 'Search durable facts for this workspace, ranked by trust (relevance x still-true). Prefer this over `search` when you need what was decided rather than what happened. Results carry evidence_status: a fact whose files changed is flagged and ranked down.',
+            description: 'Search durable facts, ranked by trust (relevance x still-true). Prefer this over `search` when you need what was decided rather than what happened. Results carry evidence_status: a fact whose files changed is flagged and ranked down. Defaults to this workspace; pass scope="all" to search every registered workspace when the current one has no answer and another project likely solved the same problem.',
             inputSchema: {
               type: 'object',
               properties: {
                 query: { type: 'string' },
                 limit: { type: 'number', default: 10 },
                 include_stale: { type: 'boolean', description: 'Include facts needing review (default true)' },
+                scope: {
+                  type: 'string',
+                  enum: ['workspace', 'all'],
+                  description: 'workspace (default) searches only here. "all" searches every registered workspace; each result carries the workspace it came from. Facts from another workspace were settled against a different codebase — treat them as precedent to check, not as settled truth here.'
+                },
                 cwd: { type: 'string' }
               },
               required: ['query']
@@ -359,15 +364,35 @@ async function handleToolCall(id, params) {
         const states = args.include_stale === false
           ? ['active']
           : ['active', 'needs_review', 'proposed'];
-        const hits = facts.search(args.query, { limit: args.limit || 10, states });
+        const limit = args.limit || 10;
+
+        const render = fact => ({
+          id: fact.id, kind: fact.kind, title: fact.title, summary: fact.summary, body: fact.body,
+          state: fact.state, trust: Number(fact.trust.toFixed(3)),
+          updated_at: fact.updated_at, updated_by: fact.updated_by,
+          stale_files: fact.evidence_status.changedPaths,
+          ...(fact.workspace ? { workspace: fact.workspace } : {})
+        });
+
+        if (args.scope === 'all') {
+          const hits = searchWorkspaces(args.query, { limit, states, machine: machineId(), agent: 'mcp' });
+          const local = hits.filter(f => f.workspace_id === workspace.id).length;
+          result = { content: [{ type: 'text', text: JSON.stringify({
+            scope: 'all',
+            workspace: workspace.root,
+            searched_workspaces: listWorkspaces().length,
+            note: local === hits.length
+              ? undefined
+              : 'Results marked with a different workspace were settled against another codebase. Treat them as precedent worth checking here, not as facts about this project.',
+            facts: hits.map(render)
+          }) }] };
+          break;
+        }
+
+        const hits = facts.search(args.query, { limit, states });
         result = { content: [{ type: 'text', text: JSON.stringify({
           workspace: workspace.root,
-          facts: hits.map(f => ({
-            id: f.id, kind: f.kind, title: f.title, summary: f.summary, body: f.body,
-            state: f.state, trust: Number(f.trust.toFixed(3)),
-            updated_at: f.updated_at, updated_by: f.updated_by,
-            stale_files: f.evidence_status.changedPaths
-          }))
+          facts: hits.map(render)
         }) }] };
         break;
       }

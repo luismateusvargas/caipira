@@ -362,7 +362,63 @@ class FactStore {
   }
 }
 
+// ── cross-workspace recall ──
+//
+// Explicitly requested, never injected. Facts from another project are borrowed
+// context: they were settled against a codebase that is not this one, so they
+// can inform an answer but must never silently become a premise. Every result
+// is therefore tagged with the workspace it came from.
+//
+// Ranking note: each workspace has its own FTS index, so bm25 is relative to
+// that workspace's corpus and scores are NOT comparable between them. ATTACH
+// would not fix this — an attached database keeps its own index and its own
+// statistics. So results are fused by rank, not by score: a workspace's top hit
+// is worth the same as any other workspace's top hit, and trust breaks ties.
+const RRF_K = 60;
+
+function searchWorkspaces(query, opts = {}) {
+  const { listWorkspaces, openWorkspaceDb } = require('./workspace');
+  const machine = opts.machine;
+  const limit = opts.limit || 10;
+  const perWorkspace = opts.perWorkspace || Math.max(limit, 5);
+  const skip = (opts.skipKeys || []).map(k => String(k).toLowerCase());
+
+  const fused = [];
+  for (const row of listWorkspaces()) {
+    if (skip.includes(String(row.canonical_key).toLowerCase())) continue;
+    // A registry row whose database is gone is not an error worth failing the
+    // whole search over — prune removes these, but a search must not depend on
+    // prune having been run.
+    if (!fs.existsSync(row.db_file)) continue;
+
+    let db = null;
+    try {
+      db = openWorkspaceDb(row.db_file);
+      const store = new FactStore(db, { machine, agent: opts.agent || 'search' });
+      const hits = store.search(query, { limit: perWorkspace, states: opts.states });
+      hits.forEach((fact, index) => {
+        fused.push({
+          ...fact,
+          workspace: row.root_path || row.label || row.canonical_key,
+          workspace_id: row.id,
+          workspace_label: row.label,
+          rank_in_workspace: index + 1,
+          rrf: 1 / (RRF_K + index + 1)
+        });
+      });
+    } catch {
+      // A corrupt or locked workspace database must not take the others down.
+    } finally {
+      if (db) { try { db.close(); } catch {} }
+    }
+  }
+
+  return fused
+    .sort((a, b) => (b.rrf * b.trust) - (a.rrf * a.trust) || b.trust - a.trust)
+    .slice(0, limit);
+}
+
 module.exports = {
   FactStore, fingerprint, hashFile, trustScore, buildMatch, termForms,
-  VALID_KINDS, VALID_STATES
+  searchWorkspaces, RRF_K, VALID_KINDS, VALID_STATES
 };
