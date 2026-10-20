@@ -30,6 +30,7 @@ check('uses hookSpecificOutput', Boolean(ctx), JSON.stringify(r).slice(0, 120));
 check('hookEventName correct', r.hookSpecificOutput.hookEventName === 'SessionStart');
 check('keeps caipira startup instruction', ctx.includes('shared local-first cross-agent memory'));
 check('keeps madar instruction', ctx.includes('Madar'));
+check('madar graph path is portable', ctx.includes('<project-root>/out/graph.json'));
 
 // The write half of the contract. Nothing used to name these, so memory only
 // grew when the user asked for it — a fact the agent is never told to record
@@ -98,7 +99,7 @@ const leaked = ldb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id
 check('nothing leaked into legacy data.db', leaked === 0, leaked);
 ldb.close();
 
-console.log('\nN. a write to a fact\'s evidence flags that fact, in-session');
+console.log('\n8. a write to a fact\'s evidence flags that fact, in-session');
 {
   const fs2 = require('fs');
   const { openWorkspaceDb, machineId } = require(ROOT + '/workspace.js');
@@ -157,6 +158,138 @@ console.log('\nN. a write to a fact\'s evidence flags that fact, in-session');
   fdb.close();
   fs2.rmSync(file, { force: true });
 }
+
+// Each drift scenario gets its own workspace holding one fact on one evidence
+// file, so every case starts from a known-active fact.
+const fs = require('fs'), os = require('os'), path = require('path');
+const { openWorkspaceDb, machineId } = require(ROOT + '/workspace.js');
+const { FactStore } = require(ROOT + '/facts.js');
+const probes = [];
+
+function driftProbe(name) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hookdrift-' + name + '-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  fs.mkdirSync(path.join(dir, 'src'));
+  const file = path.join(dir, 'src', 'config.js');
+  fs.writeFileSync(file, 'const PORT = 3000;\n');
+  const info = ensureWorkspace(dir);
+  const db = openWorkspaceDb(info.dbFile);
+  try {
+    const id = new FactStore(db, { machine: machineId(), agent: 'test' }).record({
+      kind: 'decision', title: 'port probe', summary: 'The dev server listens on port 3000.',
+      body: 'the port is 3000', evidence: [file]
+    });
+    const probe = { dir, file, id, dbFile: info.dbFile };
+    probes.push(probe);
+    return probe;
+  } finally {
+    db.close();
+  }
+}
+
+// A different size, so the change is caught even within one mtime tick.
+const editEvidence = probe => fs.writeFileSync(probe.file, 'const PORT = 8080; // moved\n');
+
+function factState(probe) {
+  const db = new D(probe.dbFile, { readonly: true });
+  try { return db.prepare('SELECT state FROM facts WHERE id = ?').get(probe.id).state; }
+  finally { db.close(); }
+}
+
+function sessionRow(dbFile, id) {
+  const db = new D(dbFile, { readonly: true });
+  try { return db.prepare('SELECT * FROM sessions WHERE id = ?').get(id); }
+  finally { db.close(); }
+}
+
+console.log('\n9. Antigravity and Codex writes flag drift too');
+{
+  const cases = [
+    ['antigravity edit_file, absolute Path', probe => run('antigravity', 'post-tool-use', {
+      conversationId: 'hooktest-agy-drift', workspacePaths: [probe.dir],
+      toolName: 'edit_file', toolCall: { name: 'edit_file', args: { Path: probe.file } }
+    })],
+    ['antigravity edit_file, Path relative to cwd', probe => run('antigravity', 'post-tool-use', {
+      conversationId: 'hooktest-agy-drift', cwd: probe.dir,
+      toolName: 'edit_file', toolCall: { args: { Path: 'src/config.js' } }
+    })],
+    ['codex apply_patch, absolute path', probe => run('codex', 'PostToolUse', {
+      session_id: 'hooktest-codex-drift', cwd: probe.dir, tool_name: 'apply_patch',
+      tool_input: '*** Begin Patch\n*** Update File: ' + probe.file + '\n@@\n-const PORT = 3000;\n+const PORT = 8080;\n*** End Patch\n'
+    })],
+    ['codex apply_patch, path relative to cwd', probe => run('codex', 'PostToolUse', {
+      session_id: 'hooktest-codex-drift', cwd: probe.dir, tool_name: 'apply_patch',
+      tool_input: '*** Begin Patch\n*** Update File: src/config.js\n@@\n-const PORT = 3000;\n+const PORT = 8080;\n*** End Patch\n'
+    })]
+  ];
+  for (const [label, send] of cases) {
+    const probe = driftProbe('write');
+    editEvidence(probe);
+    const response = send(probe);
+    check(label + ' flags the fact', factState(probe) === 'needs_review', factState(probe));
+    check(label + ' still acks with {}', JSON.stringify(response) === '{}', JSON.stringify(response));
+  }
+}
+
+console.log('\n10. edits made between sessions are caught at session start');
+{
+  const starts = [
+    ['claude-code SessionStart', probe => {
+      const r = run('claude-code', 'SessionStart', { session_id: 'hooktest-between-cc', cwd: probe.dir });
+      return r.hookSpecificOutput && r.hookSpecificOutput.additionalContext;
+    }],
+    ['codex SessionStart', probe => {
+      const r = run('codex', 'SessionStart', { session_id: 'hooktest-between-codex', cwd: probe.dir });
+      return r.hookSpecificOutput && r.hookSpecificOutput.additionalContext;
+    }],
+    ['antigravity pre-invocation #0', probe => {
+      const r = run('antigravity', 'pre-invocation', { conversationId: 'hooktest-between-agy', workspacePaths: [probe.dir], invocationNum: 0 });
+      return (r.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+    }]
+  ];
+  for (const [label, start] of starts) {
+    const probe = driftProbe('between');
+    editEvidence(probe);
+    const text = start(probe) || '';
+    const tag = 'decision#' + probe.id + ']';
+    check(label + ' marks the fact NEEDS REVIEW', text.includes(tag) && /NEEDS REVIEW/.test(text.split(tag)[1] || ''),
+      text.slice(0, 160));
+    check(label + ' carries the drift notice', text.includes('whose evidence changed') && text.includes('changed: config.js'),
+      text.slice(-200));
+  }
+}
+
+console.log('\n11. Antigravity injects standing facts once per conversation');
+r = run('antigravity', 'pre-invocation', { conversationId: 'hooktest-agy', workspacePaths: [WS], invocationNum: 1 });
+check('later invocation without a prompt returns {}', JSON.stringify(r) === '{}', JSON.stringify(r).slice(0, 140));
+r = run('antigravity', 'pre-invocation', {
+  conversationId: 'hooktest-agy', workspacePaths: [WS], invocationNum: 1,
+  prompt: 'how do I wire codex over to caipira and drop cavemem?'
+});
+let steps = JSON.stringify(r);
+check('later invocation with a prompt recalls facts', steps.includes('Caipira recalled') && steps.includes('cavemem'), steps.slice(0, 140));
+check('...without repeating standing facts', !steps.includes('standing facts'), steps.slice(0, 140));
+r = run('antigravity', 'pre-invocation', {
+  conversationId: 'hooktest-agy', workspacePaths: [WS], invocationNum: 2,
+  userPrompt: 'why did we pick per workspace databases for sqlite?'
+});
+steps = JSON.stringify(r);
+check('userPrompt is recalled as well', steps.includes('Caipira recalled'), steps.slice(0, 140));
+
+console.log('\n12. session lifecycle is recorded for every client');
+r = run('codex', 'session-end', { session_id: 'hooktest-codex-end', cwd: WS });
+let row = sessionRow(wsInfo.dbFile, 'hooktest-codex-end');
+check('codex session-end sets ended_at', Boolean(row && row.ended_at), JSON.stringify(row));
+check('codex session-end acks with {}', JSON.stringify(r) === '{}', JSON.stringify(r));
+run('claude-code', 'SessionEnd', { session_id: 'hooktest-cc-end', cwd: WS });
+row = sessionRow(wsInfo.dbFile, 'hooktest-cc-end');
+check('SessionEnd alias closes the session', Boolean(row && row.ended_at), JSON.stringify(row));
+
+run('codex', 'PostToolUse', { session_id: 'hooktest-midstream', cwd: WS, tool_name: 'Read', tool_input: { file_path: 'x' } });
+row = sessionRow(wsInfo.dbFile, 'hooktest-midstream');
+check('a session first seen mid-stream records client and cwd', row && row.ide === 'codex' && row.cwd === WS, JSON.stringify(row));
+
+for (const probe of probes) fs.rmSync(probe.dir, { recursive: true, force: true });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

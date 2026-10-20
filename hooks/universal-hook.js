@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { MemoryStore } = require('../store');
-const { ensureWorkspace, openWorkspaceDb, machineId } = require('../workspace');
+const { ensureWorkspace, machineId } = require('../workspace');
 const { buildPromptInjection, buildStandingInjection, buildDriftNotice } = require('../inject');
 const { FactStore } = require('../facts');
 
@@ -36,7 +36,9 @@ const EVENT_ALIASES = new Map([
   ['post-invocation', 'post-invocation'],
   ['PostInvocation', 'post-invocation'],
   ['stop', 'stop'],
-  ['Stop', 'stop']
+  ['Stop', 'stop'],
+  ['session-end', 'session-end'],
+  ['SessionEnd', 'session-end']
 ]);
 
 const CAIPIRA_STARTUP_INSTRUCTION = [
@@ -61,7 +63,7 @@ const CAIPIRA_STARTUP_INSTRUCTION = [
 const MADAR_STARTUP_INSTRUCTION = [
   `Madar is the global local AST code-graph executable at ${resolveMadarPath()}.`,
   'For codebase navigation, symbol lookup, routes, callers, impact analysis, or architecture questions, prefer Madar before broad text search or reading many files.',
-  'Find the relevant project graph at <project-root>\\out\\graph.json, then use Madar query, explain, path, or pack with an explicit --graph path.',
+  'Find the relevant project graph at <project-root>/out/graph.json, then use Madar query, explain, path, or pack with an explicit --graph path.',
   'Do not assume a static Madar MCP server can select the current project graph; use the executable unless that project separately runs Madar serve with --mcp.',
   'Check graph freshness with Madar status and inspect exact cited source before edits or behavior claims.'
 ].join(' ');
@@ -112,7 +114,15 @@ function describeTool(payload) {
 // Paths a tool call wrote to. Read-only tools are deliberately ignored: only
 // a write can invalidate a fact, and re-verifying on reads would burn stats on
 // every grep. Each client names the field differently, so all forms are tried.
-const WRITE_TOOLS = /^(edit|write|multiedit|notebookedit|str_replace|create_file|apply_patch)$/i;
+const WRITE_TOOLS = /^(edit|write|edit_file|write_file|multiedit|multi_edit|notebookedit|str_replace|create_file|apply_patch)$/i;
+
+// Codex apply_patch names its targets inside the patch text rather than in a
+// field. A deleted evidence file invalidates a fact as surely as an edit.
+const PATCH_TARGET = /^(?:\*\*\* (?:Update|Add|Delete) File: (.+)|\+\+\+ b\/(.+))$/gm;
+
+function patchPaths(patch) {
+  return Array.from(patch.matchAll(PATCH_TARGET), match => (match[1] || match[2]).trim());
+}
 
 function writtenPaths(payload) {
   const toolCall = payload.toolCall || {};
@@ -120,11 +130,27 @@ function writtenPaths(payload) {
   if (!WRITE_TOOLS.test(toolName)) return [];
 
   const args = toolCall.args || payload.tool_input || payload.toolInput || {};
-  const candidates = [args.file_path, args.filePath, args.path, args.notebook_path];
-  if (Array.isArray(args.edits)) {
-    for (const edit of args.edits) candidates.push(edit && (edit.file_path || edit.path));
+  if (typeof args === 'string') return patchPaths(args);
+  if (typeof args !== 'object') return [];
+
+  const candidates = [
+    args.file_path, args.filePath, args.path, args.Path,
+    args.target_file, args.TargetFile, args.notebook_path
+  ];
+  for (const list of [args.edits, args.Replacements]) {
+    if (!Array.isArray(list)) continue;
+    for (const edit of list) candidates.push(edit && (edit.file_path || edit.filePath || edit.path || edit.Path));
   }
-  return candidates.filter(p => typeof p === 'string' && p.length > 0);
+  for (const patch of [args.patch, args.input]) {
+    if (typeof patch === 'string') candidates.push(...patchPaths(patch));
+  }
+  return [...new Set(candidates.filter(p => typeof p === 'string' && p.length > 0))];
+}
+
+// Antigravity fires pre-invocation before every model step. A payload with no
+// counter is treated as the first, so standing facts are never lost outright.
+function isFirstInvocation(payload) {
+  return payload.invocationNum === 0 || payload.invocationNum === undefined;
 }
 
 function describeInvocation(payload) {
@@ -143,32 +169,40 @@ function writeResult(result) {
 // Recall the facts worth putting in front of the model for this event. Never
 // allowed to throw or to be slow: memory is an accelerant, and a hook that
 // fails must cost nothing but the recall it would have provided.
-function recallContext(event, payload, workspace) {
-  if (!workspace) return null;
-  let db;
+function recallContext(db, event, payload) {
+  if (!db) return null;
   try {
-    db = openWorkspaceDb(workspace.dbFile);
     const opts = { machine: machineId() };
+    const starting = event === 'session-start' || (event === 'pre-invocation' && isFirstInvocation(payload));
+
+    // A git pull or another editor can move evidence between sessions with no
+    // PostToolUse to notice, so a new session re-checks every fact before
+    // anything is injected as settled.
+    if (starting) new FactStore(db, { ...opts, agent: 'hook' }).verify();
 
     // Drift rides along with whatever else is being injected. It is appended
     // rather than gated on relevance: the fact that its evidence moved is
     // established, so the agent is told even when the prompt is unrelated.
     const drift = buildDriftNotice(db, opts);
+    const prompt = payload.prompt || payload.userPrompt || '';
+    const recalled = prompt ? buildPromptInjection(db, prompt, opts) : null;
 
     if (event === 'user-prompt-submit') {
-      const prompt = payload.prompt || payload.userPrompt || '';
-      const recalled = prompt ? buildPromptInjection(db, prompt, opts) : null;
       return [recalled, drift].filter(Boolean).join('\n\n') || null;
     }
-    if (event === 'session-start' || event === 'pre-invocation') {
+    if (event === 'session-start') {
       return [buildStandingInjection(db, opts), drift].filter(Boolean).join('\n\n') || null;
+    }
+    // Standing facts open the conversation; repeating them before every step
+    // would bury whatever the step actually recalled.
+    if (event === 'pre-invocation') {
+      const standing = starting ? buildStandingInjection(db, opts) : null;
+      return [standing, recalled, drift].filter(Boolean).join('\n\n') || null;
     }
     return null;
   } catch (error) {
     process.stderr.write(`[caipira-hook] recall skipped: ${error.message}\n`);
     return null;
-  } finally {
-    if (db) { try { db.close(); } catch {} }
   }
 }
 
@@ -179,7 +213,8 @@ const HOOK_EVENT_NAMES = {
   'session-start': 'SessionStart',
   'user-prompt-submit': 'UserPromptSubmit',
   'post-tool-use': 'PostToolUse',
-  'stop': 'Stop'
+  'stop': 'Stop',
+  'session-end': 'SessionEnd'
 };
 
 function writeClientResult(result, event, client, payload, recalled) {
@@ -209,9 +244,8 @@ function writeClientResult(result, event, client, payload, recalled) {
   }
 
   if (client === 'antigravity' && event === 'pre-invocation') {
-    const isFirstInvocation = payload.invocationNum === 0;
     const steps = [];
-    if (isFirstInvocation) {
+    if (isFirstInvocation(payload)) {
       steps.push(
         { ephemeralMessage: CAIPIRA_STARTUP_INSTRUCTION },
         { ephemeralMessage: MADAR_STARTUP_INSTRUCTION }
@@ -233,30 +267,33 @@ function writeClientResult(result, event, client, payload, recalled) {
 // needs no judgement, so it is acted on the moment it happens rather than
 // waiting for someone to call check_drift. Only the facts resting on the
 // written paths are re-verified, and verify() itself stats before it hashes.
-function verifyTouchedFacts(payload, workspaceRow) {
-  if (!workspaceRow) return;
+// Relative paths (Codex patches, Antigravity args) resolve against the cwd the
+// client reported.
+function verifyTouchedFacts(db, payload, workspacePath) {
+  if (!db) return;
   const paths = writtenPaths(payload);
   if (paths.length === 0) return;
 
-  let db = null;
   try {
-    db = openWorkspaceDb(workspaceRow.dbFile);
     const facts = new FactStore(db, { machine: machineId(), agent: 'hook' });
-    const ids = facts.factsForPaths(paths);
+    const ids = facts.factsForPaths(paths, workspacePath || undefined);
     if (ids.length) facts.verify(ids);
   } catch (error) {
     // Drift detection must never break the tool call that triggered it.
     process.stderr.write(`[caipira-hook] drift check skipped: ${error.message}\n`);
-  } finally {
-    if (db) { try { db.close(); } catch {} }
   }
 }
 
-function captureEvent(store, event, payload, client, sessionId, workspace, workspaceRow) {
+// db is the store's own connection, or null when no workspace resolved and
+// the store fell back to the legacy database, which holds no facts to check.
+function captureEvent(store, event, payload, client, sessionId, workspacePath, db) {
   if (!sessionId) return { ok: false, skipped: true, reason: 'missing session identifier' };
 
+  // A client whose start hook never fired still gets its session attributed.
   if (event === 'session-start' || event === 'pre-invocation') {
-    store.startSession({ id: sessionId, ide: client, cwd: workspace });
+    store.startSession({ id: sessionId, ide: client, cwd: workspacePath });
+  } else {
+    store.ensureSession(sessionId, client, workspacePath);
   }
 
   if (event === 'user-prompt-submit' && payload.prompt) {
@@ -265,7 +302,7 @@ function captureEvent(store, event, payload, client, sessionId, workspace, works
 
   if (event === 'post-tool-use') {
     store.addObservation({ session_id: sessionId, kind: 'tool_result', content: describeTool(payload) });
-    verifyTouchedFacts(payload, workspaceRow);
+    verifyTouchedFacts(db, payload, workspacePath);
   }
 
   if (event === 'post-invocation') {
@@ -278,6 +315,10 @@ function captureEvent(store, event, payload, client, sessionId, workspace, works
       store.addObservation({ session_id: sessionId, kind: 'session_stop', content: finalMessage });
       store.addSummary({ session_id: sessionId, scope: 'session', content: finalMessage });
     }
+    store.endSession(sessionId);
+  }
+
+  if (event === 'session-end') {
     store.endSession(sessionId);
   }
 
@@ -308,10 +349,12 @@ function main() {
         process.stderr.write(`[caipira-hook] workspace resolve failed: ${error.message}\n`);
       }
 
+      // One connection per hook run: capture, drift checks, and recall share it.
       const store = new MemoryStore(workspace ? { dbPath: workspace.dbFile } : {});
       try {
-        const result = captureEvent(store, event, payload, client, sessionId, workspacePath, workspace);
-        const recalled = recallContext(event, payload, workspace);
+        const db = workspace ? store.storage.db : null;
+        const result = captureEvent(store, event, payload, client, sessionId, workspacePath, db);
+        const recalled = recallContext(db, event, payload);
         writeClientResult(result, event, client, payload, recalled);
       } finally {
         store.close();

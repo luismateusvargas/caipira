@@ -1,6 +1,6 @@
 # Fix cross-client hook drift detection, Antigravity invocation injection, and connection reuse
 
-Status: ready
+Status: done
 Project rules: specs/project.md#constitution
 Target files: hooks/universal-hook.js, test/test-hook.js
 Depends on: specs/tasks/02-workspace-registry-and-storage-integrity.md, specs/tasks/03-fact-verification-and-injection-precision.md
