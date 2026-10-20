@@ -1,48 +1,17 @@
 // End-to-end: drive mcp.js over real stdio, exactly as a client would.
+require('./fixtures').ensureIsolatedHome();
 const { spawn } = require('child_process');
 const fs = require('fs'), os = require('os'), path = require('path');
 
 const ROOT = require('path').join(__dirname, '..');
 const NODE = process.execPath;
+const D = require('better-sqlite3');
+const { MemoryStore } = require(ROOT + '/store.js');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcpws-'));
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"name":"testws"}');
 const evidence = path.join(tmp, 'server.js');
 fs.writeFileSync(evidence, 'const PORT = 3000;\n');
-
-const child = spawn(NODE, [ROOT + '/mcp.js'], {
-  cwd: tmp,
-  env: { ...process.env, CAIPIRA_MODEL_PATH: ROOT + '/models' },
-  stdio: ['pipe', 'pipe', 'pipe']
-});
-
-let out = '';
-const pending = new Map();
-child.stdout.on('data', d => {
-  out += d;
-  const lines = out.split('\n');
-  out = lines.pop();
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const msg = JSON.parse(line);
-    if (pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
-  }
-});
-child.stderr.on('data', d => { if (/error|Error/.test(String(d))) console.log('  [stderr]', String(d).trim()); });
-
-let seq = 0;
-function call(method, params) {
-  const id = ++seq;
-  return new Promise(resolve => {
-    pending.set(id, resolve);
-    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-  });
-}
-const tool = async (name, args) => {
-  const r = await call('tools/call', { name, arguments: args });
-  if (r.error) return { __error: r.error.message };
-  return JSON.parse(r.result.content[0].text);
-};
 
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => {
@@ -50,8 +19,90 @@ const check = (label, cond, extra) => {
   else { fail++; console.log('  FAIL ' + label + (extra !== undefined ? ' -> ' + extra : '')); }
 };
 
+const RPC_TIMEOUT_MS = 10000;
+const INITIALIZE = { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } };
+
+// One mcp.js child over stdio. A child that dies before stop() fails the suite
+// and rejects every pending call at once, so a crash can neither hang the run
+// nor let it pass on whatever checks happened to finish first.
+function startServer(extraEnv = {}) {
+  const child = spawn(NODE, [ROOT + '/mcp.js'], {
+    cwd: tmp,
+    env: { ...process.env, CAIPIRA_MODEL_PATH: ROOT + '/models', CAIPIRA_DEBUG: '', ...extraEnv },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const pending = new Map();
+  let out = '', seq = 0, exited = null, stopping = false;
+
+  const rejectAll = reason => {
+    for (const entry of pending.values()) entry.reject(new Error(reason));
+    pending.clear();
+  };
+  child.on('error', error => {
+    exited = 'mcp.js failed to start: ' + error.message;
+    rejectAll(exited);
+  });
+  child.on('exit', (code, signal) => {
+    exited = `mcp.js exited (code ${code}, signal ${signal})`;
+    if (stopping) return;
+    fail++;
+    console.log('  FAIL ' + exited + ' before the suite stopped it');
+    rejectAll(exited);
+  });
+  child.stdout.on('data', d => {
+    out += d;
+    const lines = out.split('\n');
+    out = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line);
+      const entry = pending.get(msg.id);
+      if (entry) { pending.delete(msg.id); entry.resolve(msg); }
+    }
+  });
+  child.stderr.on('data', d => { if (/error|Error/.test(String(d))) console.log('  [stderr]', String(d).trim()); });
+
+  // `id` is the id the response will carry: null for a request the server
+  // cannot attribute to anything.
+  function send(id, line) {
+    if (exited) return Promise.reject(new Error(exited));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`no response to request ${id} within ${RPC_TIMEOUT_MS}ms`));
+      }, RPC_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: msg => { clearTimeout(timer); resolve(msg); },
+        reject: error => { clearTimeout(timer); reject(error); }
+      });
+      child.stdin.write(line + '\n');
+    });
+  }
+
+  const call = (method, params) => {
+    const id = ++seq;
+    return send(id, JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+  };
+  const raw = (line, id = null) => send(id, line);
+  const tool = async (name, args) => {
+    const r = await call('tools/call', { name, arguments: args });
+    if (r.error) return { __error: r.error.message };
+    return JSON.parse(r.result.content[0].text);
+  };
+  const stop = () => new Promise(resolve => {
+    stopping = true;
+    if (exited) return resolve();
+    child.once('exit', () => resolve());
+    child.kill();
+  });
+  return { call, raw, tool, stop };
+}
+
+const server = startServer();
+const { call, tool } = server;
+
 (async () => {
-  await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+  await call('initialize', INITIALIZE);
 
   console.log('\n1. tools are advertised');
   const list = await call('tools/list', {});
@@ -59,6 +110,9 @@ const check = (label, cond, extra) => {
   for (const n of ['search', 'record_fact', 'search_facts', 'update_fact', 'check_drift', 'list_workspaces']) {
     check('exposes ' + n, names.includes(n));
   }
+  const updateSchema = list.result.tools.find(t => t.name === 'update_fact').inputSchema.properties;
+  check('update_fact advertises kind, scope and evidence', ['kind', 'scope', 'evidence'].every(k => k in updateSchema),
+    Object.keys(updateSchema).join(','));
 
   console.log('\n2. record_fact provisions the workspace on demand');
   const rec = await tool('record_fact', {
@@ -148,9 +202,79 @@ const check = (label, cond, extra) => {
   const bad = await tool('record_fact', { kind: 'nonsense', title: 'x', body: 'y' });
   check('invalid kind rejected', Boolean(bad.__error), JSON.stringify(bad));
 
-  child.kill();
-  await new Promise(r => setTimeout(r, 400));
+  console.log('\n11. malformed requests get JSON-RPC errors, not a dead server');
+  const expectError = async (label, pending, code) => {
+    const r = await pending;
+    check(label, Boolean(r.error) && r.error.code === code, JSON.stringify(r));
+  };
+  await expectError('null payload -> -32600', server.raw('null'), -32600);
+  await expectError('array payload -> -32600', server.raw('[1,2]'), -32600);
+  await expectError('object without a method -> -32600, under its own id',
+    server.raw(JSON.stringify({ jsonrpc: '2.0', id: 'no-method' }), 'no-method'), -32600);
+  await expectError('unparseable line -> -32700', server.raw('{not json'), -32700);
+  await expectError('tools/call without params -> -32602', call('tools/call'), -32602);
+  const badArgs = [
+    ['get_observations without ids', 'get_observations', {}],
+    ['get_observations with non-numeric ids', 'get_observations', { ids: ['1'] }],
+    ['get_observations with more than 500 ids', 'get_observations', { ids: Array.from({ length: 501 }, (_, i) => i + 1) }],
+    ['timeline without session_id', 'timeline', {}],
+    ['search_facts without query', 'search_facts', {}],
+    ['update_fact without id', 'update_fact', { state: 'revoked' }],
+    ['update_fact with a string id', 'update_fact', { id: String(rec2.id), state: 'revoked' }],
+    ['a non-string cwd', 'list_sessions', { cwd: 42 }]
+  ];
+  for (const [label, name, args] of badArgs) {
+    await expectError(label + ' -> -32602', call('tools/call', { name, arguments: args }), -32602);
+  }
+  const pong = await call('ping', {});
+  check('server still answers afterwards', Boolean(pong.result), JSON.stringify(pong));
+
+  console.log('\n12. traffic is logged only on request, rotated, and redacted');
+  const logFile = path.join(process.env.CAIPIRA_HOME, 'logs', 'mcp_traffic.log');
+  check('nothing logged without CAIPIRA_DEBUG', !fs.existsSync(logFile));
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  fs.writeFileSync(logFile, 'x'.repeat(5 * 1024 * 1024));
+  const debug = startServer({ CAIPIRA_DEBUG: '1' });
+  await debug.call('initialize', INITIALIZE);
+  await debug.tool('search_facts', { query: 'port <private>hunter2-secret</private>' });
+  await debug.stop();
+  const logged = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+  check('a full log rotates to .1', fs.existsSync(logFile + '.1') && fs.statSync(logFile + '.1').size >= 5 * 1024 * 1024);
+  check('requests and responses are logged', /\] IN: /.test(logged) && /\] OUT: /.test(logged), logged.slice(0, 160));
+  check('each request is logged once', (logged.match(/\] IN: /g) || []).length === 2, logged.slice(0, 300));
+  check('private blocks are redacted', logged.length > 0 && !logged.includes('hunter2-secret'));
+
+  console.log('\n13. a workspace db deleted under the server is reopened, not written blind');
+  if (process.platform === 'win32') {
+    console.log('  skip (an open database cannot be deleted on Windows)');
+  } else {
+    const pruned = fs.mkdtempSync(path.join(os.tmpdir(), 'mcpprune-'));
+    fs.writeFileSync(path.join(pruned, 'package.json'), '{}');
+    const first = await tool('record_fact', { kind: 'gotcha', title: 'before prune', body: 'recorded before the db was deleted', cwd: pruned });
+    await tool('list_sessions', { cwd: pruned });
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(first.db + suffix, { force: true });
+
+    const second = await tool('record_fact', { kind: 'gotcha', title: 'after prune', body: 'recorded after the db was deleted', cwd: pruned });
+    const onDisk = new D(second.db, { readonly: true });
+    const titles = onDisk.prepare('SELECT title FROM facts').all().map(r => r.title);
+    onDisk.close();
+    check('a fact recorded afterwards lands in the file on disk', titles.includes('after prune'), JSON.stringify(titles));
+
+    const writer = new MemoryStore({ dbPath: second.db });
+    writer.startSession({ id: 'after-prune', ide: 'test', cwd: pruned });
+    writer.close();
+    const sessions = await tool('list_sessions', { cwd: pruned });
+    check('observation reads see the new file', Array.isArray(sessions) && sessions.some(s => s.id === 'after-prune'),
+      JSON.stringify(sessions));
+    fs.rmSync(pruned, { recursive: true, force: true });
+  }
+
+  await server.stop();
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
   process.exit(fail ? 1 : 0);
-})().catch(e => { console.error('CRASH', e); child.kill(); process.exit(1); });
+})().catch(e => {
+  console.error('CRASH', e.message);
+  server.stop();
+  process.exit(1);
+});

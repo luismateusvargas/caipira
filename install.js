@@ -279,6 +279,94 @@ function registerAntigravityHooks() {
   ok(`Antigravity hooks registered: ${ANTIGRAVITY_EVENTS.map(([event]) => event).join(', ')}`);
 }
 
+// Splits TOML into blocks at table headers (a header line plus everything up
+// to the next one), so whole tables can be dropped without a TOML round trip.
+function tomlBlocks(text) {
+  const blocks = [{ header: null, lines: [] }];
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\[/.test(line)) blocks.push({ header: line.trim(), lines: [line] });
+    else blocks[blocks.length - 1].lines.push(line);
+  }
+  return blocks;
+}
+
+// Drops the [mcp_servers.caipira] tables, every [[hooks.X.hooks]] handler that
+// runs universal-hook.js, any [[hooks.X]] left with no handlers, and the trust
+// state of the events that lost one. Everything else is kept byte for byte.
+function stripCodexConfig(text) {
+  const blocks = tomlBlocks(text);
+  const keep = blocks.map(() => true);
+  const strippedEvents = new Set();
+  let removed = 0;
+
+  blocks.forEach((block, i) => {
+    if (!block.header) return;
+    if (/^\[mcp_servers\.caipira[\].]/.test(block.header)) { keep[i] = false; removed++; return; }
+    const handler = block.header.match(/^\[\[hooks\.(\w+)\.hooks\]\]$/);
+    if (handler && block.lines.some(line => line.includes('universal-hook.js'))) {
+      keep[i] = false;
+      strippedEvents.add(handler[1]);
+      removed++;
+    }
+  });
+
+  blocks.forEach((block, i) => {
+    const parent = block.header && block.header.match(/^\[\[hooks\.(\w+)\]\]$/);
+    if (!parent || !strippedEvents.has(parent[1])) return;
+    let handlers = 0;
+    for (let j = i + 1; j < blocks.length && blocks[j].header === `[[hooks.${parent[1]}.hooks]]`; j++) {
+      if (keep[j]) handlers++;
+    }
+    if (handlers === 0) keep[i] = false;
+  });
+
+  // Codex keys trust by hook position, so an event that lost a handler has to
+  // be re-trusted either way; stale entries would only read as tampering.
+  blocks.forEach((block, i) => {
+    if (!block.header || !block.header.startsWith('[hooks.state.')) return;
+    const stale = CODEX_HOOKS.some(([toml, snake]) => strippedEvents.has(toml) && block.header.includes(`:${snake}:`));
+    if (stale) keep[i] = false;
+  });
+
+  const lines = blocks.filter((_, i) => keep[i]).flatMap(block => block.lines);
+  return { text: lines.join('\n'), removed };
+}
+
+function unregisterCodex() {
+  if (!fs.existsSync(CODEX_CONFIG)) {
+    warn('Codex config.toml not found — skipped');
+    return;
+  }
+  const original = fs.readFileSync(CODEX_CONFIG, 'utf8');
+  const { text, removed } = stripCodexConfig(original);
+  if (removed === 0) {
+    warn('Codex had no Caipira entries');
+    return;
+  }
+  writeTextAtomic(CODEX_CONFIG, text);
+  ok(`Codex entries removed: ${removed}`);
+}
+
+function unregisterAntigravity() {
+  const mcp = readJson(ANTIGRAVITY_MCP, null);
+  if (mcp?.mcpServers?.caipira) {
+    delete mcp.mcpServers.caipira;
+    writeJsonAtomic(ANTIGRAVITY_MCP, mcp);
+    ok('Antigravity MCP server unregistered');
+  } else {
+    warn('Antigravity MCP server was not registered');
+  }
+
+  const hooks = readJson(ANTIGRAVITY_HOOKS, null);
+  if (hooks?.caipira) {
+    delete hooks.caipira;
+    writeJsonAtomic(ANTIGRAVITY_HOOKS, hooks);
+    ok('Antigravity hooks removed');
+  } else {
+    warn('Antigravity hooks were not registered');
+  }
+}
+
 function unregister() {
   const config = readJson(CLAUDE_JSON, {});
   if (config.mcpServers?.caipira) {
@@ -300,9 +388,62 @@ function unregister() {
     if (kept.length) settings.hooks[event] = kept;
     else delete settings.hooks[event];
   }
-  writeJsonAtomic(CLAUDE_SETTINGS, settings);
+  if (removed > 0) writeJsonAtomic(CLAUDE_SETTINGS, settings);
   ok(`hooks removed: ${removed}`);
-  log('\nCaipira data at ~/.caipira/data.db was left untouched.');
+
+  unregisterCodex();
+  unregisterAntigravity();
+
+  const { DB_DIR } = require('./workspace');
+  log(`\nCaipira data under ${DB_DIR} was left untouched.`);
+}
+
+// ── workspace databases ──
+
+// Read-only, so status and doctor never migrate, lock, or create a workspace
+// they only count. Tables a pre-v2 database lacks count as zero.
+function workspaceCounts(dbFile) {
+  const Database = require('better-sqlite3');
+  const db = new Database(dbFile, { readonly: true, fileMustExist: true });
+  try {
+    const has = table => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+    const count = table => (has(table) ? db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n : 0);
+    return {
+      observations: count('observations'),
+      embeddings: count('embeddings'),
+      facts: count('facts'),
+      sessions: count('sessions'),
+      recent: has('sessions') ? db.prepare('SELECT * FROM sessions ORDER BY started_at DESC LIMIT 5').all() : []
+    };
+  } finally {
+    db.close();
+  }
+}
+
+// Every registered workspace whose database exists, with its counts. Rows
+// whose file is missing or unreadable come back separately rather than
+// failing the whole report.
+function aggregateWorkspaces() {
+  const { listWorkspaces } = require('./workspace');
+  const totals = { workspaces: 0, observations: 0, embeddings: 0, facts: 0, sessions: 0 };
+  const recent = [];
+  const missing = [];
+  const broken = [];
+  for (const row of listWorkspaces()) {
+    if (!fs.existsSync(row.db_file)) { missing.push(row); continue; }
+    let counts;
+    try {
+      counts = workspaceCounts(row.db_file);
+    } catch (error) {
+      broken.push({ row, error });
+      continue;
+    }
+    totals.workspaces++;
+    for (const key of ['observations', 'embeddings', 'facts', 'sessions']) totals[key] += counts[key];
+    for (const session of counts.recent) recent.push({ ...session, workspace: row.label || row.root_path || 'legacy' });
+  }
+  recent.sort((a, b) => b.started_at - a.started_at);
+  return { totals, recent: recent.slice(0, 5), missing, broken };
 }
 
 // ── doctor ──
@@ -322,14 +463,19 @@ function doctor() {
   check('embedding model present', fs.existsSync(path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx')));
 
   try {
-    const { MemoryStore } = require('./store');
-    const store = new MemoryStore();
-    const count = store.countObservations();
-    store.close();
-    ok(`SQLite store opens (${count} observations)`);
+    const { openMaster } = require('./workspace');
+    openMaster().close();
+    ok('workspace registry opens');
+    const { totals, missing, broken } = aggregateWorkspaces();
+    for (const { row, error } of broken) {
+      problems++;
+      fail(`workspace database ${path.basename(row.db_file)} — ${error.message}`);
+    }
+    ok(`${totals.workspaces} workspace database(s) open (${totals.observations} observations, ${totals.facts} facts)`);
+    if (missing.length) warn(`${missing.length} registered workspace database(s) missing — re-created on next use`);
   } catch (error) {
     problems++;
-    fail(`SQLite store — ${error.message}`);
+    fail(`workspace registry — ${error.message}`);
   }
 
   const config = readJson(CLAUDE_JSON, {});
@@ -341,9 +487,10 @@ function doctor() {
     check(`hook ${event}`, present, 'run: caipira install');
   }
 
+  // Matches registerCodex(): a machine without Codex is fine, not broken.
   const codexConfig = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : '';
-  check('Codex config.toml present', Boolean(codexConfig), 'Codex not installed?');
-  if (codexConfig) {
+  if (!codexConfig) warn('Codex config.toml not found — Codex checks skipped');
+  else {
     check('Codex free of cavemem references', !/cavemem/i.test(codexConfig), 'run: caipira install');
     check('Codex hooks point at Caipira',
       (codexConfig.match(/universal-hook\.js/g) || []).length >= CODEX_HOOKS.length * 2,
@@ -451,19 +598,21 @@ function setMode(mode) {
 }
 
 function status() {
-  const { MemoryStore } = require('./store');
-  const store = new MemoryStore();
-  const sessions = store.listSessions(5);
+  const { totals, recent, missing, broken } = aggregateWorkspaces();
   log(`\nCaipira status`);
   log(`  mode:         ${currentMode()}`);
-  log(`  observations: ${store.countObservations()}`);
-  log(`  embeddings:   ${store.countEmbeddings()}`);
+  log(`  workspaces:   ${totals.workspaces}`);
+  log(`  observations: ${totals.observations}`);
+  log(`  embeddings:   ${totals.embeddings}`);
+  log(`  facts:        ${totals.facts}`);
+  log(`  sessions:     ${totals.sessions}`);
+  if (missing.length) warn(`${missing.length} registered workspace database(s) missing`);
+  for (const { row, error } of broken) warn(`${path.basename(row.db_file)} unreadable — ${error.message}`);
   log(`  recent sessions:`);
-  for (const session of sessions) {
-    log(`    ${new Date(session.started_at).toISOString()}  ${session.ide.padEnd(12)}  ${session.id}`);
+  for (const session of recent) {
+    log(`    ${new Date(session.started_at).toISOString()}  ${String(session.ide).padEnd(12)}  ${String(session.workspace).padEnd(20)}  ${session.id}`);
   }
   log('');
-  store.close();
 }
 
 function install() {

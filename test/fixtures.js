@@ -8,9 +8,11 @@
 // Ids matter: the suites assert that a prompt reaches fact #1, #2 or #3, so
 // these are recorded in order into an empty database.
 
-const ROOT = require('path').join(__dirname, '..');
-const { ensureWorkspace, openWorkspaceDb, machineId } = require(ROOT + '/workspace.js');
-const { FactStore } = require(ROOT + '/facts.js');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const ROOT = path.join(__dirname, '..');
 
 const FACTS = [
   {
@@ -33,8 +35,26 @@ const FACTS = [
   }
 ];
 
+// run-all.js hands every suite a throwaway CAIPIRA_HOME. A suite started on
+// its own gets one here instead, so it can never write into ~/.caipira. Must
+// run before workspace.js or store.js is loaded: both read CAIPIRA_HOME once.
+/** @returns {string} The CAIPIRA_HOME this process will use. */
+function ensureIsolatedHome() {
+  if (process.env.CAIPIRA_HOME) return process.env.CAIPIRA_HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'caipira-home-'));
+  process.env.CAIPIRA_HOME = home;
+  process.on('exit', () => {
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+  return home;
+}
+
 // Idempotent: a database that already holds facts is left exactly as it is.
+// Required lazily so ensureIsolatedHome() can run before workspace.js loads.
+/** @param {string} workspaceRoot @returns {{workspace: object, db: object, store: object}} */
 function seedFacts(workspaceRoot) {
+  const { ensureWorkspace, openWorkspaceDb, machineId } = require(ROOT + '/workspace.js');
+  const { FactStore } = require(ROOT + '/facts.js');
   const workspace = ensureWorkspace(workspaceRoot);
   const db = openWorkspaceDb(workspace.dbFile);
   const store = new FactStore(db, { machine: machineId(), agent: 'test' });
@@ -44,4 +64,4 @@ function seedFacts(workspaceRoot) {
   return { workspace, db, store };
 }
 
-module.exports = { seedFacts, FACTS };
+module.exports = { ensureIsolatedHome, seedFacts, FACTS };

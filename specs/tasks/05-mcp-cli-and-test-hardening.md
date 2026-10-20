@@ -1,6 +1,6 @@
 # Harden MCP server, CLI installer/doctor, test runner, and remove legacy CodeWhale hooks
 
-Status: ready
+Status: done
 Project rules: specs/project.md#constitution
 Target files: mcp.js, install.js, caipira.cmd, package.json, test/run-all.js, test/test-mcp.js, test/test-facts.js, test/test-workspace.js, test/test-inject.js, test/test-hook.js, hooks/session-start.js, hooks/session-end.js, hooks/turn-end.js, hooks/system-inject.js, hooks/proxy-start.js
 Depends on: specs/tasks/02-workspace-registry-and-storage-integrity.md, specs/tasks/03-fact-verification-and-injection-precision.md, specs/tasks/04-hooks-cross-client-lifecycle-and-drift.md

@@ -477,4 +477,4 @@ function safeJSON(s) {
   try { return JSON.parse(s); } catch { return s; }
 }
 
-module.exports = { MemoryStore, Storage };
+module.exports = { MemoryStore, Storage, redactPrivate };

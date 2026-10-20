@@ -1,5 +1,6 @@
 // Drives universal-hook.js exactly as each client would: JSON on stdin,
 // JSON on stdout, one process per event.
+require('./fixtures').ensureIsolatedHome();
 const { execFileSync } = require('child_process');
 const ROOT = require('path').join(__dirname, '..');
 const NODE = process.execPath;
@@ -94,10 +95,16 @@ const wdb = new D(wsInfo.dbFile, { readonly: true });
 const n = wdb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id LIKE 'hooktest%'").get().n;
 check('hook writes landed in workspace db (' + n + ')', n > 0);
 wdb.close();
-const ldb = new D(require(ROOT + '/workspace.js').LEGACY_DB, { readonly: true });
-const leaked = ldb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id LIKE 'hooktest%'").get().n;
+// A standalone run's fresh CAIPIRA_HOME has no legacy data.db at all, and a
+// file that does not exist cannot have had anything leaked into it.
+const LEGACY_DB = require(ROOT + '/workspace.js').LEGACY_DB;
+let leaked = 0;
+if (require('fs').existsSync(LEGACY_DB)) {
+  const ldb = new D(LEGACY_DB, { readonly: true });
+  try { leaked = ldb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id LIKE 'hooktest%'").get().n; }
+  finally { ldb.close(); }
+}
 check('nothing leaked into legacy data.db', leaked === 0, leaked);
-ldb.close();
 
 console.log('\n8. a write to a fact\'s evidence flags that fact, in-session');
 {

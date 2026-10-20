@@ -1,3 +1,4 @@
+require('./fixtures').ensureIsolatedHome();
 const fs = require('fs'), os = require('os'), path = require('path');
 const D = require('better-sqlite3');
 const { migrate, WORKSPACE_MIGRATIONS } = require('../migrate.js');

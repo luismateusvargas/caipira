@@ -1,3 +1,4 @@
+require('./fixtures').ensureIsolatedHome();
 process.chdir(require('path').join(__dirname, '..'));
 const fs = require('fs'), os = require('os'), path = require('path');
 const ws = require('../workspace.js');

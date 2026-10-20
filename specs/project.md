@@ -46,7 +46,7 @@ Caipira is a local-first, cross-client memory and prose-compression toolkit for 
 ## Logging policy
 
 - **Existing logger and coverage gaps**:
-  - `mcp.js` writes stderr status/error messages (`[caipira] ...`) and currently appends all raw stdio traffic unconditionally to `logs/mcp_traffic.log` without `<private>` redaction or size limits.
+  - `mcp.js` writes stderr status/error messages (`[caipira] ...`) and, only when `CAIPIRA_DEBUG=1`, appends `<private>`-redacted stdio traffic to `logs/mcp_traffic.log` (under `CAIPIRA_HOME` when set), rotating to `.1` at 5 MB.
   - `hooks/universal-hook.js` logs recall, workspace resolution, and drift check errors to `stderr` (`[caipira-hook] ...`).
 - **Levels and rules**:
   - `INFO`: Startup/backfill summaries on `stderr` in `mcp.js`; `[ok]` step summaries on `stdout` in `install.js`.
@@ -69,5 +69,5 @@ Caipira is a local-first, cross-client memory and prose-compression toolkit for 
 
 ## Evidence and unknowns
 
-- Repository paths verified: `package.json`, `workspace.js`, `migrate.js`, `store.js`, `facts.js`, `inject.js`, `compress.js`, `mcp.js`, `install.js`, `caipira.sh`, `caipira.cmd`, `hooks/universal-hook.js`, `hooks/session-start.js`, `hooks/session-end.js`, `hooks/turn-end.js`, `hooks/system-inject.js`, `hooks/proxy-start.js`, `test/run-all.js`, `test/fixtures.js`, `test/test-workspace.js`, `test/test-facts.js`, `test/test-inject.js`, `test/test-mcp.js`, `test/test-hook.js`.
-- Open questions: None. Legacy CodeWhale hook scripts (`hooks/session-start.js`, `hooks/session-end.js`, `hooks/turn-end.js`, `hooks/system-inject.js`, `hooks/proxy-start.js`) are slated for removal in `specs/tasks/05-mcp-cli-and-test-hardening.md`.
+- Repository paths verified: `package.json`, `workspace.js`, `migrate.js`, `store.js`, `facts.js`, `inject.js`, `compress.js`, `mcp.js`, `install.js`, `caipira.sh`, `caipira.cmd`, `hooks/universal-hook.js`, `test/run-all.js`, `test/fixtures.js`, `test/test-workspace.js`, `test/test-facts.js`, `test/test-inject.js`, `test/test-mcp.js`, `test/test-hook.js`, `test/test-install.js`.
+- Open questions: None. The legacy CodeWhale hook scripts were removed in `specs/tasks/05-mcp-cli-and-test-hardening.md`; `hooks/universal-hook.js` is the only hook entry point.

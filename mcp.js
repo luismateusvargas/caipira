@@ -3,14 +3,14 @@
 // Loads @xenova/transformers lazily. Backfills embeddings on idle.
 // Tools: search, get_observations, list_sessions, timeline
 
-const { MemoryStore } = require('./store');
+const { MemoryStore, redactPrivate } = require('./store');
 const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces } = require('./workspace');
 const { FactStore, searchWorkspaces } = require('./facts');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-let embedder = null;
+let embedderPromise = null;
 let backfillTimer = null;
 
 // ── workspace-scoped fact access ──
@@ -20,12 +20,33 @@ let backfillTimer = null;
 // first. Connections are cached per workspace: resolving is cheap, opening is not.
 const factConnections = new Map();
 
+// `caipira prune --apply` can delete a workspace database under a running
+// server, and ensureWorkspace() then provisions a fresh file at the same path.
+// A cached handle would keep reading and writing the unlinked file, so each
+// cache entry remembers which file it opened and is dropped once that changes.
+function fileIdentity(dbFile) {
+  try { return fs.statSync(dbFile).ino; } catch { return null; }
+}
+
+function isStale(entry, dbFile) {
+  const identity = fileIdentity(dbFile);
+  return identity === null || identity !== entry.identity;
+}
+
 function factsFor(cwd) {
   const workspace = ensureWorkspace(cwd || process.cwd());
   let entry = factConnections.get(workspace.dbFile);
+  if (entry && isStale(entry, workspace.dbFile)) {
+    try { entry.db.close(); } catch {}
+    factConnections.delete(workspace.dbFile);
+    entry = null;
+  }
   if (!entry) {
     const db = openWorkspaceDb(workspace.dbFile);
-    entry = { db, store: new FactStore(db, { machine: machineId(), agent: 'mcp' }) };
+    entry = {
+      db, identity: fileIdentity(workspace.dbFile),
+      store: new FactStore(db, { machine: machineId(), agent: 'mcp' })
+    };
     factConnections.set(workspace.dbFile, entry);
   }
   return { workspace, facts: entry.store };
@@ -44,12 +65,18 @@ function closeFactConnections() {
 const memoryStores = new Map();
 
 function memoryAt(dbFile) {
-  let memory = memoryStores.get(dbFile);
-  if (!memory) {
-    memory = new MemoryStore({ dbPath: dbFile });
-    memoryStores.set(dbFile, memory);
+  let entry = memoryStores.get(dbFile);
+  if (entry && isStale(entry, dbFile)) {
+    try { entry.memory.close(); } catch {}
+    memoryStores.delete(dbFile);
+    entry = null;
   }
-  return memory;
+  if (!entry) {
+    const memory = new MemoryStore({ dbPath: dbFile });
+    entry = { memory, identity: fileIdentity(dbFile) };
+    memoryStores.set(dbFile, entry);
+  }
+  return entry.memory;
 }
 
 function memoryFor(cwd) {
@@ -57,8 +84,8 @@ function memoryFor(cwd) {
 }
 
 function closeMemoryStores() {
-  for (const memory of memoryStores.values()) {
-    try { memory.close(); } catch {}
+  for (const entry of memoryStores.values()) {
+    try { entry.memory.close(); } catch {}
   }
   memoryStores.clear();
 }
@@ -71,31 +98,66 @@ function closeAll() {
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
 const MODEL_DIM = 384;
 
-// Traffic log file for diagnostics
-const logFile = path.join(__dirname, 'logs', 'mcp_traffic.log');
+// ── Debug traffic log ──
+//
+// Opt-in only: raw stdio carries prompts and tool output. Lives under
+// CAIPIRA_HOME when that is set, so test runs never write into the install.
+const DEBUG_TRAFFIC = process.env.CAIPIRA_DEBUG === '1';
+const TRAFFIC_LOG = process.env.CAIPIRA_HOME
+  ? path.join(path.resolve(process.env.CAIPIRA_HOME), 'logs', 'mcp_traffic.log')
+  : path.join(__dirname, 'logs', 'mcp_traffic.log');
+const TRAFFIC_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
 function logTraffic(direction, data) {
+  if (!DEBUG_TRAFFIC) return;
   try {
-    fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${direction}: ${data}\n`);
-  } catch (e) {}
+    fs.mkdirSync(path.dirname(TRAFFIC_LOG), { recursive: true });
+    let size = 0;
+    try { size = fs.statSync(TRAFFIC_LOG).size; } catch {}
+    if (size >= TRAFFIC_LOG_MAX_BYTES) fs.renameSync(TRAFFIC_LOG, `${TRAFFIC_LOG}.1`);
+    fs.appendFileSync(TRAFFIC_LOG, `[${new Date().toISOString()}] ${direction}: ${redactPrivate(String(data))}\n`);
+  } catch (e) {
+    // Diagnostics must never take the server down with them.
+    console.error('[caipira] traffic log write failed:', e.message);
+  }
 }
 
 // ── Embedder (lazy, cached) ──
 
-async function getEmbedder() {
-  if (embedder) return embedder;
+// The bundled model ships next to this file; ~/.caipira/models is the
+// fallback for a checkout run without one.
+function modelDirectory() {
+  if (process.env.CAIPIRA_MODEL_PATH) return path.resolve(process.env.CAIPIRA_MODEL_PATH);
+  const bundled = path.join(__dirname, 'models');
+  return fs.existsSync(bundled) ? bundled : path.join(os.homedir(), '.caipira', 'models');
+}
+
+// Concurrent first requests share one pipeline load rather than racing to
+// load the model several times. A failed load is forgotten so a later call
+// can retry it.
+function getEmbedder() {
+  if (!embedderPromise) {
+    embedderPromise = loadEmbedder().catch(error => {
+      embedderPromise = null;
+      throw error;
+    });
+  }
+  return embedderPromise;
+}
+
+async function loadEmbedder() {
   const transformers = require('@xenova/transformers');
-  const modelDirectory = process.env.CAIPIRA_MODEL_PATH
-    ? path.resolve(process.env.CAIPIRA_MODEL_PATH)
-    : path.join(os.homedir(), '.caipira', 'models');
-  transformers.env.localModelPath = modelDirectory;
-  transformers.env.cacheDir = modelDirectory;
+  const directory = modelDirectory();
+  transformers.env.localModelPath = directory;
+  transformers.env.cacheDir = directory;
   transformers.env.allowLocalModels = true;
   transformers.env.allowRemoteModels = false;
   transformers.env.useFS = true;
   transformers.env.useFSCache = true;
   const extractor = await transformers.pipeline('feature-extraction', MODEL, { quantized: true });
 
-  embedder = {
+  console.error('[caipira] embedder loaded:', MODEL);
+  return {
     model: MODEL,
     dim: MODEL_DIM,
     embed: async (text) => {
@@ -103,8 +165,6 @@ async function getEmbedder() {
       return new Float32Array(out.data);
     }
   };
-  console.error('[caipira] embedder loaded:', MODEL);
-  return embedder;
 }
 
 // ── Backfill ──
@@ -156,39 +216,49 @@ function scheduleBackfill() {
 
 // ── MCP protocol ──
 
+const isPlainObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
 process.stdin.setEncoding('utf8');
 let buf = '';
 process.stdin.on('data', chunk => {
-  logTraffic('IN', chunk);
   buf += chunk;
   const lines = buf.split('\n');
   buf = lines.pop();
   for (const line of lines) {
     if (!line.trim()) continue;
+    logTraffic('IN', line);
+    let msg;
     try {
-      logTraffic('IN-LINE', line);
-      const msg = JSON.parse(line);
-      handle(msg);
+      msg = JSON.parse(line);
     } catch (e) {
       logTraffic('IN-ERR', e.message);
-      respond(null, { code: -32700, message: 'Parse error: ' + e.message });
+      respondError(null, -32700, 'Parse error: ' + e.message);
+      continue;
     }
+    if (!isPlainObject(msg) || typeof msg.method !== 'string') {
+      respondError(isPlainObject(msg) && msg.id !== undefined ? msg.id : null, -32600, 'Invalid Request');
+      continue;
+    }
+    // handle() is async: without this a throw inside it is an unhandled
+    // rejection, which takes the whole server down.
+    handle(msg).catch(err => respondError(msg.id ?? null, -32603, err.message));
   }
 });
 
-function respond(id, result) {
-  if (id === undefined) {
-    return;
-  }
-  const msg = { jsonrpc: '2.0', id };
-  if (result && result.code) {
-    msg.error = result;
-  } else {
-    msg.result = result;
-  }
-  const payload = JSON.stringify(msg) + '\n';
+// JSON-RPC 2.0: notifications (no id) are never replied to.
+function send(id, body) {
+  if (id === undefined) return;
+  const payload = JSON.stringify({ jsonrpc: '2.0', id, ...body });
   logTraffic('OUT', payload);
-  process.stdout.write(payload);
+  process.stdout.write(payload + '\n');
+}
+
+function respond(id, result) {
+  send(id, { result });
+}
+
+function respondError(id, code, message) {
+  send(id, { error: { code, message } });
 }
 
 async function handle(msg) {
@@ -331,7 +401,10 @@ async function handle(msg) {
               type: 'object',
               properties: {
                 id: { type: 'number' },
+                kind: { type: 'string', enum: ['decision', 'constraint', 'preference', 'status', 'gotcha'] },
                 title: { type: 'string' }, body: { type: 'string' }, summary: { type: 'string' },
+                scope: { type: 'string', description: 'Sub-path this fact applies to' },
+                evidence: { type: 'array', items: { type: 'string' }, description: 'Replaces this machine\'s evidence files; each is re-fingerprinted' },
                 state: { type: 'string', enum: ['active', 'needs_review', 'superseded', 'revoked', 'proposed'] },
                 confidence: { type: 'number' }, ttl_days: { type: 'number' },
                 cwd: { type: 'string' }
@@ -364,21 +437,55 @@ async function handle(msg) {
       break;
 
     default:
-      respond(id, { code: -32601, message: `Method not found: ${method}` });
+      respondError(id, -32601, `Method not found: ${method}`);
+  }
+}
+
+// Argument checks for the fields each tool cannot run without. Returns the
+// problem as a message, or null when the arguments are usable.
+const MAX_IDS = 500;
+const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
+const validIds = ids => Array.isArray(ids) && ids.length <= MAX_IDS && ids.every(Number.isInteger);
+
+function invalidArguments(name, args) {
+  if (args.cwd !== undefined && typeof args.cwd !== 'string') return 'cwd must be a string';
+  switch (name) {
+    case 'search':
+    case 'search_facts':
+      return nonEmptyString(args.query) ? null : 'Missing required parameter: query';
+    case 'get_observations':
+      return validIds(args.ids) ? null : `ids must be an array of at most ${MAX_IDS} integer ids`;
+    case 'check_drift':
+      return args.ids === undefined || validIds(args.ids) ? null : `ids must be an array of at most ${MAX_IDS} integer ids`;
+    case 'timeline':
+      return nonEmptyString(args.session_id) ? null : 'Missing required parameter: session_id';
+    case 'update_fact':
+      return Number.isInteger(args.id) ? null : 'id must be an integer fact id';
+    default:
+      return null;
   }
 }
 
 async function handleToolCall(id, params) {
+  if (!isPlainObject(params) || typeof params.name !== 'string') {
+    respondError(id, -32602, 'tools/call needs params with a tool name');
+    return;
+  }
   const { name, arguments: args = {} } = params;
+  if (!isPlainObject(args)) {
+    respondError(id, -32602, 'arguments must be an object');
+    return;
+  }
+  const problem = invalidArguments(name, args);
+  if (problem) {
+    respondError(id, -32602, problem);
+    return;
+  }
 
   try {
     let result;
     switch (name) {
       case 'search': {
-        if (!args || !args.query) {
-          respond(id, { code: -32602, message: 'Missing required parameter: query' });
-          return;
-        }
         const emb = await getEmbedder().catch(() => null);
         const hits = await memoryFor(args.cwd).search(args.query, args.limit || 10, emb);
         result = { content: [{ type: 'text', text: JSON.stringify(hits) }] };
@@ -476,12 +583,12 @@ async function handleToolCall(id, params) {
         break;
       }
       default:
-        respond(id, { code: -32601, message: `Unknown tool: ${name}` });
+        respondError(id, -32601, `Unknown tool: ${name}`);
         return;
     }
     respond(id, result);
   } catch (err) {
-    respond(id, { code: -32000, message: `Tool error: ${err.message}` });
+    respondError(id, -32000, `Tool error: ${err.message}`);
   }
 }
 

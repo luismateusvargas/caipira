@@ -1,5 +1,6 @@
 // Runs the gate against a seeded three-fact workspace (see fixtures.js), using
 // prompts of the shape the user actually writes.
+require('./fixtures').ensureIsolatedHome();
 const ROOT = require('path').join(__dirname, '..');
 const { machineId } = require(ROOT + '/workspace.js');
 const { buildPromptInjection, buildStandingInjection, selectFacts, renderInjection, termGroups } = require(ROOT + '/inject.js');
