@@ -1,6 +1,6 @@
 # Fix fact verification, TTL drift, and prompt-injection precision
 
-Status: ready
+Status: implemented
 Project rules: specs/project.md#constitution
 Target files: facts.js, inject.js, test/test-facts.js, test/test-inject.js
 Depends on: specs/tasks/01-compression-and-query-expansion.md
@@ -43,6 +43,13 @@ Fix evidence verification and TTL drift handling in `facts.js` and tighten promp
 ## Verification
 
 - Run `NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-facts.js` and `test/test-inject.js`; expect all assertions to pass (`0 failed`).
+
+## Implementation result (2026-10-20)
+
+- `facts.js` now separates unverified provenance from missing fingerprinted evidence, flags expired TTLs without renewing them, re-baselines on explicit activation, validates fact updates, replaces local evidence lists, and resolves touched paths with workspace canonical keys.
+- `inject.js` filters common function words, expands short lexicon terms before length filtering, flags selected facts with changed evidence, and skips oversized lines while retaining later facts that fit.
+- Regression coverage was added to `test/test-facts.js` and `test/test-inject.js`. The cross-workspace fixture now marks its temporary project roots explicitly so a parent `/tmp/.git` cannot capture them.
+- Bundled Node 22 full suite passed: workspace 32, facts 67, injection 34, MCP 33, hook 29; all with 0 failures. The suite required execution outside the sandbox because its child Node processes received `EPERM` inside it.
 
 ## Open decisions and sources
 

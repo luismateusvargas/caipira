@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { buildAndMatch: buildMatch, termForms } = require('./compress');
+const { canonicalKey } = require('./workspace');
 
 const VALID_KINDS = ['decision', 'constraint', 'preference', 'status', 'gotcha'];
 const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'proposed'];
@@ -21,16 +22,33 @@ const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'propos
 // Facts that are worth re-checking on a clock, not just on file changes.
 const DEFAULT_TTL_DAYS = { status: 14, decision: null, constraint: null, preference: null, gotcha: null };
 
+/** @typedef {{checked: number, unchanged: number, changed: number, missing: number, unverified: number, foreign: number, changedPaths: string[]}} EvidenceStatus */
+/** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
+/** @typedef {Partial<FactInput>} FactChanges */
+
+/** @param {unknown} value @returns {boolean} */
+function validConfidence(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+/** @param {unknown} value @returns {boolean} */
+function nonEmptyText(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 // ── fingerprinting ──
 
+/** @param {string} filePath @returns {string} */
 function hashFile(filePath) {
   const hash = crypto.createHash('sha256');
   hash.update(fs.readFileSync(filePath));
   return hash.digest('hex');
 }
 
+/** @param {string} filePath @returns {{path: string, size: number, mtime: number, sha256: string}} */
 function fingerprint(filePath) {
   const stat = fs.statSync(filePath);
+  if (!stat.isFile()) throw new Error('not a regular file');
   return {
     path: path.resolve(filePath),
     size: stat.size,
@@ -44,6 +62,7 @@ function fingerprint(filePath) {
 // A highly relevant fact whose evidence has moved should rank below a less
 // relevant one that is still verified: relevance says "about the same thing",
 // trust says "still true", and only their product is worth injecting.
+/** @param {object} fact @param {EvidenceStatus} [evidenceStatus] @returns {number} */
 function trustScore(fact, evidenceStatus) {
   const stateWeight = { active: 1.0, proposed: 0.6, needs_review: 0.35, superseded: 0, revoked: 0 };
   let score = (stateWeight[fact.state] ?? 0) * (fact.confidence ?? 1);
@@ -68,7 +87,9 @@ function trustScore(fact, evidenceStatus) {
 
 // ── store ──
 
+/** Stores and verifies durable facts in one workspace database. */
 class FactStore {
+  /** @param {import('better-sqlite3').Database} db @param {{machine?: string, agent?: string}} [opts] */
   constructor(db, opts = {}) {
     this.db = db;
     this.machine = opts.machine || 'unknown';
@@ -77,10 +98,16 @@ class FactStore {
 
   // ── writes ──
 
+  /** @param {FactInput} input @returns {number} New fact ID. */
   record({ kind, title, body, summary, scope, evidence, confidence, ttl_days, session_id, supersedes, state }) {
     if (!VALID_KINDS.includes(kind)) throw new Error(`kind must be one of: ${VALID_KINDS.join(', ')}`);
-    if (!title || !body) throw new Error('title and body are required');
-    if (state && !VALID_STATES.includes(state)) throw new Error(`invalid state: ${state}`);
+    if (!nonEmptyText(title) || !nonEmptyText(body)) throw new Error('title and body are required');
+    if (state !== undefined && !VALID_STATES.includes(state)) throw new Error(`invalid state: ${state}`);
+    if (confidence !== undefined && !validConfidence(confidence)) throw new Error('confidence must be a number from 0 to 1');
+    if (supersedes !== undefined && supersedes !== null &&
+        (!Number.isSafeInteger(supersedes) || !this.db.prepare('SELECT id FROM facts WHERE id = ?').get(supersedes))) {
+      throw new Error(`no fact to supersede with id ${supersedes}`);
+    }
 
     const now = Date.now();
     const ttl = ttl_days !== undefined ? ttl_days : DEFAULT_TTL_DAYS[kind] ?? null;
@@ -117,6 +144,7 @@ class FactStore {
     return insert();
   }
 
+  /** @param {number} factId @param {string} filePath @returns {void} */
   attachEvidence(factId, filePath) {
     let fp;
     try {
@@ -135,11 +163,26 @@ class FactStore {
     `).run(factId, fp.path, fp.sha256, fp.size, fp.mtime, this.machine, Date.now());
   }
 
+  /** @param {number} id @param {FactChanges} changes @returns {object} Updated fact with evidence. */
   update(id, changes) {
     const fact = this.get(id);
     if (!fact) throw new Error(`no fact with id ${id}`);
-    if (changes.state && !VALID_STATES.includes(changes.state)) {
+    if (!changes || typeof changes !== 'object') throw new Error('changes must be an object');
+    if (changes.state !== undefined && !VALID_STATES.includes(changes.state)) {
       throw new Error(`invalid state: ${changes.state}`);
+    }
+    if (changes.kind !== undefined && !VALID_KINDS.includes(changes.kind)) {
+      throw new Error(`kind must be one of: ${VALID_KINDS.join(', ')}`);
+    }
+    for (const key of ['title', 'body']) {
+      if (changes[key] !== undefined && !nonEmptyText(changes[key])) throw new Error(`${key} must be non-empty text`);
+    }
+    if (changes.confidence !== undefined && !validConfidence(changes.confidence)) {
+      throw new Error('confidence must be a number from 0 to 1');
+    }
+    if (changes.evidence !== undefined &&
+        (!Array.isArray(changes.evidence) || changes.evidence.some(file => !nonEmptyText(file)))) {
+      throw new Error('evidence must be an array of file paths');
     }
 
     const allowed = ['kind', 'scope', 'title', 'body', 'summary', 'state', 'confidence', 'ttl_days'];
@@ -147,23 +190,29 @@ class FactStore {
     for (const key of allowed) {
       if (changes[key] !== undefined) { sets.push(`${key} = ?`); values.push(changes[key]); }
     }
-    if (sets.length === 0) return fact;
+    if (sets.length === 0 && changes.evidence === undefined) return fact;
 
     const now = Date.now();
     sets.push('updated_at = ?', 'updated_by = ?');
     values.push(now, this.agent, id);
-    this.db.prepare(`UPDATE facts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+    const apply = this.db.transaction(() => {
+      this.db.prepare(`UPDATE facts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+      if (Array.isArray(changes.evidence)) {
+        this.db.prepare('DELETE FROM fact_evidence WHERE fact_id = ? AND machine = ?').run(id, this.machine);
+        for (const file of changes.evidence) this.attachEvidence(id, file);
+      }
 
-    // Clearing needs_review means someone looked at the changed files and
-    // decided the fact still holds. Without re-fingerprinting, the very next
-    // check would flip it straight back — so returning a fact to active is
-    // what re-baselines its evidence.
-    if (changes.state === 'active' && fact.state !== 'active') this.reaffirm(id);
-    return this.get(id);
+      // Explicit activation re-baselines evidence even when the stored state
+      // was already active and the underlying files had changed.
+      if (changes.state === 'active') this.reaffirm(id);
+      return this.get(id);
+    });
+    return apply();
   }
 
   // Re-baseline every evidence file recorded on this machine, and mark the
   // fact verified as of now.
+  /** @param {number} id @returns {object} Re-baselined active fact. */
   reaffirm(id) {
     const rows = this.db.prepare(
       'SELECT path FROM fact_evidence WHERE fact_id = ? AND machine = ?'
@@ -177,10 +226,12 @@ class FactStore {
     return this.get(id);
   }
 
+  /** @param {number} id @returns {object} Revoked fact. */
   revoke(id) { return this.update(id, { state: 'revoked' }); }
 
   // ── reads ──
 
+  /** @param {number} id @returns {object|null} Fact with evidence, if found. */
   get(id) {
     const fact = this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id);
     if (!fact) return null;
@@ -189,21 +240,28 @@ class FactStore {
   }
 
   // Two-tier: stat gates the hash, hash gates the verdict.
+  /** @param {number} factId @returns {EvidenceStatus} */
   checkEvidence(factId) {
     const rows = this.db.prepare('SELECT * FROM fact_evidence WHERE fact_id = ?').all(factId);
-    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, foreign: 0, changedPaths: [] };
+    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, unverified: 0, foreign: 0, changedPaths: [] };
 
     for (const row of rows) {
       // Evidence recorded on another machine cannot be verified here; treating
       // it as stale would make an imported memory permanently untrusted.
       if (row.machine !== this.machine) { status.foreign++; continue; }
-      if (!row.sha256) { status.missing++; continue; }
+      if (!row.sha256) { status.unverified++; continue; }
 
       let stat;
       try {
         stat = fs.statSync(row.path);
       } catch {
         status.missing++;
+        status.changedPaths.push(row.path);
+        continue;
+      }
+
+      if (!stat.isFile()) {
+        status.changed++;
         status.changedPaths.push(row.path);
         continue;
       }
@@ -232,6 +290,7 @@ class FactStore {
   }
 
   // Re-checks facts and flips those whose evidence moved into needs_review.
+  /** @param {number[]} [ids] @returns {(EvidenceStatus & {id: number, title: string, drifted: boolean, ttlExpired: boolean})[]} */
   verify(ids) {
     const targets = ids && ids.length
       ? ids
@@ -243,7 +302,9 @@ class FactStore {
       const fact = this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id);
       if (!fact) continue;
       const status = this.checkEvidence(id);
-      const drifted = status.changed > 0 || status.missing > 0;
+      const ttlExpired = Boolean(fact.ttl_days && fact.last_verified_at &&
+        (now - fact.last_verified_at) / 86400000 > fact.ttl_days);
+      const drifted = status.changed > 0 || status.missing > 0 || ttlExpired;
 
       if (drifted && fact.state === 'active') {
         this.db.prepare(`UPDATE facts SET state = 'needs_review', last_checked_at = ? WHERE id = ?`)
@@ -252,21 +313,24 @@ class FactStore {
         // Evidence came back into line (a revert, or the fact was re-recorded).
         this.db.prepare(`UPDATE facts SET state = 'active', last_checked_at = ?, last_verified_at = ? WHERE id = ?`)
           .run(now, now, id);
+      } else if (!drifted && status.checked > 0) {
+        this.db.prepare('UPDATE facts SET last_checked_at = ?, last_verified_at = ? WHERE id = ?')
+          .run(now, now, id);
       } else {
-        this.db.prepare(`UPDATE facts SET last_checked_at = ?${drifted ? '' : ', last_verified_at = ?'} WHERE id = ?`)
-          .run(...(drifted ? [now, id] : [now, now, id]));
+        this.db.prepare('UPDATE facts SET last_checked_at = ? WHERE id = ?').run(now, id);
       }
-      results.push({ id, title: fact.title, ...status, drifted });
+      results.push({ id, title: fact.title, ...status, drifted, ttlExpired });
     }
     return results;
   }
 
   // Which facts rest on these files. Lets PostToolUse re-verify only the facts
   // a write could actually have invalidated, instead of the whole table.
-  // Paths are compared case-insensitively: Windows reaches the same file
-  // through different casing, and evidence is stored as it was first seen.
-  factsForPaths(paths) {
-    const wanted = new Set(paths.filter(Boolean).map(p => path.resolve(p).toLowerCase()));
+  // Canonical keys resolve symlinks and fold case on Windows, where the same
+  // evidence file may be reached through several spellings.
+  /** @param {string[]} paths @param {string} [baseDir] @returns {number[]} */
+  factsForPaths(paths, baseDir) {
+    const wanted = new Set(paths.filter(Boolean).map(p => canonicalKey(baseDir ? path.resolve(baseDir, p) : path.resolve(p))));
     if (wanted.size === 0) return [];
     const rows = this.db.prepare(`
       SELECT DISTINCT e.fact_id AS id, e.path
@@ -275,13 +339,14 @@ class FactStore {
     `).all(this.machine);
     const hits = new Set();
     for (const row of rows) {
-      if (wanted.has(path.resolve(row.path).toLowerCase())) hits.add(row.id);
+      if (wanted.has(canonicalKey(row.path))) hits.add(row.id);
     }
     return [...hits];
   }
 
   // Facts whose evidence moved — the diff between what was decided and what
   // the code now says. Drift is a query, not a guess.
+  /** @returns {object[]} Facts currently marked for review. */
   drifted() {
     return this.db.prepare(`
       SELECT f.id, f.title, f.summary, f.updated_at,
@@ -294,6 +359,7 @@ class FactStore {
   //
   // Lexical recall only. Semantic reranking needs an embedder and lives in the
   // caller, which is the only place that has one.
+  /** @param {string} query @param {{limit?: number, states?: string[]}} [opts] @returns {object[]} */
   search(query, opts = {}) {
     const limit = opts.limit || 10;
     const states = opts.states || ['active', 'needs_review', 'proposed'];
@@ -323,12 +389,14 @@ class FactStore {
     }).sort((a, b) => b.trust - a.trust || b.lexical - a.lexical).slice(0, limit);
   }
 
+  /** @param {number} [limit] @returns {object[]} */
   listActive(limit = 20) {
     return this.db.prepare(`
       SELECT * FROM facts WHERE state = 'active' ORDER BY updated_at DESC LIMIT ?
     `).all(limit);
   }
 
+  /** @returns {number} */
   count() {
     return this.db.prepare('SELECT COUNT(*) n FROM facts').get().n;
   }
@@ -348,6 +416,7 @@ class FactStore {
 // is worth the same as any other workspace's top hit, and trust breaks ties.
 const RRF_K = 60;
 
+/** @param {string} query @param {object} [opts] @returns {object[]} */
 function searchWorkspaces(query, opts = {}) {
   const { listWorkspaces, openWorkspaceDb } = require('./workspace');
   const machine = opts.machine;

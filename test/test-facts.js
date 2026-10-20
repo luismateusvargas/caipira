@@ -148,6 +148,7 @@ console.log('\n13. cross-workspace recall');
   const mk = (name, fact) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), name));
     fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+    fs.writeFileSync(path.join(dir, '.caipira-workspace'), '');
     const w = ws.ensureWorkspace(dir);
     const wdb = ws.openWorkspaceDb(w.dbFile);
     new FactStore(wdb, { machine, agent: 'test' }).record(fact);
@@ -197,6 +198,76 @@ console.log('\n14. validation');
 let threw = false;
 try { store.record({ kind: 'nonsense', title: 't', body: 'b' }); } catch { threw = true; }
 check('rejects unknown kind', threw);
+
+console.log('\n15. unverified provenance versus deleted evidence');
+const absentFile = path.join(tmp, 'never-created.js');
+const unverifiedId = store.record({
+  kind: 'gotcha', title: 'provenance only', body: 'Missing and directory paths are provenance.',
+  evidence: [absentFile, tmp]
+});
+check('unfingerprintable paths have no hash', store.get(unverifiedId).evidence.every(row => row.sha256 === null));
+const unverified = store.verify([unverifiedId])[0];
+check('unfingerprinted provenance does not drift',
+  !unverified.drifted && unverified.unverified === 2 && unverified.missing === 0 &&
+  store.get(unverifiedId).state === 'active', JSON.stringify(unverified));
+
+const deletedFile = path.join(tmp, 'deleted.js');
+fs.writeFileSync(deletedFile, 'module.exports = true;\n');
+const deletedId = store.record({ kind: 'constraint', title: 'deleted file', body: 'File must exist.', evidence: [deletedFile] });
+fs.unlinkSync(deletedFile);
+const deleted = store.verify([deletedId])[0];
+check('deleted fingerprinted file drifts with its exact path',
+  deleted.drifted && deleted.missing === 1 && deleted.changedPaths.includes(deletedFile) &&
+  store.get(deletedId).state === 'needs_review', JSON.stringify(deleted));
+
+console.log('\n16. TTL expiry and explicit re-baselining');
+const ttlId = store.record({ kind: 'status', title: 'old status', body: 'This status expires.', ttl_days: 1, evidence: [liveFile] });
+const twoDaysAgo = Date.now() - 2 * 86400000;
+db.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(twoDaysAgo, ttlId);
+const ttlResult = store.verify([ttlId])[0];
+check('expired status is flagged for review', ttlResult.ttlExpired && ttlResult.drifted && store.get(ttlId).state === 'needs_review');
+check('verification does not silently renew expired status', store.get(ttlId).last_verified_at === twoDaysAgo);
+store.update(ttlId, { state: 'active' });
+check('explicit activation renews expired status',
+  store.get(ttlId).state === 'active' && store.get(ttlId).last_verified_at > twoDaysAgo);
+
+const activeFile = path.join(tmp, 'active.js');
+fs.writeFileSync(activeFile, 'const value = 1;\n');
+const activeId = store.record({ kind: 'decision', title: 'active evidence', body: 'Active evidence can be reaffirmed.', evidence: [activeFile] });
+const originalHash = store.get(activeId).evidence[0].sha256;
+fs.writeFileSync(activeFile, 'const value = 2;\n');
+const activeMtime = (Date.now() + 3000) / 1000;
+fs.utimesSync(activeFile, activeMtime, activeMtime);
+check('an active fact can have changed evidence before verification', store.checkEvidence(activeId).changed === 1);
+store.update(activeId, { state: 'active' });
+check('explicit activation re-baselines an already-active fact',
+  store.get(activeId).state === 'active' && store.get(activeId).evidence[0].sha256 !== originalHash &&
+  store.checkEvidence(activeId).changed === 0);
+
+const replacementFile = path.join(tmp, 'replacement.js');
+fs.writeFileSync(replacementFile, 'const replacement = true;\n');
+store.update(activeId, { evidence: [replacementFile] });
+check('update replaces the local evidence list',
+  store.get(activeId).evidence.length === 1 && store.get(activeId).evidence[0].path === replacementFile);
+
+console.log('\n17. update and record validation');
+const rejects = fn => { try { fn(); return false; } catch { return true; } };
+check('record rejects invalid confidence', rejects(() => store.record({ kind: 'decision', title: 'x', body: 'y', confidence: 1.2 })));
+check('record rejects unknown supersedes ID', rejects(() => store.record({ kind: 'decision', title: 'x', body: 'y', supersedes: 999999 })));
+check('update rejects invalid kind', rejects(() => store.update(activeId, { kind: 'nonsense' })));
+check('update rejects empty title and body',
+  rejects(() => store.update(activeId, { title: '  ' })) && rejects(() => store.update(activeId, { body: '' })));
+check('update rejects invalid confidence', rejects(() => store.update(activeId, { confidence: NaN })));
+check('rejected updates leave the fact intact', store.get(activeId).kind === 'decision' && store.get(activeId).title === 'active evidence');
+
+console.log('\n18. path lookup relative to a base directory and through a symlink');
+check('relative path resolves against supplied base directory',
+  store.factsForPaths([path.relative(tmp, liveFile)], tmp).includes(liveId));
+if (process.platform !== 'win32') {
+  const linkedFile = path.join(tmp, 'linked-live.js');
+  fs.symlinkSync(liveFile, linkedFile);
+  check('symlink resolves to recorded evidence file', store.factsForPaths([linkedFile]).includes(liveId));
+}
 
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });

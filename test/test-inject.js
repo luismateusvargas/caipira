@@ -2,7 +2,7 @@
 // prompts of the shape the user actually writes.
 const ROOT = require('path').join(__dirname, '..');
 const { machineId } = require(ROOT + '/workspace.js');
-const { buildPromptInjection, buildStandingInjection, selectFacts } = require(ROOT + '/inject.js');
+const { buildPromptInjection, buildStandingInjection, selectFacts, renderInjection, termGroups } = require(ROOT + '/inject.js');
 const { buildOrMatch, termForms, ftsQuote } = require(ROOT + '/compress.js');
 
 const { db } = require('./fixtures').seedFacts(ROOT);
@@ -55,6 +55,11 @@ for (const prompt of shouldMiss) {
   check(`silent on "${prompt.slice(0, 48)}..."`, text === null,
     text && text.slice(0, 160));
 }
+check('two-letter db recalls the database fact', selectFacts(db, 'where is the db?', opts).some(hit => hit.fact.id === 2));
+check('two-letter domain abbreviations remain searchable',
+  ['database', 'function', 'transaction', 'middleware'].every(long =>
+    termGroups('db fn tx mw').some(forms => forms.includes(long))));
+check('common English function words do not inject a fact', buildPromptInjection(db, 'when did this happen?', opts) === null);
 
 console.log('\n3. injection never exceeds its budget');
 const big = buildPromptInjection(db, 'codex caipira cavemem database workspace injection decision configuration', opts);
@@ -73,6 +78,16 @@ const framed = buildPromptInjection(db, 'how do I wire codex over to caipira and
 check('names update_fact for contradictions', framed && framed.includes('update_fact'));
 check('discourages reconfirming', framed && /re-reading files|re-running checks/i.test(framed));
 check('still gates on NEEDS REVIEW', framed && framed.includes('NEEDS REVIEW'));
+const activeStale = renderInjection([{
+  fact: { id: 99, kind: 'decision', summary: 'Changed evidence', state: 'active' },
+  stale: ['/tmp/changed.js']
+}]);
+check('active fact with changed evidence is flagged', activeStale && activeStale.includes('NEEDS REVIEW') && activeStale.includes('/tmp/changed.js'));
+const oversized = { fact: { id: 98, kind: 'decision', summary: 'x'.repeat(1300), state: 'active' }, stale: [] };
+const fitting = { fact: { id: 99, kind: 'decision', summary: 'Short fact', state: 'active' }, stale: [] };
+const budgeted = renderInjection([oversized, fitting]);
+check('oversized fact does not hide a later fitting fact', budgeted && budgeted.includes('#99') && !budgeted.includes('#98'));
+check('rendering no fitting facts returns null', renderInjection([oversized]) === null);
 console.log('\n--- SessionStart injection ---\n' + standing);
 
 console.log('\n--- UserPromptSubmit injection for a real prompt ---');
