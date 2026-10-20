@@ -1,6 +1,6 @@
 # Fix workspace root resolution, master registry writes, and store reliability
 
-Status: ready
+Status: done
 Project rules: specs/project.md#constitution
 Target files: workspace.js, store.js, test/test-workspace.js, test/test-hook.js
 Depends on: specs/tasks/01-compression-and-query-expansion.md

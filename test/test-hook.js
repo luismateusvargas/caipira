@@ -86,7 +86,7 @@ r = run('claude-code', 'SessionStart', { session_id: 'x', cwd: 'Z:\\does\\not\\e
 check('nonexistent workspace tolerated', typeof r === 'object', JSON.stringify(r).slice(0, 100));
 
 console.log('\n7. observations route to the workspace db, not the legacy one');
-const D = require(ROOT + '/node_modules/better-sqlite3');
+const D = require('better-sqlite3');
 const { ensureWorkspace } = require(ROOT + '/workspace.js');
 const wsInfo = ensureWorkspace(WS);
 const wdb = new D(wsInfo.dbFile, { readonly: true });

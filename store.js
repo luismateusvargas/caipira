@@ -4,9 +4,11 @@
 // Hybrid search: FTS5 BM25 + cosine similarity rerank.
 
 const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { compress, expand, countTokens, queryForms, buildAndMatch } = require('./compress');
+const { LEXICON, compress, expand, countTokens, queryForms, buildAndMatch } = require('./compress');
+const { migrate, WORKSPACE_MIGRATIONS } = require('./migrate');
 
 // CAIPIRA_HOME redirects the store, so tests never touch the real database.
 const DEFAULT_DB = path.join(
@@ -18,76 +20,12 @@ const DEFAULT_DB = path.join(
 
 const PRIVATE_RE = /<private>[\s\S]*?<\/private>/gi;
 function redactPrivate(input) {
+  if (typeof input !== 'string') return '';
   const closed = input.replace(PRIVATE_RE, '');
   const idx = closed.search(/<private>/i);
   if (idx >= 0) return closed.slice(0, idx);
   return closed;
 }
-
-// ── SCHEMA ──
-
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  ide TEXT NOT NULL DEFAULT 'codewhale',
-  cwd TEXT,
-  started_at INTEGER NOT NULL,
-  ended_at INTEGER,
-  metadata TEXT
-);
-
-CREATE TABLE IF NOT EXISTS observations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  content TEXT NOT NULL,
-  compressed INTEGER NOT NULL DEFAULT 1,
-  intensity TEXT,
-  ts INTEGER NOT NULL,
-  metadata TEXT
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
-  content,
-  content='observations',
-  content_rowid='id',
-  tokenize='porter unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS embeddings (
-  observation_id INTEGER PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
-  model TEXT NOT NULL,
-  dim INTEGER NOT NULL,
-  vec BLOB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS summaries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  scope TEXT NOT NULL CHECK(scope IN ('turn','session')),
-  content TEXT NOT NULL,
-  compressed INTEGER NOT NULL DEFAULT 1,
-  intensity TEXT,
-  ts INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS schema_version (
-  version INTEGER PRIMARY KEY
-);
-`;
-
-const INSERT_TRIGGERS = `
-CREATE TRIGGER IF NOT EXISTS obs_ai AFTER INSERT ON observations BEGIN
-  INSERT INTO observations_fts(rowid, content) VALUES (new.id, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS obs_ad AFTER DELETE ON observations BEGIN
-  INSERT INTO observations_fts(observations_fts, rowid, content) VALUES('delete', old.id, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS obs_au AFTER UPDATE ON observations BEGIN
-  INSERT INTO observations_fts(observations_fts, rowid, content) VALUES('delete', old.id, old.content);
-  INSERT INTO observations_fts(rowid, content) VALUES (new.id, new.content);
-END;
-`;
 
 // ── RANKING ──
 
@@ -105,59 +43,90 @@ function cosine(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
+// Min/max over the values actually present: an item with no cosine is
+// unscored, not scored 0, and a loop survives corpora too large to spread
+// into Math.min().
+function bounds(items, key) {
+  let min = Infinity, max = -Infinity;
+  for (const item of items) {
+    const v = item[key];
+    if (v == null) continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  return { min, max };
+}
+
 function hybridRank(items, alpha) {
-  const bm25s = items.map(x => x.bm25 ?? 0);
-  const cosines = items.map(x => x.cosine ?? 0);
-  const [bmin, bmax] = [Math.min(...bm25s), Math.max(...bm25s)];
-  const [cmin, cmax] = [Math.min(...cosines), Math.max(...cosines)];
-  const bRange = bmax - bmin || 1;
-  const cRange = cmax - cmin || 1;
+  const b = bounds(items, 'bm25');
+  const c = bounds(items, 'cosine');
   return items.map(x => {
-    const b = ((x.bm25 ?? bmin) - bmin) / bRange;
-    const c = ((x.cosine ?? cmin) - cmin) / cRange;
-    return { id: x.id, score: alpha * b + (1 - alpha) * c };
+    // A lone or tied keyword hit is a full match, not the bottom of a range.
+    const bn = x.bm25 == null ? 0
+      : b.max === b.min ? (b.max > 0 ? 1 : 0)
+      : (x.bm25 - b.min) / (b.max - b.min);
+    const cn = x.cosine == null ? 0 : (x.cosine - c.min) / (c.max - c.min || 1);
+    return { id: x.id, score: alpha * bn + (1 - alpha) * cn };
   }).sort((a, b) => b.score - a.score);
 }
 
+// Node may hand back a pooled Buffer at any byte offset, and a Float32Array
+// view must start on a 4-byte boundary, so copy into a buffer of its own.
+function toFloat32(blob) {
+  return new Float32Array(new Uint8Array(blob.buffer, blob.byteOffset, blob.byteLength).slice().buffer);
+}
+
+/** @typedef {{id: number, session_id: string, snippet: string, score: number, ts: number}} KeywordHit */
+/** @typedef {{id: number, session_id: string, snippet: string, content: string, score: number, ts: number, metadata: null}} SearchHit */
+/** @typedef {{model: string, dim: number, embed: (text: string) => Promise<Float32Array>}} Embedder */
+
 // ── STORAGE ──
 
+/** Raw SQL access to one workspace database: sessions, observations, summaries, embeddings. */
 class Storage {
+  /** @param {string} [dbPath] Database file; defaults to the legacy data.db. */
   constructor(dbPath) {
     this.dbPath = dbPath || DEFAULT_DB;
     this.db = new Database(this.dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
-    this._initSchema();
-  }
-
-  _initSchema() {
-    this.db.exec(SCHEMA_SQL);
-    try { this.db.exec(INSERT_TRIGGERS); } catch {}
-    const v = this.db.prepare('SELECT MAX(version) as v FROM schema_version').get();
-    if (!v || v.v === null) {
-      this.db.prepare('INSERT OR IGNORE INTO schema_version (version) VALUES (1)').run();
+    try {
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('foreign_keys = ON');
+      migrate(this.db, WORKSPACE_MIGRATIONS);
+    } catch (err) {
+      this.db.close();
+      throw err;
     }
   }
 
   // ── sessions ──
 
+  // ensureSession() can register a session as 'unknown' before its start
+  // event arrives; the real start then fills in what the placeholder lacked
+  // without overwriting anything already known.
+  /** @param {{id: string, ide?: string, cwd?: string|null, started_at?: number, metadata?: string|null}} session */
   createSession({ id, ide, cwd, started_at, metadata }) {
     return this.db.prepare(`
-      INSERT OR IGNORE INTO sessions (id, ide, cwd, started_at, metadata)
+      INSERT INTO sessions (id, ide, cwd, started_at, metadata)
       VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        ide = CASE WHEN sessions.ide = 'unknown' AND excluded.ide != 'unknown' THEN excluded.ide ELSE sessions.ide END,
+        cwd = COALESCE(sessions.cwd, excluded.cwd)
     `).run(id, ide || 'codewhale', cwd || null, started_at || Date.now(), metadata || null);
   }
 
+  /** @param {string} id */
   endSession(id) {
     return this.db.prepare(`UPDATE sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL`).run(Date.now(), id);
   }
 
+  /** @param {number} [limit] @returns {object[]} Newest first. */
   listSessions(limit = 20) {
     return this.db.prepare(`SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?`).all(limit);
   }
 
   // ── observations ──
 
+  /** @param {object} obs Row fields; content is stored as given. @returns {number} New observation id. */
   insertObservation(obs) {
     const info = this.db.prepare(`
       INSERT INTO observations (session_id, kind, content, compressed, intensity, ts, metadata)
@@ -166,18 +135,21 @@ class Storage {
     return Number(info.lastInsertRowid);
   }
 
+  /** @param {number[]} ids @returns {object[]} Raw rows in id order. */
   getObservations(ids) {
     if (!ids || ids.length === 0) return [];
     const placeholders = ids.map(() => '?').join(',');
     return this.db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY id`).all(...ids);
   }
 
+  /** @returns {number} */
   countObservations() {
     return this.db.prepare('SELECT COUNT(*) as c FROM observations').get().c;
   }
 
   // ── summaries ──
 
+  /** @param {object} s Row fields; content is stored as given. */
   insertSummary(s) {
     return this.db.prepare(`
       INSERT INTO summaries (session_id, scope, content, compressed, intensity, ts)
@@ -185,29 +157,34 @@ class Storage {
     `).run(s.session_id, s.scope, s.content, s.compressed ? 1 : 0, s.intensity || null, s.ts || Date.now());
   }
 
+  /** @param {string} sessionId @returns {object[]} Newest first. */
   listSummaries(sessionId) {
     return this.db.prepare(`SELECT * FROM summaries WHERE session_id = ? ORDER BY ts DESC`).all(sessionId);
   }
 
   // ── FTS5 search ──
 
+  /** @param {string} query @param {number} [limit] @returns {KeywordHit[]} Higher score is better. */
   searchFts(query, limit = 10) {
     if (!query || !query.trim()) return [];
     const match = buildAndMatch(query);
     let rows = [];
-    try {
-      rows = this.db.prepare(`
-        SELECT o.id, o.session_id, o.ts,
-               snippet(observations_fts, 0, '[', ']', '\u2026', 16) AS snippet,
-               bm25(observations_fts) AS score
-        FROM observations_fts
-        JOIN observations o ON o.id = observations_fts.rowid
-        WHERE observations_fts MATCH ?
-        ORDER BY score ASC
-        LIMIT ?
-      `).all(match, limit);
-    } catch {
-      rows = [];
+    // A query of nothing but stopwords leaves no FTS term at all.
+    if (match) {
+      try {
+        rows = this.db.prepare(`
+          SELECT o.id, o.session_id, o.ts,
+                 snippet(observations_fts, 0, '[', ']', '\u2026', 16) AS snippet,
+                 bm25(observations_fts) AS score
+          FROM observations_fts
+          JOIN observations o ON o.id = observations_fts.rowid
+          WHERE observations_fts MATCH ?
+          ORDER BY score ASC
+          LIMIT ?
+        `).all(match, limit);
+      } catch {
+        rows = [];
+      }
     }
     // Fallback: if FTS5 returned nothing or threw, try LIKE with OR across terms
     if (rows.length === 0) {
@@ -236,6 +213,7 @@ class Storage {
 
   // ── embeddings ──
 
+  /** @param {number} observationId @param {string} model @param {Float32Array} vec */
   putEmbedding(observationId, model, vec) {
     const buf = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
     this.db.prepare(
@@ -243,23 +221,25 @@ class Storage {
     ).run(observationId, model, vec.length, buf);
   }
 
+  /** @param {number} observationId @returns {{model: string, dim: number, vec: Float32Array}|undefined} */
   getEmbedding(observationId) {
     const row = this.db.prepare("SELECT model, dim, vec FROM embeddings WHERE observation_id = ?").get(observationId);
     if (!row) return undefined;
-    const vec = new Float32Array(row.vec.buffer, row.vec.byteOffset, row.dim);
-    return { model: row.model, dim: row.dim, vec };
+    return { model: row.model, dim: row.dim, vec: toFloat32(row.vec) };
   }
 
+  /** @param {{model: string, dim: number}} [filter] @returns {{observation_id: number, vec: Float32Array}[]} */
   allEmbeddings(filter) {
     const rows = filter
       ? this.db.prepare("SELECT observation_id, dim, vec FROM embeddings WHERE model = ? AND dim = ?").all(filter.model, filter.dim)
       : this.db.prepare("SELECT observation_id, dim, vec FROM embeddings").all();
     return rows.map(r => ({
       observation_id: r.observation_id,
-      vec: new Float32Array(new Uint8Array(r.vec.buffer, r.vec.byteOffset, r.vec.byteLength).slice().buffer)
+      vec: toFloat32(r.vec)
     }));
   }
 
+  /** @param {number} [limit] @param {string} [model] @returns {object[]} Rows with no embedding (for model, if given). */
   observationsMissingEmbeddings(limit = 100, model) {
     if (model) {
       return this.db.prepare(`
@@ -277,11 +257,13 @@ class Storage {
     `).all(limit);
   }
 
+  /** @param {string} model @returns {number} Rows deleted. */
   dropEmbeddingsWhereModelNot(model) {
     const info = this.db.prepare("DELETE FROM embeddings WHERE model != ?").run(model);
     return Number(info.changes);
   }
 
+  /** @param {{model: string, dim: number}} [filter] @returns {number} */
   countEmbeddings(filter) {
     if (filter) {
       return this.db.prepare("SELECT COUNT(*) AS n FROM embeddings WHERE model = ? AND dim = ?").get(filter.model, filter.dim).n;
@@ -294,13 +276,25 @@ class Storage {
 
 // ── MEMORY STORE ──
 
+// `caipira mode <lite|full|ultra>` writes the active intensity next to this
+// file; a missing or unrecognised value falls back to full.
+function activeIntensity() {
+  try {
+    const mode = fs.readFileSync(path.join(__dirname, 'active'), 'utf8').trim();
+    if (Object.hasOwn(LEXICON.fillers, mode)) return mode;
+  } catch {}
+  return 'full';
+}
+
 const DEFAULT_SETTINGS = {
-  compression: { intensity: 'full', expandForModel: false },
+  compression: { intensity: activeIntensity(), expandForModel: false },
   search: { alpha: 0.5, defaultLimit: 10 },
   embedding: { provider: 'local', model: 'Xenova/all-MiniLM-L6-v2' }
 };
 
+/** Observation memory for one workspace: redacts and compresses on write, ranks on search. */
 class MemoryStore {
+  /** @param {{dbPath?: string, settings?: typeof DEFAULT_SETTINGS}} [opts] */
   constructor(opts = {}) {
     this.storage = new Storage(opts.dbPath);
     this.settings = opts.settings || DEFAULT_SETTINGS;
@@ -310,6 +304,7 @@ class MemoryStore {
 
   // ── sessions ──
 
+  /** @param {{id: string, ide?: string, cwd?: string}} p */
   startSession(p) {
     this.storage.createSession({ id: p.id, ide: p.ide, cwd: p.cwd, started_at: Date.now(), metadata: null });
   }
@@ -322,12 +317,14 @@ class MemoryStore {
     return this.storage.listSessions(limit);
   }
 
-  ensureSession(id) {
-    this.storage.createSession({ id, ide: 'unknown', cwd: null, started_at: Date.now(), metadata: null });
+  /** Register a placeholder session; a later startSession() fills in ide and cwd. @param {string} id @param {string} [ide] @param {string|null} [cwd] */
+  ensureSession(id, ide = 'unknown', cwd = null) {
+    this.storage.createSession({ id, ide, cwd, started_at: Date.now(), metadata: null });
   }
 
   // ── observations (WITH compression) ──
 
+  /** @param {{session_id: string, kind: string, content: string, metadata?: object|string}} p @returns {number} New id, or -1 when nothing survives redaction. */
   addObservation(p) {
     const redacted = redactPrivate(p.content);
     if (!redacted.trim()) return -1;
@@ -346,8 +343,10 @@ class MemoryStore {
     return this.storage.insertObservation(obs);
   }
 
+  /** @param {{session_id: string, scope: 'turn'|'session', content: string}} p @returns {object|null} Run result, or null when nothing survives redaction. */
   addSummary(p) {
     const redacted = redactPrivate(p.content);
+    if (!redacted.trim()) return null;
     this.ensureSession(p.session_id);
     const intensity = this.settings.compression.intensity;
     const out = compress(redacted, { intensity });
@@ -363,6 +362,7 @@ class MemoryStore {
 
   // ── reads ──
 
+  /** @param {number[]} ids @param {{expand?: boolean}} [opts] @returns {object[]} */
   getObservations(ids, opts = {}) {
     const wantExpand = opts.expand ?? this.settings.compression.expandForModel;
     return this.storage.getObservations(ids).map(r => ({
@@ -377,6 +377,7 @@ class MemoryStore {
     }));
   }
 
+  /** @param {string} sessionId @param {number|null} [aroundId] @param {number} [limit] @returns {object[]} */
   timeline(sessionId, aroundId, limit = 20) {
     const rows = aroundId
       ? this.storage.db.prepare(`SELECT * FROM observations WHERE session_id = ? AND id BETWEEN ? AND ? ORDER BY id LIMIT ?`).all(sessionId, Math.max(0, aroundId - limit / 2), aroundId + limit / 2, limit)
@@ -389,6 +390,11 @@ class MemoryStore {
 
   // ── search ──
 
+  /**
+   * Keyword search, reranked against embeddings when an embedder is given.
+   * @param {string} query @param {number} [limit] @param {Embedder|null} [embedder]
+   * @returns {Promise<SearchHit[]>}
+   */
   async search(query, limit, embedder) {
     const cap = limit ?? this.settings.search.defaultLimit;
     const alpha = this.settings.search.alpha;
