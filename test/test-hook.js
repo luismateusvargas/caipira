@@ -1,10 +1,10 @@
 // Drives universal-hook.js exactly as each client would: JSON on stdin,
 // JSON on stdout, one process per event.
 const { execFileSync } = require('child_process');
-const ROOT = 'C:/Users/luism/.caipira';
-const NODE = ROOT + '/node22/node-v22.20.0-win-x64/node.exe';
+const ROOT = require('path').join(__dirname, '..');
+const NODE = process.execPath;
 const HOOK = ROOT + '/hooks/universal-hook.js';
-const WS = 'C:\\Users\\luism\\.caipira';
+const WS = ROOT;
 
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => {
@@ -93,7 +93,7 @@ const wdb = new D(wsInfo.dbFile, { readonly: true });
 const n = wdb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id LIKE 'hooktest%'").get().n;
 check('hook writes landed in workspace db (' + n + ')', n > 0);
 wdb.close();
-const ldb = new D(ROOT + '/data.db', { readonly: true });
+const ldb = new D(require(ROOT + '/workspace.js').LEGACY_DB, { readonly: true });
 const leaked = ldb.prepare("SELECT COUNT(*) n FROM observations WHERE session_id LIKE 'hooktest%'").get().n;
 check('nothing leaked into legacy data.db', leaked === 0, leaked);
 ldb.close();

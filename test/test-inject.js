@@ -1,10 +1,11 @@
 // Runs the gate against a seeded three-fact workspace (see fixtures.js), using
 // prompts of the shape the user actually writes.
-const ROOT = 'C:/Users/luism/.caipira';
+const ROOT = require('path').join(__dirname, '..');
 const { machineId } = require(ROOT + '/workspace.js');
 const { buildPromptInjection, buildStandingInjection, selectFacts } = require(ROOT + '/inject.js');
+const { buildOrMatch, termForms, ftsQuote } = require(ROOT + '/compress.js');
 
-const { db } = require('./fixtures').seedFacts('C:/Users/luism/.caipira');
+const { db } = require('./fixtures').seedFacts(ROOT);
 const opts = { machine: machineId() };
 
 let pass = 0, fail = 0;
@@ -41,6 +42,12 @@ for (const [prompt, expectedId] of shouldHit) {
   check(`"${prompt.slice(0, 52)}..." -> #${expectedId}`, ids.includes(expectedId),
     'got ' + JSON.stringify(ids) + ' cov=' + JSON.stringify(selected.map(s => s.coverage.toFixed(2))));
 }
+
+const orMatch = buildOrMatch([termForms('w/'), termForms('b/c')]);
+const orHits = db.prepare('SELECT rowid FROM facts_fts WHERE facts_fts MATCH ?').all(orMatch);
+check('shared OR query searches expanded slash abbreviations', orHits.some(hit => hit.rowid === 3));
+check('shared OR query keeps groups separate', orMatch.includes(' OR ') && orMatch.includes('"with"') && orMatch.includes('"because"'));
+check('FTS quoting escapes embedded quotes', ftsQuote('a"b') === '"a""b"');
 
 console.log('\n2. prompts that must inject NOTHING');
 for (const prompt of shouldMiss) {

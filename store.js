@@ -6,7 +6,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const os = require('os');
-const { compress, expand, countTokens } = require('./compress');
+const { compress, expand, countTokens, queryForms, buildAndMatch } = require('./compress');
 
 // CAIPIRA_HOME redirects the store, so tests never touch the real database.
 const DEFAULT_DB = path.join(
@@ -119,49 +119,6 @@ function hybridRank(items, alpha) {
   }).sort((a, b) => b.score - a.score);
 }
 
-// Observations are stored compressed, so a raw query term cannot match its
-// stored form — "database" never matches a stored "db". Search every form a
-// term could take: as typed, compressed at each intensity, and expanded.
-const SEARCH_INTENSITIES = ['full', 'ultra'];
-
-function hasSearchableChars(s) {
-  return /[\p{L}\p{N}]/u.test(s);
-}
-
-// Terms the compressor also strips from stored content (articles, fillers)
-// yield no usable form and are dropped rather than made to match nothing.
-function termForms(term) {
-  const forms = new Set();
-  const add = (value) => {
-    const trimmed = (value || '').trim();
-    if (trimmed && hasSearchableChars(trimmed)) forms.add(trimmed);
-  };
-  // Expand first, then compress the expansion: an already-abbreviated query
-  // ('cfg') otherwise never reaches the other intensity's form ('config').
-  const expanded = expand(term);
-  for (const base of new Set([term, expanded])) {
-    add(base);
-    for (const intensity of SEARCH_INTENSITIES) add(compress(base, { intensity }));
-  }
-  return Array.from(forms);
-}
-
-function queryForms(query) {
-  return Array.from(new Set(query.split(/\s+/).filter(Boolean).flatMap(termForms)));
-}
-
-function ftsQuote(s) { return `"${s.replace(/"/g, '""')}"`; }
-
-// AND across terms, OR within each term's forms. Returns '' when no term
-// survives, which searchFts treats as "skip FTS".
-function sanitizeMatch(q) {
-  return q.split(/\s+/).filter(Boolean)
-    .map(termForms)
-    .filter(forms => forms.length > 0)
-    .map(forms => forms.length === 1 ? ftsQuote(forms[0]) : `(${forms.map(ftsQuote).join(' OR ')})`)
-    .join(' AND ');
-}
-
 // ── STORAGE ──
 
 class Storage {
@@ -236,7 +193,7 @@ class Storage {
 
   searchFts(query, limit = 10) {
     if (!query || !query.trim()) return [];
-    const match = sanitizeMatch(query);
+    const match = buildAndMatch(query);
     let rows = [];
     try {
       rows = this.db.prepare(`

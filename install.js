@@ -2,8 +2,8 @@
 // caipira/install.js — installs and wires Caipira into Claude Code.
 //
 // Run with the BUNDLED Node 22 runtime, never the system Node 24:
-//   .\node22\node-v22.20.0-win-x64\node.exe install.js
-// (caipira.cmd does this for you.)
+//   Windows: .\node22\node-v22.20.0-win-x64\node.exe install.js  (caipira.cmd)
+//   Linux:   ./node22/node-v22.20.0-linux-x64/bin/node install.js  (caipira.sh)
 //
 // Commands: install | uninstall | status | doctor | prune [--apply] | mode <lite|full|ultra>
 
@@ -14,14 +14,28 @@ const { execFileSync } = require('child_process');
 
 const ROOT = __dirname;
 const HOME = os.homedir();
-const NODE_BIN = path.join(ROOT, 'node22', 'node-v22.20.0-win-x64', 'node.exe');
-const NPM_CLI = path.join(ROOT, 'node22', 'node-v22.20.0-win-x64', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+const IS_WINDOWS = process.platform === 'win32';
+const NODE_DIR = path.join(ROOT, 'node22', IS_WINDOWS ? 'node-v22.20.0-win-x64' : 'node-v22.20.0-linux-x64');
+const NODE_BIN = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
+const NPM_CLI = IS_WINDOWS
+  ? path.join(NODE_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  : path.join(NODE_DIR, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
 const MCP_ENTRY = path.join(ROOT, 'mcp.js');
 const HOOK_ENTRY = path.join(ROOT, 'hooks', 'universal-hook.js');
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
 const CODEX_CONFIG = path.join(HOME, '.codex', 'config.toml');
 const ANTIGRAVITY_MCP = path.join(HOME, '.gemini', 'config', 'mcp_config.json');
+const ANTIGRAVITY_HOOKS = path.join(HOME, '.gemini', 'config', 'hooks.json');
+
+// Antigravity hook events. Tool events are grouped behind a matcher; the
+// invocation and stop events take a flat list of handlers.
+const ANTIGRAVITY_EVENTS = [
+  ['PreInvocation', 'pre-invocation', false],
+  ['PostToolUse', 'post-tool-use', true],
+  ['PostInvocation', 'post-invocation', false],
+  ['Stop', 'stop', false]
+];
 const MODEL_DIR = path.join(ROOT, 'models', 'Xenova', 'all-MiniLM-L6-v2');
 
 // Claude Code hook events -> Caipira lifecycle events.
@@ -30,6 +44,8 @@ const HOOK_MARKER = 'caipira';
 
 // Codex names the same lifecycle points differently, and keys its hook trust
 // state by the snake_case form rather than the TOML table name.
+// Codex clamps SessionEnd hooks to 3s and warns on every launch if asked for more.
+const codexTimeout = lifecycle => (lifecycle === 'session-end' ? 3 : 15);
 const CODEX_HOOKS = [
   ['SessionStart', 'session_start', 'session-start'],
   ['UserPromptSubmit', 'user_prompt_submit', 'user-prompt-submit'],
@@ -193,10 +209,34 @@ function registerCodex() {
         hooksFixed++;
         continue;
       }
+      if (/^\s*timeout\s*=/.test(line)) {
+        const timeout = `timeout = ${codexTimeout(section)}`;
+        if (line.trim() !== timeout) hooksFixed++;
+        out.push(timeout);
+        continue;
+      }
       if (/^\[/.test(line)) section = null;
     }
 
     out.push(line);
+  }
+
+  // Repointing only touches entries that exist; a fresh Codex has none, so the
+  // MCP server and hook tables are appended the first time round.
+  let appended = '';
+  if (!out.some(line => /^\[mcp_servers\.caipira\]/.test(line))) {
+    appended += `\n[mcp_servers.caipira]\ncommand = '${NODE_BIN}'\nargs = ['${MCP_ENTRY}']\n`;
+  }
+  for (const [toml, , lifecycle] of CODEX_HOOKS) {
+    const present = out.some(line => line.startsWith(`[[hooks.${toml}.hooks]]`));
+    if (present) continue;
+    appended += `\n[[hooks.${toml}]]\n[[hooks.${toml}.hooks]]\ntype = "command"\n`
+      + `command = '${codexCommand(lifecycle, false)}'\n`
+      + `command_windows = '${codexCommand(lifecycle, true)}'\ntimeout = ${codexTimeout(lifecycle)}\n`;
+  }
+  if (appended) {
+    while (out.length && out[out.length - 1] === '') out.pop();
+    out.push(appended.replace(/\n$/, ''), '');
   }
 
   const updated = out.join('\n');
@@ -219,6 +259,24 @@ function registerAntigravity() {
   };
   writeJsonAtomic(ANTIGRAVITY_MCP, config);
   ok('MCP server "caipira" registered for Antigravity');
+}
+
+// hooks.json is keyed by hook name, so Caipira owns the "caipira" entry
+// outright and rewriting it never touches anyone else's hooks.
+function registerAntigravityHooks() {
+  const config = readJson(ANTIGRAVITY_HOOKS, {});
+  const spec = {};
+  for (const [event, lifecycle, grouped] of ANTIGRAVITY_EVENTS) {
+    const handler = {
+      type: 'command',
+      command: `"${NODE_BIN}" "${HOOK_ENTRY}" --client antigravity --event ${lifecycle}`,
+      timeout: 15
+    };
+    spec[event] = grouped ? [{ matcher: '*', hooks: [handler] }] : [handler];
+  }
+  config.caipira = spec;
+  writeJsonAtomic(ANTIGRAVITY_HOOKS, config);
+  ok(`Antigravity hooks registered: ${ANTIGRAVITY_EVENTS.map(([event]) => event).join(', ')}`);
 }
 
 function unregister() {
@@ -306,6 +364,7 @@ function doctor() {
 
   const antigravity = readJson(ANTIGRAVITY_MCP, {});
   check('Antigravity MCP registered', Boolean(antigravity.mcpServers?.caipira), 'run: caipira install');
+  check('Antigravity hooks registered', Boolean(readJson(ANTIGRAVITY_HOOKS, {}).caipira), 'run: caipira install');
 
   check(`mode flag (${currentMode()})`, ['lite', 'full', 'ultra'].includes(currentMode()));
 
@@ -415,6 +474,7 @@ function install() {
   registerHooks();
   registerCodex();
   registerAntigravity();
+  registerAntigravityHooks();
   log('\nRestart Claude Code to load the MCP server and hooks.');
   log('Verify any time with: caipira doctor\n');
 }

@@ -1,6 +1,6 @@
-process.chdir('C:/Users/luism/.caipira');
+process.chdir(require('path').join(__dirname, '..'));
 const fs = require('fs'), os = require('os'), path = require('path');
-const ws = require('C:/Users/luism/.caipira/workspace.js');
+const ws = require('../workspace.js');
 
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => {
@@ -9,15 +9,15 @@ const check = (label, cond, extra) => {
 };
 
 console.log('\n1. workspace root resolution');
-const caipira = 'C:\\Users\\luism\\.caipira';
+const caipira = path.join(__dirname, '..');
 check('.caipira resolves to itself (has package.json)', ws.findRoot(caipira).toLowerCase() === caipira.toLowerCase(), ws.findRoot(caipira));
 check('subdir walks up to root', ws.findRoot(path.join(caipira, 'hooks')).toLowerCase() === caipira.toLowerCase(), ws.findRoot(path.join(caipira, 'hooks')));
 
 console.log('\n2. canonicalisation (the Windows traps)');
-const a = ws.canonicalKey('C:\\Users\\luism\\.caipira');
-const b = ws.canonicalKey('C:/Users/LUISM/.CAIPIRA/');
-const c = ws.canonicalKey('C:\\Users\\luism\\.caipira\\hooks\\..');
-check('case-insensitive + trailing sep collapse', a === b, a + ' vs ' + b);
+const a = ws.canonicalKey(caipira);
+const b = ws.canonicalKey(process.platform === 'win32' ? caipira.toUpperCase() + path.sep : caipira + path.sep);
+const c = ws.canonicalKey(path.join(caipira, 'hooks') + path.sep + '..');
+check(process.platform === 'win32' ? 'case-insensitive + trailing sep collapse' : 'trailing sep collapse', a === b, a + ' vs ' + b);
 check('.. normalised', a === c, a + ' vs ' + c);
 
 // Adoption happens inside the first ensureWorkspace, and an isolated
@@ -25,7 +25,7 @@ check('.. normalised', a === c, a + ' vs ' + c);
 // a data.db holding a real observation, exactly as the real one did.
 if (!fs.existsSync(ws.LEGACY_DB)) {
   fs.mkdirSync(path.dirname(ws.LEGACY_DB), { recursive: true });
-  const { MemoryStore } = require('C:/Users/luism/.caipira/store.js');
+  const { MemoryStore } = require('../store.js');
   const seed = new MemoryStore({ dbPath: ws.LEGACY_DB });
   seed.startSession({ id: 'legacy-seed', ide: 'test', cwd: caipira });
   seed.addObservation({ session_id: 'legacy-seed', kind: 'note', content: 'pre-split observation' });
@@ -53,8 +53,8 @@ check('legacy row present', Boolean(legacy));
 check('legacy points at original data.db', legacy && legacy.db_file === ws.LEGACY_DB, legacy && legacy.db_file);
 
 console.log('\n6. migrations are versioned and repeatable');
-const D = require('C:/Users/luism/.caipira/node_modules/better-sqlite3');
-const { migrate, WORKSPACE_MIGRATIONS } = require('C:/Users/luism/.caipira/migrate.js');
+const D = require('better-sqlite3');
+const { migrate, WORKSPACE_MIGRATIONS } = require('../migrate.js');
 const fresh = path.join(tmp, 'fresh.db');
 const db1 = new D(fresh);
 const r1 = migrate(db1, WORKSPACE_MIGRATIONS);
@@ -68,7 +68,7 @@ const legacyDb = new D(ws.LEGACY_DB);
 const before = legacyDb.prepare('SELECT COUNT(*) n FROM observations').get().n;
 const r3 = migrate(legacyDb, WORKSPACE_MIGRATIONS);
 const after = legacyDb.prepare('SELECT COUNT(*) n FROM observations').get().n;
-check('legacy db reaches current version', require('C:/Users/luism/.caipira/migrate.js').currentVersion(legacyDb) === 2, JSON.stringify(r3));
+check('legacy db reaches current version', require('../migrate.js').currentVersion(legacyDb) === 2, JSON.stringify(r3));
 check('observations preserved (' + before + ')', before === after && before > 0);
 legacyDb.close();
 

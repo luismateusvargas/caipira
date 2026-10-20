@@ -1,6 +1,9 @@
-// caipira/compress.js — EXACT port of cavemem compress/expand/tokenize
-// From @cavemem/compress — boundary-protected prose compression
+// caipira/compress.js — boundary-protected prose compression and search forms
+// Originated in @cavemem/compress.
 // Stays out of code blocks, URLs, paths, identifiers, versions, etc.
+
+/** @typedef {{kind: string, text: string, preserved: boolean}} Segment */
+/** @typedef {{intensity?: string}} CompressionOptions */
 
 // ── LEXICON ──
 
@@ -49,22 +52,23 @@ const RULES = [
   { kind: "inline-code", priority: 90, re: /`[^`\n]+`/g },
   { kind: "url", priority: 80, re: /\bhttps?:\/\/[^\s)\]]+/g },
   { kind: "heading", priority: 70, re: /^#{1,6}\s[^\n]*$/gm },
-  { kind: "path", priority: 60, re: /(?:(?:\.{1,2})?\/[A-Za-z0-9._\-/]+|~\/[A-Za-z0-9._\-/]+|[A-Z]:\\[A-Za-z0-9._\-\\]+)/g },
+  { kind: "path", priority: 60, re: /(?:(?:\.{1,2}|~)\/[A-Za-z0-9._/-]+|[A-Z]:\\[A-Za-z0-9._\\-]+|(?<=^|[\s"'`])\/[A-Za-z0-9._/-]+|(?<![A-Za-z0-9._/-])(?:[A-Za-z0-9._-]{2,}\/[A-Za-z0-9._/-]+|[A-Za-z0-9._-]+\/[A-Za-z0-9._-]{2,}[A-Za-z0-9._/-]*|(?:[A-Za-z0-9._-]+\/){2,}[A-Za-z0-9._/-]+))/g },
   { kind: "date", priority: 50, re: /\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2})?)?\b/g },
   { kind: "version", priority: 40, re: /\bv?\d+\.\d+(?:\.\d+)?(?:[-+][\w.]+)?\b/g },
   { kind: "number", priority: 30, re: /\b\d+(?:\.\d+)?\b/g },
   { kind: "identifier", priority: 20, re: /\b[A-Za-z_][A-Za-z0-9_]*[-_][A-Za-z0-9_\-]+\b|\b[a-z]+[A-Z][A-Za-z0-9]*\b/g }
 ];
 
+/** @param {string} input @returns {Segment[]} */
 function tokenize(input) {
   const spans = [];
   for (const rule of RULES) {
-    rule.re.lastIndex = 0;
-    let m = rule.re.exec(input);
+    const re = new RegExp(rule.re.source, rule.re.flags);
+    let m = re.exec(input);
     while (m !== null) {
-      if (m[0].length === 0) { rule.re.lastIndex += 1; }
+      if (m[0].length === 0) { re.lastIndex += 1; }
       else { spans.push({ start: m.index, end: m.index + m[0].length, kind: rule.kind, priority: rule.priority }); }
-      m = rule.re.exec(input);
+      m = re.exec(input);
     }
   }
   spans.sort((a, b) => {
@@ -99,12 +103,14 @@ function matchCase(source, target) {
   if (source[0] === source[0]?.toUpperCase()) return target[0]?.toUpperCase() + target.slice(1);
   return target;
 }
+/** @param {string} input @returns {string} */
 function expand(input) {
+  if (typeof input !== 'string' || !input) return '';
   const segments = tokenize(input);
   const map = expansions();
   const keys = Object.keys(map).sort((a, b) => b.length - a.length);
   if (keys.length === 0) return input;
-  const pattern = new RegExp(`\\b(?:${keys.map(escapeRe).join("|")})\\b`, "gi");
+  const pattern = new RegExp(`(?<=^|[^\\p{L}\\p{N}])(?:${keys.map(escapeRe).join("|")})(?=$|[^\\p{L}\\p{N}])`, "giu");
   return segments.map((seg) => {
     if (seg.preserved) return seg.text;
     return seg.text.replace(pattern, (match) => {
@@ -117,17 +123,16 @@ function expand(input) {
 
 // ── COMPRESS ──
 
-function escapeRe2(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function removePhrases(text, phrases) {
   if (phrases.length === 0) return text;
   const sorted = [...phrases].sort((a, b) => b.length - a.length);
-  const pattern = new RegExp(`\\b(?:${sorted.map(escapeRe2).join("|")})\\b`, "gi");
+  const pattern = new RegExp(`\\b(?:${sorted.map(escapeRe).join("|")})\\b`, "gi");
   return text.replace(pattern, "");
 }
 function abbreviate(text, map) {
   let result = text;
   for (const [from, to] of Object.entries(map)) {
-    const re = new RegExp(`\\b${escapeRe2(from)}\\b`, "gi");
+    const re = new RegExp(`\\b${escapeRe(from)}\\b`, "gi");
     result = result.replace(re, (match) => matchCase(match, to));
   }
   return result;
@@ -135,7 +140,14 @@ function abbreviate(text, map) {
 function collapseWhitespace(text) {
   return text.replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").replace(/ +([.,;:!?])/g, "$1").replace(/\n{3,}/g, "\n\n").replace(/^ +| +$/gm, "");
 }
+/** @param {string} intensity @returns {string} */
+function normalizeIntensity(intensity) {
+  return Object.hasOwn(LEXICON.fillers, intensity) ? intensity : 'full';
+}
+/** @param {string} text @param {string} intensity @returns {string} */
 function compressProse(text, intensity) {
+  if (typeof text !== 'string' || !text) return '';
+  const validIntensity = normalizeIntensity(intensity);
   const leadingMatch = text.match(/^\s+/);
   const trailingMatch = text.match(/\s+$/);
   const leading = leadingMatch ? leadingMatch[0] : "";
@@ -143,29 +155,32 @@ function compressProse(text, intensity) {
   const body = text.slice(leading.length, text.length - trailing.length);
   if (body.length === 0) return text;
   let out = body;
-  out = removePhrases(out, pleasantriesFor(intensity));
-  out = removePhrases(out, hedgesFor(intensity));
-  out = removePhrases(out, fillersFor(intensity));
-  out = removePhrases(out, articlesFor(intensity));
-  out = abbreviate(out, abbreviationsFor(intensity));
+  out = removePhrases(out, pleasantriesFor(validIntensity));
+  out = removePhrases(out, hedgesFor(validIntensity));
+  out = removePhrases(out, fillersFor(validIntensity));
+  out = removePhrases(out, articlesFor(validIntensity));
+  out = abbreviate(out, abbreviationsFor(validIntensity));
   out = collapseWhitespace(out);
   const leftPad = leading.includes("\n") ? "\n" : leading ? " " : "";
   const rightPad = trailing.includes("\n") ? "\n" : trailing ? " " : "";
   return `${leftPad}${out}${rightPad}`;
 }
+/** @param {string} input @param {CompressionOptions} [opts] @returns {string} */
 function compress(input, opts = {}) {
-  const intensity = opts.intensity ?? "full";
+  if (typeof input !== 'string' || !input) return '';
+  const intensity = normalizeIntensity(opts?.intensity);
   const segments = tokenize(input);
   const out = [];
   for (const seg of segments) {
     if (seg.preserved) { out.push(seg.text); continue; }
     out.push(compressProse(seg.text, intensity));
   }
-  return out.join("").replace(/[ \t]+([.,;:!?])/g, "$1");
+  return out.join("").replace(/[ \t]+(?!\.{1,2}\/)([.,;:!?])/g, "$1");
 }
 
 // ── COUNT ──
 
+/** @param {string} text @returns {number} */
 function countTokens(text) {
   if (!text) return 0;
   const words = text.trim().split(/\s+/).filter(Boolean).length;
@@ -173,4 +188,58 @@ function countTokens(text) {
   return Math.max(words, Math.round(chars / 4));
 }
 
-module.exports = { compress, expand, countTokens, compressProse };
+// Search stored prose in either its typed, compressed, or expanded form.
+const SEARCH_INTENSITIES = ['full', 'ultra'];
+
+/** @param {string} value @returns {boolean} */
+function hasSearchableChars(value) {
+  return /[\p{L}\p{N}]/u.test(value);
+}
+
+/** @param {string} term @returns {string[]} */
+function termForms(term) {
+  if (typeof term !== 'string' || !term) return [];
+  const forms = new Set();
+  const add = (value) => {
+    const trimmed = value.trim();
+    if (trimmed && hasSearchableChars(trimmed)) forms.add(trimmed);
+  };
+  const expanded = expand(term);
+  for (const base of new Set([term, expanded])) {
+    add(base);
+    for (const intensity of SEARCH_INTENSITIES) add(compress(base, { intensity }));
+  }
+  return Array.from(forms);
+}
+
+/** @param {string} query @returns {string[]} */
+function queryForms(query) {
+  if (typeof query !== 'string' || !query) return [];
+  return Array.from(new Set(query.split(/\s+/).filter(Boolean).flatMap(termForms)));
+}
+
+/** @param {string} value @returns {string} */
+function ftsQuote(value) { return `"${value.replace(/"/g, '""')}"`; }
+
+/** @param {string} query @returns {string} */
+function buildAndMatch(query) {
+  if (typeof query !== 'string' || !query) return '';
+  return query.split(/\s+/).filter(Boolean)
+    .map(termForms)
+    .filter(forms => forms.length > 0)
+    .map(forms => forms.length === 1 ? ftsQuote(forms[0]) : `(${forms.map(ftsQuote).join(' OR ')})`)
+    .join(' AND ');
+}
+
+/** @param {string[][]} groups @returns {string} */
+function buildOrMatch(groups) {
+  return groups
+    .filter(forms => forms.length > 0)
+    .map(forms => `(${forms.map(ftsQuote).join(' OR ')})`)
+    .join(' OR ');
+}
+
+module.exports = {
+  LEXICON, compress, expand, countTokens, compressProse,
+  hasSearchableChars, termForms, queryForms, ftsQuote, buildAndMatch, buildOrMatch
+};

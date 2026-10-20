@@ -13,7 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { compress, expand } = require('./compress');
+const { buildAndMatch: buildMatch, termForms } = require('./compress');
 
 const VALID_KINDS = ['decision', 'constraint', 'preference', 'status', 'gotcha'];
 const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'proposed'];
@@ -37,34 +37,6 @@ function fingerprint(filePath) {
     mtime: Math.floor(stat.mtimeMs),
     sha256: hashFile(filePath)
   };
-}
-
-// ── dual-form query, shared with observation search ──
-
-const SEARCH_INTENSITIES = ['full', 'ultra'];
-
-function termForms(term) {
-  const forms = new Set();
-  const add = (value) => {
-    const trimmed = (value || '').trim();
-    if (trimmed && /[\p{L}\p{N}]/u.test(trimmed)) forms.add(trimmed);
-  };
-  const expanded = expand(term);
-  for (const base of new Set([term, expanded])) {
-    add(base);
-    for (const intensity of SEARCH_INTENSITIES) add(compress(base, { intensity }));
-  }
-  return Array.from(forms);
-}
-
-function ftsQuote(s) { return `"${s.replace(/"/g, '""')}"`; }
-
-function buildMatch(query) {
-  return query.split(/\s+/).filter(Boolean)
-    .map(termForms)
-    .filter(forms => forms.length > 0)
-    .map(forms => forms.length === 1 ? ftsQuote(forms[0]) : `(${forms.map(ftsQuote).join(' OR ')})`)
-    .join(' AND ');
 }
 
 // ── trust ──

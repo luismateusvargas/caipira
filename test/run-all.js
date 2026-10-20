@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // caipira/test/run-all.js — runs every suite with the bundled Node 22.
 //
-//   .\node22\node-v22.20.0-win-x64\node.exe test\run-all.js
+//   <bundled node22>/node test/run-all.js
 //
 // Every suite runs against a throwaway CAIPIRA_HOME, so no run can leave
 // workspace databases behind in ~/.caipira/database.
@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const NODE = path.join(ROOT, 'node22', 'node-v22.20.0-win-x64', 'node.exe');
+const NODE = process.execPath;
 
 const SUITES = ['test-workspace', 'test-facts', 'test-inject', 'test-mcp', 'test-hook'];
 

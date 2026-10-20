@@ -1,7 +1,8 @@
 const fs = require('fs'), os = require('os'), path = require('path');
-const D = require('C:/Users/luism/.caipira/node_modules/better-sqlite3');
-const { migrate, WORKSPACE_MIGRATIONS } = require('C:/Users/luism/.caipira/migrate.js');
-const { FactStore } = require('C:/Users/luism/.caipira/facts.js');
+const D = require('better-sqlite3');
+const { migrate, WORKSPACE_MIGRATIONS } = require('../migrate.js');
+const { FactStore, buildMatch, termForms } = require('../facts.js');
+const { compress, expand, compressProse } = require('../compress.js');
 
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => {
@@ -50,6 +51,28 @@ console.log('\n4. dual-form search reaches facts');
 check('abbreviated query finds verbatim fact', store.search('db cfg').some(f => f.id === id2));
 check('verbatim query finds it too', store.search('database configuration').some(f => f.id === id2));
 check('unrelated query returns nothing', store.search('quantum entanglement zebra').length === 0);
+
+console.log('\n4a. slash abbreviations and shared FTS query forms');
+const prose = 'authentication with database because without configuration';
+check('slash abbreviations round-trip through compression', expand(compress(prose, { intensity: 'full' })) === prose);
+for (const [short, long] of [['w/', 'with'], ['b/c', 'because'], ['w/o', 'without']]) {
+  const forms = termForms(short);
+  check(`${short} searches abbreviated and expanded forms`, forms.includes(short) && forms.includes(long), JSON.stringify(forms));
+}
+check('unknown intensity falls back to full',
+  compress('please check the database', { intensity: 'invalid' }) === compress('please check the database', { intensity: 'full' }));
+check('prototype property is not accepted as an intensity',
+  compress('please check the database', { intensity: 'toString' }) === compress('please check the database', { intensity: 'full' }));
+check('compressProse also falls back to full',
+  compressProse('please check the database', 'invalid') === compressProse('please check the database', 'full'));
+check('non-string and empty inputs are safe', compress(null) === '' && compress(42) === '' && compress('') === '');
+check('relative and absolute paths retain their separators',
+  compress('with ./src/database/configuration and /etc/hosts').includes(' ./src/database/configuration') &&
+  compress('with ./src/database/configuration and /etc/hosts').includes(' /etc/hosts'));
+const slashId = store.record({ kind: 'constraint', title: 'Slash prose', body: prose });
+check('slash query reaches expanded prose in FTS', store.search('w/ b/c w/o').some(f => f.id === slashId));
+check('facts keep the shared AND query builder contract',
+  buildMatch('w/ b/c').includes(' AND ') && buildMatch('w/ b/c').includes('"because"'));
 
 console.log('\n5. staleness: unchanged file takes the fast path');
 let status = store.checkEvidence(id);
@@ -117,8 +140,8 @@ check('separator-insensitive', store.factsForPaths([liveFile.replace(/\\/g, '/')
 
 console.log('\n13. cross-workspace recall');
 {
-  const { searchWorkspaces } = require('C:/Users/luism/.caipira/facts.js');
-  const ws = require('C:/Users/luism/.caipira/workspace.js');
+  const { searchWorkspaces } = require('../facts.js');
+  const ws = require('../workspace.js');
   const machine = require('os').hostname().toLowerCase();
 
   // Two separate projects, each with a fact only it could answer.

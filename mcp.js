@@ -10,7 +10,6 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-let store = null;
 let embedder = null;
 let backfillTimer = null;
 
@@ -37,6 +36,36 @@ function closeFactConnections() {
     try { entry.db.close(); } catch {}
   }
   factConnections.clear();
+}
+
+// Observations live in the same per-workspace database the hooks write to.
+// A bare MemoryStore() would open the legacy data.db instead, which the hooks
+// no longer touch — search and backfill would then see an empty corpus.
+const memoryStores = new Map();
+
+function memoryAt(dbFile) {
+  let memory = memoryStores.get(dbFile);
+  if (!memory) {
+    memory = new MemoryStore({ dbPath: dbFile });
+    memoryStores.set(dbFile, memory);
+  }
+  return memory;
+}
+
+function memoryFor(cwd) {
+  return memoryAt(ensureWorkspace(cwd || process.cwd()).dbFile);
+}
+
+function closeMemoryStores() {
+  for (const memory of memoryStores.values()) {
+    try { memory.close(); } catch {}
+  }
+  memoryStores.clear();
+}
+
+function closeAll() {
+  closeMemoryStores();
+  closeFactConnections();
 }
 
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
@@ -80,23 +109,42 @@ async function getEmbedder() {
 
 // ── Backfill ──
 
-async function backfillMissing() {
-  if (!store) return;
-  const missing = store.observationsMissingEmbeddings(50, MODEL);
-  if (missing.length === 0) return;
+const BACKFILL_BATCH = 50;
 
-  const emb = await getEmbedder();
+// Every registered workspace is backfilled, not just the one this server was
+// started in: hooks from any client write to any workspace, and a workspace
+// nobody has searched yet should still be ready when someone does.
+async function backfillMissing() {
   let count = 0;
-  for (const obs of missing) {
+  let more = false;
+  for (const row of listWorkspaces()) {
+    if (!fs.existsSync(row.db_file)) continue;
+    let memory;
     try {
-      const vec = await emb.embed(obs.content);
-      store.putEmbedding(obs.id, MODEL, vec);
-      count++;
+      memory = memoryAt(row.db_file);
     } catch (e) {
-      console.error('[caipira] embed failed for obs', obs.id, ':', e.message);
+      console.error('[caipira] backfill skipped', row.db_file, ':', e.message);
+      continue;
+    }
+    const missing = memory.observationsMissingEmbeddings(BACKFILL_BATCH, MODEL);
+    if (missing.length === 0) continue;
+    if (missing.length === BACKFILL_BATCH) more = true;
+
+    const emb = await getEmbedder();
+    for (const obs of missing) {
+      try {
+        const vec = await emb.embed(obs.content);
+        memory.putEmbedding(obs.id, MODEL, vec);
+        count++;
+      } catch (e) {
+        console.error('[caipira] embed failed for obs', obs.id, ':', e.message);
+      }
     }
   }
   if (count > 0) console.error(`[caipira] backfilled ${count} embeddings`);
+  // A full batch means there is likely more; keep going without waiting for
+  // the next request to come in.
+  if (more) scheduleBackfill();
 }
 
 function scheduleBackfill() {
@@ -173,7 +221,6 @@ async function handle(msg) {
       break;
 
     case 'initialize':
-      if (!store) store = new MemoryStore();
       respond(id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
@@ -194,7 +241,8 @@ async function handle(msg) {
               type: 'object',
               properties: {
                 query: { type: 'string', description: 'Search terms. Multi-word = AND (all must match). Falls back to OR substring search when no FTS5 hits. Prefer 1-3 keywords for best results.' },
-                limit: { type: 'number', description: 'Max results (default 10)', default: 10 }
+                limit: { type: 'number', description: 'Max results (default 10)', default: 10 },
+                cwd: { type: 'string', description: 'Workspace path (defaults to the server working directory)' }
               },
               required: ['query']
             }
@@ -206,7 +254,8 @@ async function handle(msg) {
               type: 'object',
               properties: {
                 ids: { type: 'array', items: { type: 'number' }, description: 'Observation IDs to retrieve' },
-                expand: { type: 'boolean', description: 'Expand compressed abbreviations (default false)' }
+                expand: { type: 'boolean', description: 'Expand compressed abbreviations (default false)' },
+                cwd: { type: 'string', description: 'Workspace path (defaults to the server working directory)' }
               },
               required: ['ids']
             }
@@ -217,7 +266,8 @@ async function handle(msg) {
             inputSchema: {
               type: 'object',
               properties: {
-                limit: { type: 'number', description: 'Max sessions (default 20)', default: 20 }
+                limit: { type: 'number', description: 'Max sessions (default 20)', default: 20 },
+                cwd: { type: 'string', description: 'Workspace path (defaults to the server working directory)' }
               }
             }
           },
@@ -228,7 +278,8 @@ async function handle(msg) {
               type: 'object',
               properties: {
                 session_id: { type: 'string', description: 'Session ID' },
-                limit: { type: 'number', description: 'Max results (default 20)', default: 20 }
+                limit: { type: 'number', description: 'Max results (default 20)', default: 20 },
+                cwd: { type: 'string', description: 'Workspace path (defaults to the server working directory)' }
               },
               required: ['session_id']
             }
@@ -318,8 +369,7 @@ async function handle(msg) {
 }
 
 async function handleToolCall(id, params) {
-  if (!store) store = new MemoryStore();
-  const { name, arguments: args } = params;
+  const { name, arguments: args = {} } = params;
 
   try {
     let result;
@@ -330,22 +380,22 @@ async function handleToolCall(id, params) {
           return;
         }
         const emb = await getEmbedder().catch(() => null);
-        const hits = await store.search(args.query, args.limit || 10, emb);
+        const hits = await memoryFor(args.cwd).search(args.query, args.limit || 10, emb);
         result = { content: [{ type: 'text', text: JSON.stringify(hits) }] };
         break;
       }
       case 'get_observations': {
-        const rows = store.getObservations(args.ids, { expand: args.expand ?? false });
+        const rows = memoryFor(args.cwd).getObservations(args.ids, { expand: args.expand ?? false });
         result = { content: [{ type: 'text', text: JSON.stringify(rows) }] };
         break;
       }
       case 'list_sessions': {
-        const sessions = store.listSessions(args.limit || 20);
+        const sessions = memoryFor(args.cwd).listSessions(args.limit || 20);
         result = { content: [{ type: 'text', text: JSON.stringify(sessions) }] };
         break;
       }
       case 'timeline': {
-        const rows = store.timeline(args.session_id, null, args.limit || 20);
+        const rows = memoryFor(args.cwd).timeline(args.session_id, null, args.limit || 20);
         result = { content: [{ type: 'text', text: JSON.stringify(rows) }] };
         break;
       }
@@ -435,5 +485,5 @@ async function handleToolCall(id, params) {
   }
 }
 
-process.on('SIGTERM', () => { if (store) store.close(); closeFactConnections(); process.exit(0); });
-process.on('SIGINT', () => { if (store) store.close(); closeFactConnections(); process.exit(0); });
+process.on('SIGTERM', () => { closeAll(); process.exit(0); });
+process.on('SIGINT', () => { closeAll(); process.exit(0); });

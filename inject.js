@@ -10,8 +10,8 @@
 // plants a premise the model then reasons from. So the gate returns nothing
 // unless it is reasonably sure, and never returns a ranked-best-of-N.
 
-const { FactStore, termForms } = require('./facts');
-const { compress } = require('./compress');
+const { FactStore } = require('./facts');
+const { compress, termForms, buildOrMatch } = require('./compress');
 
 // Injecting the top N of anything guarantees noise on an unrelated prompt.
 // These gates are on absolute properties of the match, not on rank.
@@ -26,17 +26,6 @@ const MIN_TRUST = 0.25;     // excludes revoked/superseded; admits needs_review
 const MAX_FACTS = 3;
 const MAX_CHARS = 1200;
 const MAX_CANDIDATES = 40;
-
-function ftsQuote(s) { return `"${s.replace(/"/g, '""')}"`; }
-
-// Recall uses OR: a user prompt is a sentence, and requiring every term to
-// appear (the AND used by explicit search) would match nothing. Precision is
-// recovered afterwards by term coverage, which needs no corpus calibration.
-function buildOrMatch(groups) {
-  return groups
-    .map(forms => `(${forms.map(ftsQuote).join(' OR ')})`)
-    .join(' OR ');
-}
 
 // Function words are poison here. Explicit search can afford to keep them
 // (AND still requires the real terms to match); coverage cannot, because

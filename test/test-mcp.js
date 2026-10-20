@@ -2,8 +2,8 @@
 const { spawn } = require('child_process');
 const fs = require('fs'), os = require('os'), path = require('path');
 
-const ROOT = 'C:/Users/luism/.caipira';
-const NODE = ROOT + '/node22/node-v22.20.0-win-x64/node.exe';
+const ROOT = require('path').join(__dirname, '..');
+const NODE = process.execPath;
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcpws-'));
 fs.writeFileSync(path.join(tmp, 'package.json'), '{"name":"testws"}');
@@ -119,14 +119,14 @@ const check = (label, cond, extra) => {
   console.log('\n8. workspace isolation');
   const ws = await tool('list_workspaces', {});
   check('test workspace registered', ws.some(w => String(w.root).toLowerCase().includes('mcpws')));
-  const otherWs = await tool('search_facts', { query: 'development server port', cwd: 'C:/Users/luism/.caipira' });
+  const otherWs = await tool('search_facts', { query: 'development server port', cwd: ROOT });
   check('facts do NOT leak into another workspace', otherWs.facts.length === 0,
     JSON.stringify(otherWs.facts.map(f => f.title)));
 
   // Isolation is the default, but it must be escapable on request — otherwise
   // a lesson learned in one project is invisible everywhere else.
   const scoped = await tool('search_facts', {
-    query: 'development server port', cwd: 'C:/Users/luism/.caipira', scope: 'all'
+    query: 'development server port', cwd: ROOT, scope: 'all'
   });
   check('scope=all reaches across workspaces', scoped.facts.length > 0,
     JSON.stringify(scoped).slice(0, 160));
