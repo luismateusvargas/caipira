@@ -1,5 +1,6 @@
 import { X } from 'lucide-react';
 import type { EdgeKind, GraphNode, GraphPayload } from '../../api/schemas';
+import { evidenceNotChecked } from '../../api/schemas';
 
 /** Props for {@link NodeSummary}. */
 export interface NodeSummaryProps {
@@ -49,6 +50,16 @@ export function NodeSummary({ node, graph, onJumpTo, onClose }: NodeSummaryProps
           <code className="signature">{title}</code>
           <p className="muted small">{subtitle}</p>
           {node.type === 'fact' && node.drifted && <span className="badge badge--drift">NEEDS REVIEW</span>}
+          {node.type === 'fact' && evidenceNotChecked(node) && (
+            <>
+              <span className="badge">Evidence not checked</span>
+              <p className="muted small">
+                {node.uncheckedSymbols === null
+                  ? 'Its symbol evidence has not been checked against the source, so this status reflects the last index.'
+                  : `${node.uncheckedSymbols} symbol ${node.uncheckedSymbols === 1 ? 'anchor' : 'anchors'} could not be re-read from source, so this status reflects the last index.`}
+              </p>
+            </>
+          )}
         </section>
         {groups.length === 0 && <p className="muted">No connections in this view.</p>}
         {groups.map(group => (

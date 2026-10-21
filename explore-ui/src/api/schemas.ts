@@ -94,7 +94,16 @@ const factNodeSchema = z.object({
   category: factCategorySchema,
   state: factStateSchema,
   drifted: z.boolean(),
-  trust: z.number()
+  /** The stored trust score: the code as it is now only when `uncheckedSymbols` is 0. */
+  trust: z.number(),
+  /** Symbol anchors on record for the fact, whatever edges the view keeps; null from a server too old to say. */
+  symbolAnchors: count.nullable().default(null),
+  /**
+   * Symbol anchors the newest check could not re-read from source: 0 when it
+   * read them all, null when no check has covered the fact or the server is
+   * too old to say — unknown, never 0.
+   */
+  uncheckedSymbols: count.nullable().default(null)
 });
 
 const sessionNodeSchema = z.object({
@@ -143,6 +152,15 @@ export type SessionNode = z.infer<typeof sessionNodeSchema>;
 export type GraphNode = z.infer<typeof graphNodeSchema>;
 export type GraphEdge = z.infer<typeof graphEdgeSchema>;
 export type GraphPayload = z.infer<typeof graphPayloadSchema>;
+
+/**
+ * @param node A graph fact node.
+ * @returns True when the fact has, or may have, symbol anchors that no check
+ *   re-read from source, so its drift flag and trust describe the last index.
+ */
+export function evidenceNotChecked(node: FactNode): boolean {
+  return node.symbolAnchors !== 0 && node.uncheckedSymbols !== 0;
+}
 
 // ── symbols ──
 
@@ -235,14 +253,18 @@ const attachedFactSchema = z.object({
   title: z.string(),
   summary: z.string(),
   state: factStateSchema,
-  evidence_status: z.enum(['current', 'drifted', 'file_range', 'file'])
+  /** How the fact attaches here; `current` and `drifted` compare its anchor with the indexed signature. */
+  evidence_status: z.enum(['current', 'drifted', 'file_range', 'file']),
+  /** As the fact DTO's `uncheckedSymbols`: missing from a server too old to send it is unknown, never 0. */
+  unchecked_symbols: count.nullable().default(null)
 }).transform(row => ({
   factId: row.fact_id,
   category: row.kind,
   title: row.title,
   summary: row.summary,
   state: row.state,
-  anchor: row.evidence_status
+  anchor: row.evidence_status,
+  uncheckedSymbols: row.unchecked_symbols
 }));
 
 const sourceSchema = z.union([

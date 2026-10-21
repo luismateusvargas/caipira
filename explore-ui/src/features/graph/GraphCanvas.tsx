@@ -2,6 +2,7 @@ import { useEffect, useEffectEvent, useRef, useState } from 'react';
 import type { KeyboardEvent, PointerEvent } from 'react';
 import { Crosshair, Maximize2, Minus, Plus } from 'lucide-react';
 import type { EdgeKind, GraphNode, GraphPayload, GraphView } from '../../api/schemas';
+import { evidenceNotChecked } from '../../api/schemas';
 import { bounds, createSimulation, isSettled, reheat, tick } from './forceLayout';
 import type { Simulation } from './forceLayout';
 
@@ -317,7 +318,10 @@ function draw(ctx: CanvasRenderingContext2D, scene: Scene, state: DrawState): vo
         ctx.fill();
         ctx.strokeStyle = node.drifted ? palette['--accent-red-soft'] : palette['--accent-red-bright'];
         ctx.lineWidth = 1.4 / Math.max(viewport.k, 0.6);
+        // Dashed, like a file the index has not read: evidence not checked.
+        ctx.setLineDash(evidenceNotChecked(node) ? [3, 2] : []);
         ctx.stroke();
+        ctx.setLineDash([]);
         break;
       case 'session':
         polygon(ctx, x, y, r * 1.2, 4, 0);
@@ -574,7 +578,7 @@ export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, c
     if ((hovered?.id ?? null) !== hoverRef.current) {
       hoverRef.current = hovered?.id ?? null;
       dirtyRef.current = true;
-      setHoverLabel(hovered ? describe(hovered) : null);
+      setHoverLabel(hovered ? describeNode(hovered) : null);
     }
   };
 
@@ -701,11 +705,15 @@ export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, c
   );
 }
 
-function describe(node: GraphNode): string {
+/**
+ * @param node Any graph node.
+ * @returns The one-line description shown, and announced, while it is hovered.
+ */
+export function describeNode(node: GraphNode): string {
   switch (node.type) {
     case 'file': return `${node.path}${node.language ? ` · ${node.language}` : ''}`;
     case 'symbol': return `${node.kind} ${node.qualifiedName} · ${node.path}:${node.line} · ${node.callers} caller${node.callers === 1 ? '' : 's'} in graph`;
-    case 'fact': return `${node.category}: ${node.label}${node.drifted ? ' · NEEDS REVIEW' : ''}`;
+    case 'fact': return `${node.category}: ${node.label}${node.drifted ? ' · NEEDS REVIEW' : ''}${evidenceNotChecked(node) ? ' · Evidence not checked' : ''}`;
     case 'session': return `${node.label}${node.summary ? ` · ${node.summary}` : ''}`;
   }
 }

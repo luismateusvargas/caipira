@@ -38,8 +38,8 @@ export const RAW_SYMBOL_DETAIL = {
   inherits: [],
   inherited_by: [],
   facts: [
-    { fact_id: 41, kind: 'constraint', title: 'addUser must stay idempotent', summary: 'Retries call it twice.', state: 'needs_review', evidence_status: 'drifted' },
-    { fact_id: 42, kind: 'decision', title: 'Users live in memory', summary: 'Users live in memory', state: 'active', evidence_status: 'file' }
+    { fact_id: 41, kind: 'constraint', title: 'addUser must stay idempotent', summary: 'Retries call it twice.', state: 'needs_review', evidence_status: 'drifted', unchecked_symbols: 0 },
+    { fact_id: 42, kind: 'decision', title: 'Users live in memory', summary: 'Users live in memory', state: 'active', evidence_status: 'file', unchecked_symbols: 0 }
   ],
   type_links: { User: 2, UserRecord: 5 },
   source: { status: 'ok', start_line: 12, end_line: 15, lines: ['async addUser(user, notify = false) {', '  this.users.push(user);', '  return this.count();', '}'], truncated: false }
@@ -72,7 +72,7 @@ export const RAW_GRAPH = {
   nodes: [
     { id: 'file:src/store.ts', type: 'file', label: 'store.ts', path: 'src/store.ts', language: 'typescript', group: 'src', indexed: true },
     { id: 'symbol:7', type: 'symbol', label: 'addUser', symbolId: 7, kind: 'method', path: 'src/store.ts', qualifiedName: 'UserStore.addUser', line: 12, isPublic: true, returnType: 'Promise<UserRecord>', callers: 1 },
-    { id: 'fact:41', type: 'fact', label: 'addUser must stay idempotent', factId: 41, category: 'constraint', state: 'needs_review', drifted: true, trust: 0.35 },
+    { id: 'fact:41', type: 'fact', label: 'addUser must stay idempotent', factId: 41, category: 'constraint', state: 'needs_review', drifted: true, trust: 0.35, symbolAnchors: 1, uncheckedSymbols: 0 },
     { id: 'session:s1', type: 'session', label: 'claude-code · 2026-10-20 10:00', sessionId: 's1', ide: 'claude-code', startedAt: 1, endedAt: null, summary: null }
   ],
   edges: [

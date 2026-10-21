@@ -331,12 +331,15 @@ function withWorkspace(ws, fn) {
 
 // Drift is re-checked once per workspace per server process, then on
 // request (`refresh=1`) and after every reindex. Each check's count of
-// symbol evidence it could not re-read is kept per database and fact id
-// until the next check, so later reads can still say so.
+// symbol evidence it could not re-read is kept per database and fact id, and
+// whichever check last covered a fact (this batch, a text search, a write
+// that re-read its anchors) decides what every later read reports for it.
+// The batch skips proposed and closed facts, so their entries stay.
 function ensureVerified(ctx, ws, store, force = false) {
   const known = ctx.verified.get(ws.dbFile);
   if (known && !force) return known;
-  const outcomes = new Map(store.verify().map(outcome => [outcome.id, outcome.unchecked]));
+  const outcomes = known || new Map();
+  for (const outcome of store.verify()) outcomes.set(outcome.id, outcome.unchecked);
   ctx.verified.set(ws.dbFile, outcomes);
   return outcomes;
 }
@@ -352,6 +355,13 @@ function anchorsRead(ctx, ws, id) {
   const outcomes = ctx.verified.get(ws.dbFile);
   if (outcomes) outcomes.set(id, 0);
   return outcomes || new Map([[id, 0]]);
+}
+
+// How many of a fact's symbol anchors the newest check could not re-read
+// from source; null when no check has covered the fact — unknown, never an
+// assumed 0.
+function uncheckedSymbols(outcomes, factId) {
+  return outcomes.has(factId) ? outcomes.get(factId) : null;
 }
 
 function driftCount(db) {
@@ -417,10 +427,11 @@ function symbolIndex(rows) {
  * @param {import('better-sqlite3').Database} db Open workspace database.
  * @param {{root: string|null}} ws The workspace.
  * @param {GraphOptions} opts
+ * @param {Map<number, number>} outcomes Unchecked symbol anchors per fact id, from the newest checks.
  * @returns {{nodes: object[], edges: GraphEdge[], stats: object, driftCount: number, focusId: string|null}}
  * @throws {HttpError} 404 when the impact view's symbol does not exist.
  */
-function buildGraph(db, ws, opts) {
+function buildGraph(db, ws, opts, outcomes) {
   const nodes = new Map();
   const edges = new Map();
   const addEdge = (source, target, kind) => {
@@ -481,13 +492,20 @@ function buildGraph(db, ws, opts) {
     if (edge.kind === 'calls') nodes.get(edge.target).callers++;
   }
 
-  // Knowledge layer: every fact still on record, linked to its evidence.
+  // Knowledge layer: every fact still on record, linked to its evidence. A
+  // fact's anchor count comes from its stored anchors, since a view or the
+  // node cap can drop the edges to them; trust is the stored score, which
+  // describes the source as it is now only when uncheckedSymbols is 0.
   const facts = db.prepare(`SELECT * FROM facts WHERE state != 'revoked' ${opts.category ? 'AND kind = ?' : ''} ORDER BY id`)
     .all(...(opts.category ? [opts.category] : []));
+  const anchors = db.prepare('SELECT fact_id, path, qualified_name FROM fact_symbol_evidence').all();
+  const anchorCounts = new Map();
+  for (const row of anchors) anchorCounts.set(row.fact_id, (anchorCounts.get(row.fact_id) || 0) + 1);
   for (const fact of facts) {
     nodes.set(`fact:${fact.id}`, {
       id: `fact:${fact.id}`, type: 'fact', label: fact.title, factId: fact.id, category: fact.kind,
-      state: fact.state, drifted: fact.state === 'needs_review', trust: Number(trustScore(fact).toFixed(3))
+      state: fact.state, drifted: fact.state === 'needs_review', trust: Number(trustScore(fact).toFixed(3)),
+      symbolAnchors: anchorCounts.get(fact.id) || 0, uncheckedSymbols: uncheckedSymbols(outcomes, fact.id)
     });
   }
   const evidence = db.prepare('SELECT fact_id, path FROM fact_evidence WHERE machine = ?').all(machineId());
@@ -496,7 +514,7 @@ function buildGraph(db, ws, opts) {
     if (!rel || !nodes.has(`fact:${row.fact_id}`) || !inPrefix(rel)) continue;
     addEdge(`fact:${row.fact_id}`, nodes.has(fileId(rel)) ? fileId(rel) : addFile(rel, null, false), 'evidences');
   }
-  for (const row of db.prepare('SELECT fact_id, path, qualified_name FROM fact_symbol_evidence').all()) {
+  for (const row of anchors) {
     const symbol = index.exact(row.path, row.qualified_name);
     const target = symbol !== null && nodes.has(`symbol:${symbol}`) ? `symbol:${symbol}`
       : inPrefix(row.path) ? addFile(row.path, null, false) : null;
@@ -636,14 +654,6 @@ function capNodes(nodeList, edgeList, limit, focusId) {
 
 // ── facts ──
 
-// How many of a fact's symbol anchors could not be re-read from source: from
-// this read's own evidence check when it made one (a text search does), else
-// from the last verification, else null — unknown, never an assumed 0.
-function uncheckedSymbols(fact, outcomes) {
-  if (fact.evidence_status) return fact.evidence_status.unchecked;
-  return outcomes.has(fact.id) ? outcomes.get(fact.id) : null;
-}
-
 // Evidence and anchors for many facts in two queries rather than two per fact.
 // A symbol's `current` compares its anchor with the indexed signature, which
 // is the source as it is now only when uncheckedSymbols is 0.
@@ -675,7 +685,7 @@ function factDtos(db, ws, rows, outcomes) {
     confidence: fact.confidence,
     trust: Number((fact.trust ?? trustScore(fact)).toFixed(3)),
     drifted: fact.state === 'needs_review',
-    uncheckedSymbols: uncheckedSymbols(fact, outcomes),
+    uncheckedSymbols: uncheckedSymbols(outcomes, fact.id),
     supersedes: fact.supersedes,
     supersededBy: supersededBy.get(fact.id) ?? null,
     createdAt: fact.created_at,
@@ -863,8 +873,8 @@ function getGraph(ctx, req, url) {
   };
   if (view === 'impact' && opts.symbolId === null) throw invalid('the impact view needs symbolId');
   return withWorkspace(ws, (db, store) => {
-    ensureVerified(ctx, ws, store);
-    return { workspaceId: ws.id, view, ...buildGraph(db, ws, opts) };
+    const outcomes = ensureVerified(ctx, ws, store);
+    return { workspaceId: ws.id, view, ...buildGraph(db, ws, opts, outcomes) };
   });
 }
 
@@ -893,7 +903,7 @@ async function getSymbol(ctx, req, url, [rawId]) {
   const id = parseId(rawId, 'symbol id');
   const ws = resolveWorkspace(ctx, url);
   const detail = withWorkspace(ws, (db, store) => {
-    ensureVerified(ctx, ws, store);
+    const outcomes = ensureVerified(ctx, ws, store);
     const found = inspectSymbol(db, id, ws.root ? { workspaceRoot: ws.root } : {});
     if (!found) throw new HttpError(404, 'symbol_not_found', `no symbol with id ${id}`);
     if (ws.root) confine(ws.root, found.symbol.path);
@@ -932,8 +942,10 @@ async function getSymbol(ctx, req, url, [rawId]) {
       used_by: found.used_by.map(withId),
       inherits: found.inherits.map(resolved),
       inherited_by: found.inherited_by.map(withId),
+      // evidence_status compares with the index; unchecked_symbols says
+      // whether the newest check could re-read the source behind it.
       facts: facts.map(fact => ({ fact_id: fact.fact_id, kind: fact.kind, title: fact.title, summary: fact.summary,
-        state: fact.state, evidence_status: fact.evidence_status })),
+        state: fact.state, evidence_status: fact.evidence_status, unchecked_symbols: uncheckedSymbols(outcomes, fact.fact_id) })),
       type_links: typeLinks(db, found.symbol)
     };
   });
@@ -952,7 +964,10 @@ function getFacts(ctx, req, url) {
     const outcomes = ensureVerified(ctx, ws, store, refresh);
     let rows;
     if (query) {
-      rows = store.search(query, { limit, states }).filter(fact => !category || fact.kind === category);
+      rows = store.search(query, { limit, states });
+      // The search just re-checked each hit's evidence; later reads report that.
+      for (const fact of rows) outcomes.set(fact.id, fact.evidence_status.unchecked);
+      rows = rows.filter(fact => !category || fact.kind === category);
     } else {
       const where = [`state IN (${states.map(() => '?').join(',')})`];
       const args = [...states];

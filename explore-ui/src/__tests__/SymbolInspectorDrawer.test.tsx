@@ -128,6 +128,45 @@ describe('SymbolInspectorDrawer', () => {
     await waitFor(() => expect(api.getSymbol).toHaveBeenCalledTimes(2));
   });
 
+  it('qualifies a signature match whose evidence no check could re-read, apart from drift and file anchors', async () => {
+    const fact = (factId: number, anchor: string, unchecked: number | null | undefined, state = 'active') => ({
+      fact_id: factId, kind: 'gotcha', title: `Fact ${factId}`, summary: `Fact ${factId}`, state, evidence_status: anchor,
+      ...(unchecked === undefined ? {} : { unchecked_symbols: unchecked })
+    });
+    const raw = {
+      ...RAW_SYMBOL_DETAIL,
+      facts: [
+        fact(51, 'current', 2), fact(52, 'current', null), fact(53, 'current', undefined), fact(54, 'current', 0),
+        fact(55, 'drifted', 1, 'needs_review'), fact(56, 'drifted', 0, 'needs_review'), fact(57, 'file', null), fact(58, 'file_range', 1)
+      ]
+    };
+    const api = fakeApi({ getSymbol: vi.fn(async () => symbolDetailSchema.parse(raw)) });
+    renderDrawer(api);
+
+    const section = (await screen.findByRole('heading', { name: 'Attached Facts' })).closest('section');
+    if (!section) throw new Error('no Attached Facts section');
+    const actual = within(section).getAllByRole('listitem').map(item => ({
+      title: item.querySelector('.attached-fact__title')?.textContent,
+      notChecked: within(item).queryByText('Evidence not checked') !== null,
+      review: within(item).queryByText('NEEDS REVIEW') !== null,
+      anchor: item.querySelector('.attached-fact__head .muted')?.textContent,
+      reaffirm: within(item).queryByRole('button', { name: /Reaffirm/ }) !== null
+    }));
+
+    const current = 'anchored to this signature';
+    const row = (n: number, notChecked: boolean, review: boolean, anchor: string) => ({ title: `Fact ${n}`, notChecked, review, anchor, reaffirm: true });
+    expect(actual).toEqual([
+      row(51, true, false, `${current} as last indexed · source could not be re-read`),
+      row(52, true, false, `${current} as last indexed · not checked yet`),
+      row(53, true, false, `${current} as last indexed · not checked yet`),
+      row(54, false, false, current),
+      row(55, true, true, 'signature changed since recorded'),
+      row(56, false, true, 'signature changed since recorded'),
+      row(57, false, false, 'anchored to this file'),
+      row(58, false, false, 'covers these lines')
+    ]);
+  });
+
   it('attaches a new fact anchored to the symbol', async () => {
     const api = fakeApi();
     const props = renderDrawer(api);

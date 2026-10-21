@@ -45,6 +45,30 @@ describe('response schemas', () => {
     expect(actual).toEqual([2, 0, null, null]);
     expect(factSchema.safeParse({ ...raw, uncheckedSymbols: -1 }).success).toBe(false);
   });
+
+  it('keeps an attached fact\'s unchecked count and reads a missing one as unknown', () => {
+    const raw = at(RAW_SYMBOL_DETAIL.facts, 0);
+    const legacy = Object.fromEntries(Object.entries(raw).filter(([key]) => key !== 'unchecked_symbols'));
+    const parse = (fact: object) => symbolDetailSchema.parse({ ...RAW_SYMBOL_DETAIL, facts: [fact] }).facts.map(item => item.uncheckedSymbols);
+
+    const actual = [...[2, 0, null].flatMap(count => parse({ ...raw, unchecked_symbols: count })), ...parse(legacy)];
+
+    expect(actual).toEqual([2, 0, null, null]);
+    expect(symbolDetailSchema.safeParse({ ...RAW_SYMBOL_DETAIL, facts: [{ ...raw, unchecked_symbols: -1 }] }).success).toBe(false);
+  });
+
+  it('keeps a graph fact node\'s anchors and unchecked count, and reads missing ones as unknown', () => {
+    const raw = at(RAW_GRAPH.nodes, 2);
+    const legacy = Object.fromEntries(Object.entries(raw).filter(([key]) => key !== 'symbolAnchors' && key !== 'uncheckedSymbols'));
+    const parse = (node: object) => graphPayloadSchema.parse({ ...RAW_GRAPH, nodes: [node] }).nodes.map(item => (
+      item.type === 'fact' ? [item.symbolAnchors, item.uncheckedSymbols] : null
+    ));
+
+    const actual = [...parse({ ...raw, symbolAnchors: 2, uncheckedSymbols: 1 }), ...parse({ ...raw, symbolAnchors: 0, uncheckedSymbols: 0 }), ...parse(legacy)];
+
+    expect(actual).toEqual([[2, 1], [0, 0], [null, null]]);
+    expect(graphPayloadSchema.safeParse({ ...RAW_GRAPH, nodes: [{ ...raw, uncheckedSymbols: -1 }] }).success).toBe(false);
+  });
 });
 
 describe('createApiClient', () => {

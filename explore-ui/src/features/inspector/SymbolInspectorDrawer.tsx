@@ -206,7 +206,8 @@ function SymbolBody({ api, workspaceId, symbolId, detail, blastRadius, onBlastRa
                   <div className="attached-fact__head">
                     <span className={`badge badge--fact badge--${fact.category}`}>{fact.category}</span>
                     {drifted && <span className="badge badge--drift">NEEDS REVIEW</span>}
-                    <span className="muted small">{anchorLabel(fact.anchor)}</span>
+                    {signatureNotChecked(fact) && <span className="badge">Evidence not checked</span>}
+                    <span className="muted small">{anchorLabel(fact)}</span>
                   </div>
                   <p className="attached-fact__title">{fact.title}</p>
                   {fact.summary !== fact.title && <p className="small muted">{fact.summary}</p>}
@@ -229,9 +230,17 @@ function SymbolBody({ api, workspaceId, symbolId, detail, blastRadius, onBlastRa
   );
 }
 
-function anchorLabel(anchor: AttachedFact['anchor']): string {
-  switch (anchor) {
-    case 'current': return 'anchored to this signature';
+// A signature anchor is compared with the index; that is the code as it is
+// now only when the newest check re-read every anchor of the fact.
+function signatureNotChecked(fact: AttachedFact): boolean {
+  return (fact.anchor === 'current' || fact.anchor === 'drifted') && fact.uncheckedSymbols !== 0;
+}
+
+function anchorLabel(fact: AttachedFact): string {
+  switch (fact.anchor) {
+    case 'current':
+      if (!signatureNotChecked(fact)) return 'anchored to this signature';
+      return `anchored to this signature as last indexed · ${fact.uncheckedSymbols === null ? 'not checked yet' : 'source could not be re-read'}`;
     case 'drifted': return 'signature changed since recorded';
     case 'file_range': return 'covers these lines';
     case 'file': return 'anchored to this file';

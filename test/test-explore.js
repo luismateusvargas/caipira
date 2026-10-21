@@ -6,7 +6,8 @@
 // member callees the inspector and graph resolve alike, fact writes refused
 // when symbol evidence cannot be re-read, `caipira explore` started
 // through caipira.sh, and fact DTOs that keep saying when symbol evidence
-// could not be re-read, per workspace database.
+// could not be re-read, per workspace database, through later searches,
+// reads and writes, the symbol inspector and the graph.
 //
 // Builds the crate first (debug profile) and points CAIPIRA_AST_BIN at it,
 // like test-ast, so the server indexes with the engine in this checkout.
@@ -708,6 +709,162 @@ async function main() {
         && r.json.fact.symbols[0].current === true, r.text);
       r = await get(`/api/facts?workspace=${blind.id}`);
       check('and the next read agrees', factIn(r)?.uncheckedSymbols === 0 && factIn(r)?.state === 'active', factIn(r));
+    } finally {
+      process.env.CAIPIRA_AST_BIN = engine;
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+
+  console.log('\n17. the newest evidence check reaches later fact reads, the inspector and the graph');
+  {
+    const api1 = 'export function api(value: number): number {\n  return value;\n}\n';
+    const helper1 = 'export function helper(value: number): number {\n  return value * 2;\n}\n';
+    const searched = extraWorkspace('explore-searched-', { 'src/api.ts': api1, 'src/helper.ts': helper1 });
+    const twin = extraWorkspace('explore-twin-', { 'src/api.ts': api1 });
+    const DAY_AGO = Date.now() - 86400000;
+    // Facts vouched for only by their symbol anchors, as of a day ago.
+    const seed = (ws, inputs) => inDb(ws, db => {
+      const store = new FactStore(db, { machine: machineId(), agent: 'test', root: ws.root });
+      const hash = (file, name) => db.prepare('SELECT signature_hash FROM ast_symbols WHERE path = ? AND qualified_name = ?').get(file, name).signature_hash;
+      return inputs.map(({ anchor, ...input }) => {
+        const evidenceSymbols = anchor ? [{ path: anchor[0], qualifiedName: anchor[1], signatureHash: hash(...anchor) }] : [];
+        const id = store.record({ ...input, evidenceSymbols });
+        store.update(id, { evidence: [] });
+        db.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, id);
+        return id;
+      });
+    });
+    const API = ['src/api.ts', 'api'];
+    const [A, B, P, N] = seed(searched, [
+      { kind: 'constraint', title: 'Api argument count', body: 'api takes exactly one argument.', anchor: API },
+      { kind: 'constraint', title: 'Helper doubles', body: 'helper returns twice its input.', anchor: ['src/helper.ts', 'helper'] },
+      { kind: 'decision', title: 'Proposed result caching', body: 'Cache what api returns.', anchor: API, state: 'proposed' },
+      { kind: 'gotcha', title: 'Plain note', body: 'Has no evidence at all.' }
+    ]);
+    const [twinFact] = seed(twin, [{ kind: 'constraint', title: 'Api argument count', body: 'api takes exactly one argument.', anchor: API }]);
+    check('the twin workspace holds the same fact id', twinFact === A, twinFact);
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    const stored = () => inDb(searched, db => db.prepare('SELECT id, state, last_verified_at FROM facts ORDER BY id').all());
+    const storedBefore = stored();
+    const indexedApi = () => inDb(searched, db => db.prepare("SELECT signature_text FROM ast_symbols WHERE path = 'src/api.ts' AND qualified_name = 'api'").get().signature_text);
+    const FACT_NODE_KEYS = ['category', 'drifted', 'factId', 'id', 'label', 'state', 'symbolAnchors', 'trust', 'type', 'uncheckedSymbols'];
+    const ATTACHED_KEYS = ['evidence_status', 'fact_id', 'kind', 'state', 'summary', 'title', 'unchecked_symbols'];
+
+    const server = createExploreServer({ defaultWorkspace: WS, distDir: DIST });
+    const port = await listen(server);
+    const get = target => request(port, 'GET', target);
+    const patch = (target, body) => request(port, 'PATCH', target, { body });
+    const q = `workspace=${searched.id}`;
+    const byId = r => new Map((r.json && r.json.facts || []).map(f => [f.id, f]));
+    const unchecked = (r, ids) => ids.map(id => byId(r).get(id)?.uncheckedSymbols);
+    const factNode = (r, id) => r.json && r.json.nodes.find(n => n.id === `fact:${id}`);
+    const verification = node => node && { symbolAnchors: node.symbolAnchors, uncheckedSymbols: node.uncheckedSymbols };
+    const attached = (r, id) => {
+      const fact = r.json && r.json.facts.find(f => f.fact_id === id);
+      return fact && { state: fact.state, evidence_status: fact.evidence_status, unchecked_symbols: fact.unchecked_symbols };
+    };
+    const engine = process.env.CAIPIRA_AST_BIN;
+    try {
+      let r = await get(`/api/facts?${q}`);
+      check('a healthy check: anchored facts 0, the plain one 0, the proposed one unknown', same(unchecked(r, [A, B, N, P]), [0, 0, 0, null]),
+        unchecked(r, [A, B, N, P]));
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('the twin\'s fact reads 0', same(unchecked(r, [A]), [0]), unchecked(r, [A]));
+
+      // With the parser healthy, rendering DTOs must not re-read a changed file.
+      fs.writeFileSync(path.join(searched.root, 'src/api.ts'), api1.replace('api(value: number)', 'api(value: number, extra: number)'));
+      fs.writeFileSync(path.join(searched.root, 'src/helper.ts'), helper1.replace('helper(value: number)', 'helper(value: number, factor: number)'));
+      const apiSymbol = symbolIn(searched, 'api');
+      const indexedBefore = indexedApi();
+      const reads = await Promise.all([`/api/facts?${q}`, `/api/graph?${q}`, `/api/graph?${q}&view=knowledge`, `/api/symbol/${apiSymbol}?${q}`].map(get));
+      check('fact, graph and inspector reads run no parser', reads.every(read => read.status === 200) && indexedApi() === indexedBefore,
+        { statuses: reads.map(read => read.status), indexed: indexedApi() });
+
+      process.env.CAIPIRA_AST_BIN = path.join(searched.root, 'no-such-caipira-ast');
+      r = await get(`/api/facts?${q}&q=api+argument+count`);
+      const searchedFact = byId(r).get(A);
+      check('a search that cannot re-read the anchor reads 1, still active', same(unchecked(r, [A]), [1]) && searchedFact.state === 'active'
+        && searchedFact.drifted === false, searchedFact);
+      r = await get(`/api/facts?${q}`);
+      check('G1: the next unfiltered read keeps the search\'s outcome; uncovered facts keep theirs', same(unchecked(r, [A, B, N, P]), [1, 0, 0, null]),
+        unchecked(r, [A, B, N, P]));
+      r = await get(`/api/facts?${q}&q=helper+doubles`);
+      check('a search for another fact covers only that fact', same(unchecked(r, [B]), [1]) && !byId(r).has(A), [...byId(r).keys()]);
+      r = await get(`/api/facts?${q}`);
+      check('and does not erase the first search\'s outcome', same(unchecked(r, [A, B]), [1, 1]), unchecked(r, [A, B]));
+      r = await patch(`/api/facts/${A}?${q}`, { action: 'update', title: 'Api argument count (one)' });
+      check('an ordinary update DTO keeps it', r.status === 200 && r.json.fact.uncheckedSymbols === 1, r.text);
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('the twin\'s fact with the same id stays 0', same(unchecked(r, [A]), [0]), unchecked(r, [A]));
+
+      const [D] = seed(searched, [{ kind: 'gotcha', title: 'Late anchor recorded', body: 'No check has read this anchor yet.', anchor: API }]);
+      r = await get(`/api/facts?${q}`);
+      check('a fact recorded after the check reads null', same(unchecked(r, [D]), [null]), unchecked(r, [D]));
+      r = await get(`/api/symbol/${apiSymbol}?${q}`);
+      check('G2: inspector facts carry the outcome beside the cached match', r.status === 200
+        && same(attached(r, A), { state: 'active', evidence_status: 'current', unchecked_symbols: 1 })
+        && same(attached(r, D), { state: 'active', evidence_status: 'current', unchecked_symbols: null }), r.json && r.json.facts);
+      check('attached facts keep their fields plus unchecked_symbols', r.json && r.json.facts.every(f => same(Object.keys(f).sort(), ATTACHED_KEYS)),
+        r.json && r.json.facts.map(f => Object.keys(f).sort()));
+      r = await get(`/api/graph?${q}&view=knowledge`);
+      check('G3: graph fact nodes carry anchors and the outcome', same([A, D, N].map(id => verification(factNode(r, id))), [
+        { symbolAnchors: 1, uncheckedSymbols: 1 }, { symbolAnchors: 1, uncheckedSymbols: null }, { symbolAnchors: 0, uncheckedSymbols: 0 }
+      ]), [A, D, N].map(id => factNode(r, id)));
+      check('fact nodes keep their fields, stored trust and state', same(Object.keys(factNode(r, A) || {}).sort(), FACT_NODE_KEYS)
+        && factNode(r, A).trust > 0 && factNode(r, A).state === 'active' && factNode(r, A).drifted === false, factNode(r, A));
+
+      r = await get(`/api/facts?${q}&q=late+anchor`);
+      check('a search covering the unknown fact reads 1', same(unchecked(r, [D]), [1]), unchecked(r, [D]));
+      r = await get(`/api/facts?${q}`);
+      check('and later reads keep it', same(unchecked(r, [D]), [1]), unchecked(r, [D]));
+      r = await patch(`/api/facts/${D}?${q}`, { action: 'update', title: 'Late anchor recorded (once)' });
+      check('as does its update DTO', r.status === 200 && r.json.fact.uncheckedSymbols === 1, r.text);
+      r = await get(`/api/facts?${q}&q=proposed+caching`);
+      check('a search covering the proposed fact reads 1', same(unchecked(r, [P]), [1]), unchecked(r, [P]));
+      r = await get(`/api/facts?${q}&refresh=1`);
+      check('a failed batch re-check keeps facts it skips (proposed) as their newest check left them', same(unchecked(r, [A, B, D, N, P]), [1, 1, 1, 0, 1]),
+        unchecked(r, [A, B, D, N, P]));
+
+      for (const view of ['unified', 'knowledge']) {
+        r = await get(`/api/graph?${q}&view=${view}`);
+        check(`${view}: the unchecked fact keeps its evidence edge and metadata`, r.status === 200
+          && r.json.edges.some(e => e.kind === 'evidences' && e.source === `fact:${A}` && e.target === `symbol:${apiSymbol}`)
+          && same(verification(factNode(r, A)), { symbolAnchors: 1, uncheckedSymbols: 1 }), factNode(r, A));
+      }
+      r = await get(`/api/graph?${q}&view=impact&symbolId=${apiSymbol}&depth=1`);
+      check('impact: the anchored facts in the symbol\'s neighborhood say so', r.status === 200
+        && same([A, D].map(id => verification(factNode(r, id))), [{ symbolAnchors: 1, uncheckedSymbols: 1 }, { symbolAnchors: 1, uncheckedSymbols: 1 }]),
+        r.json && r.json.nodes.map(n => n.id));
+      // Facts rank first under a cap, so a cap of exactly the facts drops every symbol.
+      r = await get(`/api/graph?${q}&view=knowledge&limit=${[A, B, D, N, P].length}`);
+      check('a cap that drops the evidence edge leaves the anchor count and outcome', r.status === 200 && r.json.stats.truncated
+        && !r.json.edges.some(e => e.kind === 'evidences') && same(verification(factNode(r, A)), { symbolAnchors: 1, uncheckedSymbols: 1 }),
+        r.json && { edges: r.json.edges, node: factNode(r, A) });
+      check('SQLite: parser failures changed no state and advanced no verification', same(stored().filter(row => row.id !== D), storedBefore),
+        stored());
+
+      process.env.CAIPIRA_AST_BIN = engine;
+      r = await get(`/api/facts?${q}&refresh=1`);
+      const rechecked = [A, B, D].map(id => byId(r).get(id));
+      check('a healthy re-check reads 0 and finds the real changes', rechecked.every(f => f && f.uncheckedSymbols === 0 && f.state === 'needs_review'
+        && f.drifted === true && f.symbols[0].current === false), rechecked);
+      check('the proposed fact keeps the outcome of its newest check', same(unchecked(r, [P]), [1]), unchecked(r, [P]));
+      r = await get(`/api/facts?${q}&q=proposed+caching`);
+      check('until a successful search replaces it', same(unchecked(r, [P]), [0]), unchecked(r, [P]));
+      r = await patch(`/api/facts/${A}?${q}`, { action: 'reaffirm' });
+      check('reaffirm: 0 unchecked, current', r.status === 200 && r.json.fact.uncheckedSymbols === 0 && r.json.fact.symbols[0].current === true, r.text);
+      r = await get(`/api/facts?${q}`);
+      check('later reads agree', same(unchecked(r, [A, P]), [0, 0]) && byId(r).get(A)?.state === 'active', byId(r).get(A));
+      const apiNow = symbolIn(searched, 'api');
+      r = await get(`/api/symbol/${apiNow}?${q}`);
+      check('inspector after recovery: checked and current, checked and drifted', r.status === 200
+        && same(attached(r, A), { state: 'active', evidence_status: 'current', unchecked_symbols: 0 })
+        && same(attached(r, D), { state: 'needs_review', evidence_status: 'drifted', unchecked_symbols: 0 }), r.json && r.json.facts);
+      r = await get(`/api/graph?${q}&view=knowledge`);
+      check('graph after recovery: checked, drift only where proven', same([A, D].map(id => ({ ...verification(factNode(r, id)), drifted: factNode(r, id)?.drifted })),
+        [{ symbolAnchors: 1, uncheckedSymbols: 0, drifted: false }, { symbolAnchors: 1, uncheckedSymbols: 0, drifted: true }]), [A, D].map(id => factNode(r, id)));
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('the twin never saw the other workspace\'s outcomes', same(unchecked(r, [A]), [0]), unchecked(r, [A]));
     } finally {
       process.env.CAIPIRA_AST_BIN = engine;
       await new Promise(resolve => server.close(resolve));
