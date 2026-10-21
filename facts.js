@@ -44,6 +44,12 @@ const PARSER_DOWN_CODES = new Set(['binary_missing', 'timeout', 'bad_output', 'f
  * `unchecked` counts symbol evidence the parser could not refresh in time,
  * which is neither confirmed nor contradicted.
  */
+/**
+ * @typedef {(factId: number, status: EvidenceStatus) => void} EvidenceObserver
+ * Called synchronously with each evidence check a search performs, before
+ * ranking and the limit drop any candidate; a returned hit's
+ * `evidence_status` is the same object. An error it throws ends the search.
+ */
 /** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], evidence_ranges?: {path: string, start_line: number, end_line: number}[], evidenceSymbols?: {path: string, qualifiedName: string, signatureHash: string}[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
 /** @typedef {Partial<FactInput>} FactChanges */
 
@@ -545,7 +551,12 @@ class FactStore {
   //
   // Lexical recall only. Semantic reranking needs an embedder and lives in the
   // caller, which is the only place that has one.
-  /** @param {string} query @param {{limit?: number, states?: string[]}} [opts] @returns {object[]} */
+  /**
+   * @param {string} query
+   * @param {{limit?: number, states?: string[], onEvidence?: EvidenceObserver}} [opts] Up to three times
+   *   `limit` candidates are checked, ranked by trust, and cut to `limit`.
+   * @returns {object[]}
+   */
   search(query, opts = {}) {
     const limit = opts.limit || 10;
     const states = opts.states || ['active', 'needs_review', 'proposed'];
@@ -566,6 +577,7 @@ class FactStore {
 
     return rows.map(fact => {
       const evidence = this.checkEvidence(fact.id);
+      if (opts.onEvidence) opts.onEvidence(fact.id, evidence);
       return {
         ...fact,
         lexical: -fact.bm25,

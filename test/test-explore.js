@@ -870,6 +870,115 @@ async function main() {
       await new Promise(resolve => server.close(resolve));
     }
   }
+
+  console.log('\n18. search candidates the limit or a category drops keep the outcome of their check');
+  {
+    const preferred1 = 'export function preferred(value: number): number {\n  return value;\n}\n';
+    const secondary1 = 'export function secondary(value: number): number {\n  return value;\n}\n';
+    const files = { 'src/preferred.ts': preferred1, 'src/secondary.ts': secondary1 };
+    const searched = extraWorkspace('explore-truncated-', files);
+    const twin = extraWorkspace('explore-truncated-twin-', files);
+    const DAY_AGO = Date.now() - 86400000;
+    // Symbol-only facts as of a day ago; confidence alone orders their trust.
+    const seed = ws => inDb(ws, db => {
+      const store = new FactStore(db, { machine: machineId(), agent: 'test', root: ws.root });
+      const hash = (file, name) => db.prepare('SELECT signature_hash FROM ast_symbols WHERE path = ? AND qualified_name = ?').get(file, name).signature_hash;
+      const SECONDARY = ['src/secondary.ts', 'secondary'];
+      return [
+        { kind: 'constraint', title: 'Preferred shared argument count', body: 'preferred takes one argument.', confidence: 1, anchor: ['src/preferred.ts', 'preferred'] },
+        { kind: 'constraint', title: 'Secondary shared argument count', body: 'secondary takes one argument.', confidence: 0.3, anchor: SECONDARY },
+        { kind: 'gotcha', title: 'Filtered shared argument count', body: 'secondary is easy to misuse.', confidence: 0.6, anchor: SECONDARY },
+        { kind: 'decision', title: 'Unrelated helper note', body: 'Nothing else matches this.', confidence: 1, anchor: SECONDARY }
+      ].map(({ anchor, ...input }) => {
+        const id = store.record({ ...input, evidenceSymbols: [{ path: anchor[0], qualifiedName: anchor[1], signatureHash: hash(...anchor) }] });
+        store.update(id, { evidence: [] });
+        db.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, id);
+        return id;
+      });
+    });
+    const [PREFERRED, SECONDARY, FILTERED, UNMATCHED] = seed(searched);
+    const ALL = [PREFERRED, SECONDARY, FILTERED, UNMATCHED];
+    const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    check('the twin workspace holds the same fact ids', same(seed(twin), ALL), ALL);
+    const stored = () => inDb(searched, db => db.prepare('SELECT id, state, last_verified_at FROM facts ORDER BY id').all());
+    const storedBefore = stored();
+
+    const server = createExploreServer({ defaultWorkspace: WS, distDir: DIST });
+    const port = await listen(server);
+    const get = target => request(port, 'GET', target);
+    const patch = (target, body) => request(port, 'PATCH', target, { body });
+    const q = `workspace=${searched.id}`;
+    const byId = r => new Map((r.json && r.json.facts || []).map(f => [f.id, f]));
+    const unchecked = (r, ids) => ids.map(id => byId(r).get(id)?.uncheckedSymbols);
+    const returned = r => (r.json && r.json.facts || []).map(f => f.id);
+    const attached = (r, id) => {
+      const fact = r.json && r.json.facts.find(f => f.fact_id === id);
+      return fact && { state: fact.state, evidence_status: fact.evidence_status, unchecked_symbols: fact.unchecked_symbols };
+    };
+    const factNode = (r, id) => {
+      const node = r.json && r.json.nodes.find(n => n.id === `fact:${id}`);
+      return node && { drifted: node.drifted, symbolAnchors: node.symbolAnchors, uncheckedSymbols: node.uncheckedSymbols };
+    };
+    const engine = process.env.CAIPIRA_AST_BIN;
+    try {
+      let r = await get(`/api/facts?${q}`);
+      check('a healthy check reads every fact 0', same(unchecked(r, ALL), [0, 0, 0, 0]), unchecked(r, ALL));
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('so does the twin', same(unchecked(r, ALL), [0, 0, 0, 0]), unchecked(r, ALL));
+
+      // Only the lower-ranked anchors' file changes, by a different size.
+      fs.writeFileSync(path.join(searched.root, 'src/secondary.ts'), secondary1.replace('secondary(value: number)', 'secondary(value: number, extra: number)'));
+      const secondarySymbol = symbolIn(searched, 'secondary');
+      process.env.CAIPIRA_AST_BIN = path.join(searched.root, 'no-such-caipira-ast');
+      r = await get(`/api/facts?${q}&q=unrelated+helper+note`);
+      check('a search for an unrelated fact reads it 1', same(returned(r), [UNMATCHED]) && same(unchecked(r, [UNMATCHED]), [1]), unchecked(r, [UNMATCHED]));
+      r = await get(`/api/facts?${q}&q=shared+argument+count&limit=1`);
+      check('H1: limit=1 still returns only the higher-ranked hit, checked', same(returned(r), [PREFERRED]) && same(unchecked(r, [PREFERRED]), [0]),
+        r.json && r.json.facts.map(f => [f.id, f.trust, f.uncheckedSymbols]));
+      r = await get(`/api/facts?${q}`);
+      check('H1: the next read gives the candidates the limit dropped their positive count; the unmatched fact keeps its own',
+        same(unchecked(r, ALL), [0, 1, 1, 1]), unchecked(r, ALL));
+      r = await patch(`/api/facts/${SECONDARY}?${q}`, { action: 'update', title: 'Secondary shared argument count (two)' });
+      check('an ordinary update DTO keeps it', r.status === 200 && r.json.fact.uncheckedSymbols === 1, r.text);
+      r = await get(`/api/symbol/${secondarySymbol}?${q}`);
+      check('the inspector qualifies every fact on the omitted anchor', r.status === 200
+        && [SECONDARY, FILTERED, UNMATCHED].every(id => same(attached(r, id), { state: 'active', evidence_status: 'current', unchecked_symbols: 1 })),
+        r.json && r.json.facts);
+      r = await get(`/api/graph?${q}&view=knowledge`);
+      check('the graph marks the omitted candidate', same(factNode(r, SECONDARY), { drifted: false, symbolAnchors: 1, uncheckedSymbols: 1 }), factNode(r, SECONDARY));
+      r = await get(`/api/graph?${q}&view=knowledge&limit=${ALL.length}`);
+      check('as it does under a cap that drops its evidence edge', r.status === 200 && r.json.stats.truncated && !r.json.edges.some(e => e.kind === 'evidences')
+        && same(factNode(r, SECONDARY), { drifted: false, symbolAnchors: 1, uncheckedSymbols: 1 }), r.json && { edges: r.json.edges, node: factNode(r, SECONDARY) });
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('the twin\'s facts with the same ids stay 0', same(unchecked(r, ALL), [0, 0, 0, 0]), unchecked(r, ALL));
+      check('SQLite: the parser failure changed no state and advanced no verification', same(stored(), storedBefore), stored());
+
+      process.env.CAIPIRA_AST_BIN = engine;
+      r = await get(`/api/facts?${q}&q=shared+argument+count&category=gotcha&limit=1`);
+      check('a healthy search whose limit and category drop every candidate returns nothing', r.status === 200 && same(returned(r), []), returned(r));
+      r = await get(`/api/facts?${q}`);
+      check('its successful checks still replace the failed ones; the unmatched fact keeps its own', same(unchecked(r, ALL), [0, 0, 0, 1]),
+        unchecked(r, ALL));
+      r = await get(`/api/facts?${q}&refresh=1`);
+      const rechecked = [SECONDARY, FILTERED].map(id => byId(r).get(id));
+      check('an explicit re-check finds the real signature change', rechecked.every(f => f && f.uncheckedSymbols === 0 && f.state === 'needs_review'
+        && f.drifted === true && f.symbols[0].current === false) && byId(r).get(PREFERRED)?.state === 'active', rechecked);
+      r = await patch(`/api/facts/${SECONDARY}?${q}`, { action: 'reaffirm' });
+      check('reaffirm: 0 unchecked, current', r.status === 200 && r.json.fact.uncheckedSymbols === 0 && r.json.fact.symbols[0].current === true, r.text);
+      r = await get(`/api/facts?${q}`);
+      check('later fact reads agree', same(unchecked(r, ALL), [0, 0, 0, 0]) && byId(r).get(SECONDARY)?.state === 'active', unchecked(r, ALL));
+      const secondaryNow = symbolIn(searched, 'secondary');
+      r = await get(`/api/symbol/${secondaryNow}?${q}`);
+      check('so do the inspector and the graph', same(attached(r, SECONDARY), { state: 'active', evidence_status: 'current', unchecked_symbols: 0 })
+        && same(factNode(await get(`/api/graph?${q}&view=knowledge`), SECONDARY), { drifted: false, symbolAnchors: 1, uncheckedSymbols: 0 }),
+        attached(r, SECONDARY));
+      r = await get(`/api/facts?workspace=${twin.id}`);
+      check('and the twin still reads its own 0', same(unchecked(r, ALL), [0, 0, 0, 0]), unchecked(r, ALL));
+    } finally {
+      process.env.CAIPIRA_AST_BIN = engine;
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
 }
 
 main()

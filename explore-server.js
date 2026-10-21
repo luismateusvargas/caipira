@@ -964,10 +964,10 @@ function getFacts(ctx, req, url) {
     const outcomes = ensureVerified(ctx, ws, store, refresh);
     let rows;
     if (query) {
-      rows = store.search(query, { limit, states });
-      // The search just re-checked each hit's evidence; later reads report that.
-      for (const fact of rows) outcomes.set(fact.id, fact.evidence_status.unchecked);
-      rows = rows.filter(fact => !category || fact.kind === category);
+      // The search re-checks every candidate's evidence, including those its
+      // ranking and limit drop; later reads report each newest outcome.
+      const observe = (factId, status) => outcomes.set(factId, status.unchecked);
+      rows = store.search(query, { limit, states, onEvidence: observe }).filter(fact => !category || fact.kind === category);
     } else {
       const where = [`state IN (${states.map(() => '?').join(',')})`];
       const args = [...states];

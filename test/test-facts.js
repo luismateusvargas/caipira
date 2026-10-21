@@ -379,6 +379,60 @@ console.log('\n19. a refresh scope re-indexes each file once, within its deadlin
   fs.rmSync(root, { recursive: true, force: true });
 }
 
+console.log('\n20. search reports every candidate it checks, before ranking and the limit drop any');
+{
+  const odb = new D(path.join(tmp, 'observe.db'));
+  migrate(odb, WORKSPACE_MIGRATIONS);
+  const ostore = new FactStore(odb, { machine: 'testbox', agent: 'test' });
+  const steady = path.join(tmp, 'steady.js');
+  const moving = path.join(tmp, 'moving.js');
+  fs.writeFileSync(steady, 'module.exports = 1;\n');
+  fs.writeFileSync(moving, 'module.exports = 2;\n');
+  // Seven matching facts of two kinds, ranked by confidence; one rests on a file about to change.
+  const ids = [0.2, 0.9, 0.5, 1, 0.4, 0.7, 0.3].map((confidence, i) => ostore.record({
+    kind: i % 2 ? 'gotcha' : 'decision', title: `Observed candidate ${i}`, body: 'Each candidate check is reported.',
+    confidence, evidence: [i === 3 ? moving : steady]
+  }));
+  ostore.record({ kind: 'decision', title: 'Unrelated', body: 'Nothing about the query.', evidence: [steady] });
+  fs.writeFileSync(moving, 'module.exports = { changed: true };\n');
+
+  const performed = [];
+  const checkEvidence = ostore.checkEvidence.bind(ostore);
+  ostore.checkEvidence = (factId, scope) => {
+    const status = checkEvidence(factId, scope);
+    performed.push({ id: factId, status });
+    return status;
+  };
+  const run = opts => {
+    performed.length = 0;
+    const hits = ostore.search('observed candidate', { limit: 2, ...opts });
+    return { hits, performed: [...performed] };
+  };
+  const plain = run({});
+  const observed = [];
+  const watched = run({ onEvidence: (factId, status) => observed.push({ id: factId, status }) });
+  const ranked = result => result.hits.map(hit => [hit.id, hit.trust]);
+
+  check('the search checks three times its limit and returns its limit', plain.performed.length === 6 && plain.hits.length === 2,
+    JSON.stringify({ checked: plain.performed.length, returned: plain.hits.length }));
+  check('the observer gets every check the search performs, once, in order, with its own status',
+    observed.length === watched.performed.length && observed.every((seen, i) => seen.id === watched.performed[i].id
+      && seen.status === watched.performed[i].status), JSON.stringify(observed.map(seen => seen.id)));
+  check('including the candidates ranking and the limit dropped', observed.filter(seen => !watched.hits.some(hit => hit.id === seen.id)).length === 4,
+    JSON.stringify({ observed: observed.map(seen => seen.id), returned: watched.hits.map(hit => hit.id) }));
+  check('a returned hit carries the very status the observer saw', watched.hits.every(hit => observed.find(seen => seen.id === hit.id)?.status === hit.evidence_status));
+  check('the changed candidate is seen changed although it ranks out', observed.find(seen => seen.id === ids[3])?.status.changed === 1
+    && !watched.hits.some(hit => hit.id === ids[3]), JSON.stringify(observed.find(seen => seen.id === ids[3])));
+  check('observing adds no checks and changes no result or ranking', watched.performed.length === plain.performed.length
+    && JSON.stringify(watched.hits) === JSON.stringify(plain.hits), JSON.stringify({ plain: ranked(plain), watched: ranked(watched) }));
+  let thrown = null;
+  try {
+    ostore.search('observed candidate', { limit: 2, onEvidence: () => { throw new Error('observer failed'); } });
+  } catch (error) { thrown = error; }
+  check('an observer error propagates rather than yielding partial results', thrown && thrown.message === 'observer failed', thrown && thrown.message);
+  odb.close();
+}
+
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
