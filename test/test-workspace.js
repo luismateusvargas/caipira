@@ -60,7 +60,7 @@ const fresh = path.join(tmp, 'fresh.db');
 const db1 = new D(fresh);
 const r1 = migrate(db1, WORKSPACE_MIGRATIONS);
 const r2 = migrate(db1, WORKSPACE_MIGRATIONS);
-check('fresh db applies every migration', r1.applied.join(',') === '1,2,3', JSON.stringify(r1));
+check('fresh db applies every migration', r1.applied.join(',') === '1,2,3,4', JSON.stringify(r1));
 check('second run is a no-op', r2.applied.length === 0, JSON.stringify(r2));
 db1.close();
 
@@ -69,7 +69,7 @@ const legacyDb = new D(ws.LEGACY_DB);
 const before = legacyDb.prepare('SELECT COUNT(*) n FROM observations').get().n;
 const r3 = migrate(legacyDb, WORKSPACE_MIGRATIONS);
 const after = legacyDb.prepare('SELECT COUNT(*) n FROM observations').get().n;
-check('legacy db reaches current version', require('../migrate.js').currentVersion(legacyDb) === 3, JSON.stringify(r3));
+check('legacy db reaches current version', require('../migrate.js').currentVersion(legacyDb) === 4, JSON.stringify(r3));
 check('observations preserved (' + before + ')', before === after && before > 0);
 legacyDb.close();
 
@@ -148,7 +148,7 @@ console.log('\n10. Storage schema comes from migrate.js');
 const { Storage, MemoryStore } = require('../store.js');
 const storeFile = path.join(tmp, 'store.db');
 const storage = new Storage(storeFile);
-check('fresh Storage reaches schema version 3', require('../migrate.js').currentVersion(storage.db) === 3);
+check('fresh Storage reaches schema version 4', require('../migrate.js').currentVersion(storage.db) === 4);
 check('facts table provisioned', Boolean(storage.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'facts'").get()));
 
 console.log('\n11. embeddings survive unaligned blob buffers');

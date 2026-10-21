@@ -7,9 +7,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::{
-    Ctx, Decl, EdgeKind, ImportBinding, ParamSignature, collapse_ws, first_paragraph,
-    generic_names, named_children,
+    Ctx, Decl, EdgeKind, ImportItem, ParamSignature, collapse_ws, first_paragraph, generic_names,
+    named_children,
 };
+use crate::resolve::ImportRequest;
 
 pub(super) fn extract(ctx: &mut Ctx, root: Node) {
     let all = dunder_all(ctx, root);
@@ -259,8 +260,10 @@ fn import(ctx: &mut Ctx, node: Node) {
                     continue;
                 };
                 let module = ctx.text(module_node);
-                let target = ctx.resolver.python(ctx.path, &module);
-                ctx.import_edge(&module, target.clone(), line);
+                let target = ctx.request(ImportRequest::Python {
+                    module: module.clone(),
+                });
+                ctx.import_edge(&module, Some(target), line);
                 // `import a.b` binds `a`; `import a.b as x` binds `x` to `a.b`.
                 let (local, bound) = match alias {
                     Some(alias) => (ctx.text(alias), target),
@@ -269,18 +272,15 @@ fn import(ctx: &mut Ctx, node: Node) {
                         let bound = if first == module {
                             target
                         } else {
-                            ctx.resolver.python(ctx.path, &first)
+                            ctx.request(ImportRequest::Python {
+                                module: first.clone(),
+                            })
                         };
                         (first, bound)
                     }
                 };
                 let imported = local.clone();
-                ctx.bind(ImportBinding {
-                    local,
-                    target_path: bound,
-                    imported,
-                    namespace: true,
-                });
+                ctx.bind(local, bound, imported, true);
             }
         }
         "import_from_statement" => {
@@ -288,8 +288,9 @@ fn import(ctx: &mut Ctx, node: Node) {
                 return;
             };
             let module = ctx.text(module_node);
-            let target = ctx.resolver.python(ctx.path, &module);
-            let mut module_edge = false;
+            let target = ctx.request(ImportRequest::Python {
+                module: module.clone(),
+            });
             for name in names {
                 let (name_node, alias) = match name.kind() {
                     "aliased_import" => (
@@ -303,37 +304,27 @@ fn import(ctx: &mut Ctx, node: Node) {
                 let local = alias
                     .map(|a| ctx.text(a))
                     .unwrap_or_else(|| imported.clone());
-                // `from . import utils` imports a submodule, not a name.
-                if let Some(submodule) = ctx.resolver.python_submodule(ctx.path, &module, &imported)
-                {
-                    let specifier = submodule_specifier(&module, &imported);
-                    ctx.import_edge(&specifier, Some(submodule.clone()), line);
-                    let local_name = local.clone();
-                    ctx.bind(ImportBinding {
-                        local,
-                        target_path: Some(submodule),
-                        imported: local_name,
-                        namespace: true,
-                    });
-                    continue;
-                }
-                if !module_edge {
-                    ctx.import_edge(&module, target.clone(), line);
-                    module_edge = true;
-                }
-                ctx.bind(ImportBinding {
+                // `from . import utils` imports a submodule, not a name;
+                // which one it is depends on the files, so linking decides.
+                let submodule_request = ctx.request(ImportRequest::PythonSubmodule {
+                    module: module.clone(),
+                    name: imported.clone(),
+                });
+                ctx.import_from(ImportItem::PythonFrom {
+                    module: module.clone(),
+                    module_request: target,
+                    submodule: submodule_specifier(&module, &imported),
+                    submodule_request,
                     local,
-                    target_path: target.clone(),
                     imported,
-                    namespace: false,
+                    line,
                 });
             }
-            if !module_edge
-                && named_children(node)
-                    .iter()
-                    .any(|n| n.kind() == "wildcard_import")
+            if named_children(node)
+                .iter()
+                .any(|n| n.kind() == "wildcard_import")
             {
-                ctx.import_edge(&module, target, line);
+                ctx.import_edge(&module, Some(target), line);
             }
         }
         _ => {}

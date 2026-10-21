@@ -1,6 +1,8 @@
 // Drives the caipira-ast binary through ast.js against a fixture workspace
 // covering all eight language families, then checks the incremental gates,
-// single-file diffs, the symbol queries, error mapping, and schema v3.
+// single-file diffs, the symbol queries, error mapping, the workspace
+// boundary (unreadable directories, symlinks, ignore rules), cross-file edge
+// re-linking, and schemas v3 and v4.
 //
 // Builds the crate first (debug profile) and points CAIPIRA_AST_BIN at it, so
 // the suite always tests the source in this checkout rather than whatever
@@ -532,7 +534,7 @@ console.log('\n7. engine failures surface as typed errors');
   check('empty argument rejected before spawning', failure(() => ast.updateFileAst(ws, dbFile, ''))?.code === 'invalid_argument');
 }
 
-console.log('\n8. schema v3: the Rust and JS DDL agree');
+console.log('\n8. schemas v3 and v4: the Rust and JS DDL agree');
 {
   const dir = tempDir('caipira-ast-schema-');
   const rustDb = path.join(dir, 'rust.db');
@@ -549,10 +551,10 @@ console.log('\n8. schema v3: the Rust and JS DDL agree');
   };
   const fromRust = schema(rustDb), fromJs = schema(jsDb);
   const diff = fromRust.filter(s => !fromJs.includes(s)).concat(fromJs.filter(s => !fromRust.includes(s)));
-  check('same ast_* tables, indexes and triggers (' + fromJs.length + ')', fromJs.length >= 14 && diff.length === 0, diff);
+  check('same ast_* tables, indexes and triggers (' + fromJs.length + ')', fromJs.length >= 17 && diff.length === 0, diff);
 }
 
-console.log('\n9. migrateAll upgrades existing databases to v3 idempotently');
+console.log('\n9. migrateAll upgrades existing databases to v4 idempotently');
 {
   const caipiraDir = tempDir('caipira-ast-migrate-');
   const dbDir = path.join(caipiraDir, 'database');
@@ -585,19 +587,19 @@ console.log('\n9. migrateAll upgrades existing databases to v3 idempotently');
   const firstRun = migrateAll({ caipiraDir });
   const entry = file => firstRun.workspaces.find(w => w.dbFile === file);
   check('master.db visited and left at its own version', firstRun.master && firstRun.master.to === 1 && firstRun.master.applied.length === 0, firstRun.master);
-  check('v2 workspace db upgraded to v3', same(entry(v2File) && entry(v2File).applied, [3]) && entry(v2File).to === 3, entry(v2File));
-  check('legacy data.db upgraded from v1 to v3', same(entry(path.join(caipiraDir, 'data.db'))?.applied, [2, 3]), firstRun.workspaces);
+  check('v2 workspace db upgraded to v4', same(entry(v2File) && entry(v2File).applied, [3, 4]) && entry(v2File).to === 4, entry(v2File));
+  check('legacy data.db upgraded from v1 to v4', same(entry(path.join(caipiraDir, 'data.db'))?.applied, [2, 3, 4]), firstRun.workspaces);
   check('registered but missing db is skipped, not created', !fs.existsSync(goneFile) && firstRun.failed.length === 0, firstRun.failed);
 
   const upgraded = new Database(v2File);
   upgraded.pragma('foreign_keys = ON');
-  check('schema_version is 3', currentVersion(upgraded) === 3);
+  check('schema_version is 4', currentVersion(upgraded) === 4);
   const n = sql => upgraded.prepare(sql).get().n;
   check('observations, sessions and facts preserved', n('SELECT COUNT(*) n FROM observations') === 1
     && n('SELECT COUNT(*) n FROM sessions') === 1 && n('SELECT COUNT(*) n FROM facts') === 1);
   check('observation FTS still answers', n("SELECT COUNT(*) n FROM observations_fts WHERE observations_fts MATCH 'kept'") === 1);
   const tables = upgraded.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
-  check('v3 tables exist', ['ast_files', 'ast_symbols', 'ast_edges', 'ast_symbols_fts', 'fact_symbol_evidence'].every(t => tables.includes(t)), tables);
+  check('v3 and v4 tables exist', ['ast_files', 'ast_symbols', 'ast_edges', 'ast_symbols_fts', 'fact_symbol_evidence', 'ast_links', 'ast_link_probes'].every(t => tables.includes(t)), tables);
   upgraded.prepare("INSERT INTO fact_symbol_evidence (fact_id, path, qualified_name, signature_hash) VALUES (1, 'a.js', 'f', '0123456789abcdef')").run();
   upgraded.prepare('DELETE FROM facts WHERE id = 1').run();
   check('fact_symbol_evidence cascades with its fact', n('SELECT COUNT(*) n FROM fact_symbol_evidence') === 0);
@@ -605,6 +607,131 @@ console.log('\n9. migrateAll upgrades existing databases to v3 idempotently');
 
   const secondRun = migrateAll({ caipiraDir });
   check('second run applies nothing', secondRun.master.applied.length === 0 && secondRun.workspaces.every(w => w.applied.length === 0) && secondRun.failed.length === 0, secondRun);
+
+  // A database indexed before v4 has no link state, so v4 clears the stat
+  // gate and the next sync re-parses every file once.
+  const v3Ws = tempDir('caipira-ast-v3ws-');
+  fs.writeFileSync(path.join(v3Ws, 'a.js'), "import { b } from './b.js';\nexport function a() { return b(); }\n");
+  const v3File = path.join(tempDir('caipira-ast-v3db-'), 'v3.db');
+  const v3 = new Database(v3File);
+  migrate(v3, WORKSPACE_MIGRATIONS.filter(m => m.version <= 3));
+  v3.close();
+  execFileSync(process.env.CAIPIRA_AST_BIN, ['index', '--workspace', v3Ws, '--db', v3File], { stdio: 'ignore' });
+  const v3Db = new Database(v3File);
+  v3Db.exec('DELETE FROM ast_links; DELETE FROM ast_link_probes');
+  v3Db.close();
+  const resynced = ast.syncWorkspaceAst(v3Ws, v3File);
+  check('v4 re-parses files indexed before it', resynced.parsed === 1 && resynced.skipped === 0, resynced);
+  const relinkable = new Database(v3File, { readonly: true });
+  check('re-parsed files gain link state', relinkable.prepare("SELECT COUNT(*) n FROM ast_links WHERE path = 'a.js'").get().n === 1);
+  relinkable.close();
+}
+
+console.log('\n10. the index boundary: unreadable directories, symlinks, ignore rules');
+const boundaryRoot = tempDir('caipira-ast-boundary-');
+const bws = path.join(boundaryRoot, 'ws');
+const bdb = path.join(boundaryRoot, 'boundary.db');
+const put = (rel, body) => {
+  const file = path.join(bws, rel);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+};
+const rows = (sql, ...args) => {
+  const db = new Database(bdb, { readonly: true });
+  try { return db.prepare(sql).all(...args); } finally { db.close(); }
+};
+const footprint = file => ['ast_files WHERE path', 'ast_symbols WHERE path', 'ast_edges WHERE source_path', 'ast_symbols_fts WHERE path']
+  .map(where => rows(`SELECT COUNT(*) n FROM ${where} = ?`, file)[0].n);
+// Permission bits do not restrict root; those checks are skipped there.
+const restricts = dir => { try { fs.readdirSync(dir); return false; } catch { return true; } };
+{
+  put('sub/keep.js', "import { provide } from '../provider.js';\nexport function keep() { return provide(); }\n");
+  put('consumer.js', "import { provide } from './provider.js';\nexport function consume() { return provide(); }\n");
+  put('.gitignore', 'ignored.js\n');
+  put('ignored.js', 'export function hidden() {}\n');
+  put('node_modules/pkg/index.js', 'export function dep() {}\n');
+  const outside = path.join(boundaryRoot, 'outside');
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'private.js'), 'export function secret() {}\n');
+  fs.symlinkSync(outside, path.join(bws, 'linked'), 'dir');
+  const first = ast.syncWorkspaceAst(bws, bdb);
+  check('boundary fixture: only the two visible sources indexed', first.parsed === 2 && first.failed === 0, first);
+
+  const kept = footprint('sub/keep.js');
+  const sub = path.join(bws, 'sub');
+  fs.chmodSync(sub, 0o000);
+  if (restricts(sub)) {
+    const blocked = ast.syncWorkspaceAst(bws, bdb);
+    fs.chmodSync(sub, 0o755);
+    check('unreadable directory: failed > 0, removed 0', blocked.failed > 0 && blocked.removed === 0
+      && (blocked.failures || []).some(f => f.path === 'sub'), blocked);
+    check('unreadable directory: file, symbol, edge and FTS rows kept', same(footprint('sub/keep.js'), kept) && kept.every(n => n > 0), footprint('sub/keep.js'));
+  } else {
+    fs.chmodSync(sub, 0o755);
+    console.log('  skip unreadable-directory checks: permissions are not enforced for this user');
+  }
+  fs.rmSync(sub, { recursive: true });
+  const pruned = ast.syncWorkspaceAst(bws, bdb);
+  check('readable again: deletion pruning still works', pruned.failed === 0 && pruned.removed === 1 && same(footprint('sub/keep.js'), [0, 0, 0, 0]), pruned);
+
+  const failure = fn => { try { fn(); return null; } catch (error) { return error; } };
+  const linkedUpdate = failure(() => ast.updateFileAst(bws, bdb, 'linked/private.js'));
+  check('update-file through a symlinked directory -> invalid_argument', linkedUpdate && linkedUpdate.code === 'invalid_argument', linkedUpdate && linkedUpdate.message);
+  const linkedParse = failure(() => ast.parseFileAst(bws, path.join(bws, 'linked/private.js')));
+  check('parse-file through a symlinked directory -> invalid_argument', linkedParse && linkedParse.code === 'invalid_argument', linkedParse && linkedParse.message);
+  check('nothing from outside the workspace stored', rows("SELECT COUNT(*) n FROM ast_symbols WHERE name = 'secret'")[0].n === 0);
+  put('plain.js', 'export function plain() {}\n');
+  check('an ordinary in-root file still updates', ast.updateFileAst(bws, bdb, 'plain.js').status === 'added');
+
+  for (const rel of ['ignored.js', 'node_modules/pkg/index.js']) {
+    const update = ast.updateFileAst(bws, bdb, rel);
+    check(`update-file on ${rel}: status ignored, nothing stored`, update.status === 'ignored' && same(footprint(rel), [0, 0, 0, 0]), update);
+  }
+  fs.appendFileSync(path.join(bws, '.gitignore'), 'plain.js\n');
+  const nowIgnored = ast.updateFileAst(bws, bdb, 'plain.js');
+  check('a previously indexed file that becomes ignored is dropped', nowIgnored.status === 'ignored'
+    && nowIgnored.diff.removed.length === 1 && same(footprint('plain.js'), [0, 0, 0, 0]), nowIgnored);
+}
+
+console.log('\n11. cross-file edges follow targets entering and leaving the index');
+{
+  const edgesOf = file => rows('SELECT edge_kind, target_symbol, target_path FROM ast_edges WHERE source_path = ? ORDER BY id', file)
+    .map(r => `${r.edge_kind}:${r.target_symbol}->${r.target_path}`);
+  const gate = () => rows("SELECT size, mtime_ms, content_sha256, indexed_at FROM ast_files WHERE path = 'consumer.js'")[0];
+  const unresolved = ['imports:./provider.js->null', 'calls:provide->null'];
+  const resolved = ['imports:./provider.js->provider.js', 'calls:provide->provider.js'];
+  check('consumer starts with unresolved targets', same(edgesOf('consumer.js'), unresolved), edgesOf('consumer.js'));
+  const consumerGate = gate();
+  // An unreadable consumer proves it is re-linked without being read.
+  const consumer = path.join(bws, 'consumer.js');
+  fs.chmodSync(consumer, 0o000);
+  if (!restricts(consumer)) console.log('  note: permissions are not enforced for this user; the no-read check is weaker');
+
+  put('provider.js', 'export function provide() { return 1; }\n');
+  const appeared = ast.syncWorkspaceAst(bws, bdb);
+  check('provider added: parsed 1, consumer skipped by tier 1 and re-linked', appeared.parsed === 1 && appeared.skipped === 1
+    && appeared.relinked === 1 && appeared.failed === 0, appeared);
+  check('provider added: import and call targets point at provider.js', same(edgesOf('consumer.js'), resolved), edgesOf('consumer.js'));
+
+  fs.rmSync(path.join(bws, 'provider.js'));
+  const vanished = ast.syncWorkspaceAst(bws, bdb);
+  check('provider removed: removed 1, consumer skipped and re-linked', vanished.removed === 1 && vanished.skipped === 1
+    && vanished.relinked === 1 && vanished.failed === 0, vanished);
+  check('provider removed: targets are null again', same(edgesOf('consumer.js'), unresolved), edgesOf('consumer.js'));
+
+  put('provider.js', 'export function provide() { return 1; }\n');
+  const updated = ast.updateFileAst(bws, bdb, 'provider.js');
+  check('update-file adds the provider and re-links the consumer', updated.status === 'added' && updated.relinked === 1
+    && same(edgesOf('consumer.js'), resolved), [updated.status, updated.relinked, edgesOf('consumer.js')]);
+  fs.rmSync(path.join(bws, 'provider.js'));
+  const dropped = ast.updateFileAst(bws, bdb, 'provider.js');
+  check('update-file removes the provider and re-links the consumer', dropped.status === 'removed' && dropped.relinked === 1
+    && same(edgesOf('consumer.js'), unresolved), [dropped.status, dropped.relinked, edgesOf('consumer.js')]);
+
+  check('the consumer was never re-indexed', same(gate(), consumerGate), [gate(), consumerGate]);
+  fs.chmodSync(consumer, 0o644);
+  const quiet = ast.syncWorkspaceAst(bws, bdb);
+  check('a quiet sync re-links nothing', quiet.parsed === 0 && quiet.relinked === 0 && quiet.skipped === 1, quiet);
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

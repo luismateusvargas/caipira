@@ -6,8 +6,14 @@
 //! only `mtime_ms`. Tier 3 parses new and changed files in parallel and
 //! replaces their rows, together with pruning deleted files, in one
 //! transaction. `ast_symbols_fts` follows `ast_symbols` through triggers.
+//!
+//! Pruning needs a complete walk: when a directory could not be read, the
+//! sync reports it and deletes nothing. When a file enters or leaves the
+//! index, every unchanged file whose imports probed its path is re-linked
+//! from `ast_links` in the same transaction, so cross-file edge targets
+//! follow the index without those importers being read or parsed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -20,12 +26,15 @@ use sha2::{Digest, Sha256};
 
 use crate::diff::{AstDiffReport, compare_snapshots};
 use crate::error::AstError;
-use crate::parser::{AstSnapshot, Language, ParamSignature, SymbolSignature, parse_source};
-use crate::resolve::Resolver;
-use crate::walker::{MAX_FILE_BYTES, WalkedFile, mtime_ms, walk_workspace};
+use crate::parser::{
+    AstEdge, AstSnapshot, Language, LinkState, Links, ParamSignature, SymbolSignature,
+    parse_linked, relink,
+};
+use crate::resolve::{Probes, Resolver};
+use crate::walker::{FileFailure, WalkedFile, confine, walk_file, walk_workspace};
 
-/// The `ast_*` schema, identical to workspace migration v3 in `migrate.js`
-/// so either side can create it first.
+/// The `ast_*` schema, identical to workspace migrations v3 and v4 in
+/// `migrate.js` so either side can create it first.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ast_files (
   path TEXT PRIMARY KEY,
@@ -91,6 +100,18 @@ CREATE TRIGGER IF NOT EXISTS ast_symbols_au AFTER UPDATE ON ast_symbols BEGIN
   INSERT INTO ast_symbols_fts(rowid, name, qualified_name, signature_text, doc_summary, path)
   VALUES (new.id, new.name, new.qualified_name, new.signature_text, new.doc_summary, new.path);
 END;
+
+CREATE TABLE IF NOT EXISTS ast_links (
+  path TEXT PRIMARY KEY,
+  state_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ast_link_probes (
+  source_path TEXT NOT NULL,
+  probe_path TEXT NOT NULL,
+  PRIMARY KEY (source_path, probe_path)
+);
+CREATE INDEX IF NOT EXISTS ast_link_probes_probe ON ast_link_probes(probe_path);
 "#;
 
 /// Counts reported by [`index_workspace`].
@@ -102,26 +123,24 @@ pub struct IndexStats {
     pub skipped: usize,
     /// Files whose mtime moved but whose hash matched (Tier 2).
     pub hash_matched: usize,
-    /// Files no longer on disk whose rows were pruned.
+    /// Files no longer on disk whose rows were pruned; always 0 when the
+    /// walk could not read every directory.
     pub removed: usize,
-    /// Files that could not be read or parsed; their old rows are kept.
+    /// Directories that could not be walked and files that could not be read
+    /// or parsed; their old rows are kept.
     pub failed: usize,
+    /// Unchanged files whose edges were re-linked, without being read,
+    /// because a file their imports probed entered or left the index.
+    pub relinked: usize,
     /// `ast_symbols` rows after the sync.
     pub symbols_total: i64,
     /// `ast_edges` rows after the sync.
     pub edges_total: i64,
     /// Wall-clock duration of the sync.
     pub duration_ms: u64,
-    /// One entry per failed file.
+    /// One entry per failed directory or file.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<FileFailure>,
-}
-
-/// A file the sync could not read or parse.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct FileFailure {
-    pub path: String,
-    pub message: String,
 }
 
 /// What [`update_single_file`] did to the file's rows.
@@ -136,6 +155,10 @@ pub enum UpdateStatus {
     Unchanged,
     /// The file is gone and its rows were deleted.
     Removed,
+    /// The file exists but a full index would skip it (ignore rules, a
+    /// hidden or skipped directory, the size limit, not a regular file):
+    /// nothing was parsed, and any rows it had were deleted.
+    Ignored,
 }
 
 /// The result of re-indexing one file.
@@ -144,6 +167,8 @@ pub struct FileUpdate {
     pub status: UpdateStatus,
     pub path: String,
     pub diff: AstDiffReport,
+    /// Unchanged files re-linked because this file entered or left the index.
+    pub relinked: usize,
     pub duration_ms: u64,
 }
 
@@ -155,6 +180,7 @@ struct FileState {
 
 struct ParsedFile {
     snapshot: AstSnapshot,
+    links: Links,
     size: i64,
     mtime_ms: i64,
     sha256: String,
@@ -197,13 +223,13 @@ pub fn open_database(db_path: &Path) -> Result<Connection, AstError> {
 /// unparsable files are reported in [`IndexStats::failures`] instead.
 pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats, AstError> {
     let started = Instant::now();
-    let walked = walk_workspace(root)?;
+    let walk = walk_workspace(root)?;
     let known = load_file_states(conn)?;
     let resolver = Resolver::new(root);
 
     let mut stats = IndexStats::default();
     let mut work: Vec<(&WalkedFile, Option<&str>)> = Vec::new();
-    for file in &walked {
+    for file in &walk.files {
         let size = to_i64(file.size);
         match known.get(&file.rel_path) {
             Some(state) if state.size == size && state.mtime_ms == file.mtime_ms => {
@@ -218,17 +244,26 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
         .map(|(file, known_sha)| process(root, &resolver, file, *known_sha))
         .collect();
 
-    let on_disk: HashSet<&str> = walked.iter().map(|f| f.rel_path.as_str()).collect();
-    let mut removed: Vec<&String> = known
-        .keys()
-        .filter(|path| !on_disk.contains(path.as_str()))
-        .collect();
-    removed.sort();
+    // An incomplete walk cannot tell a deleted file from one it never
+    // reached, so nothing is pruned until every directory can be read.
+    let mut removed: Vec<&String> = Vec::new();
+    if walk.failures.is_empty() {
+        let on_disk: HashSet<&str> = walk.files.iter().map(|f| f.rel_path.as_str()).collect();
+        removed = known
+            .keys()
+            .filter(|path| !on_disk.contains(path.as_str()))
+            .collect();
+        removed.sort();
+    }
+    stats.failed = walk.failures.len();
+    stats.failures = walk.failures;
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| AstError::database("starting the index transaction", e))?;
     let indexed_at = now_ms();
+    let mut fresh: HashSet<String> = HashSet::new();
+    let mut changed: Vec<String> = Vec::new();
     for outcome in outcomes {
         match outcome {
             Outcome::HashMatched { path, mtime_ms } => {
@@ -238,6 +273,11 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
             Outcome::Parsed(parsed) => {
                 write_file(&tx, &parsed, indexed_at)?;
                 stats.parsed += 1;
+                let path = parsed.snapshot.path.clone();
+                if !known.contains_key(&path) {
+                    changed.push(path.clone());
+                }
+                fresh.insert(path);
             }
             Outcome::Failed(failure) => {
                 stats.failed += 1;
@@ -247,7 +287,9 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
     }
     for path in &removed {
         delete_file(&tx, path)?;
+        changed.push((*path).clone());
     }
+    stats.relinked = relink_dependents(&tx, &resolver, &changed, &fresh)?;
     tx.commit()
         .map_err(|e| AstError::database("committing the index transaction", e))?;
 
@@ -281,9 +323,10 @@ fn process(
             mtime_ms: file.mtime_ms,
         };
     }
-    match parse_source(&file.rel_path, &bytes, resolver) {
-        Ok(snapshot) => Outcome::Parsed(Box::new(ParsedFile {
+    match parse_linked(&file.rel_path, &bytes, resolver) {
+        Ok((snapshot, links)) => Outcome::Parsed(Box::new(ParsedFile {
             snapshot,
+            links,
             size: to_i64(bytes.len() as u64),
             mtime_ms: file.mtime_ms,
             sha256,
@@ -294,8 +337,10 @@ fn process(
 
 /// Re-indexes one file through the same gates and reports its symbol diff.
 ///
-/// Does not consult ignore rules: a later [`index_workspace`] prunes a file
-/// the walker would not have visited.
+/// The file must be one a full [`index_workspace`] would visit: a path
+/// through a symlink is rejected before anything is read, and a file the
+/// walker's rules exclude is never parsed; if it was indexed before, its rows
+/// are deleted and the status is [`UpdateStatus::Ignored`].
 ///
 /// # Arguments
 /// `conn`: an open workspace database.
@@ -303,9 +348,11 @@ fn process(
 /// `rel_path`: the file, relative to `root` (see [`crate::workspace_relative`]).
 ///
 /// # Errors
-/// `AstError::Unsupported` for an unknown extension; `AstError::Io` when the
-/// file cannot be read, or is missing and was never indexed;
-/// `AstError::Parse` and `AstError::Database` as for a full index.
+/// `AstError::Unsupported` for an unknown extension;
+/// `AstError::InvalidArgument` for a path through a symlink; `AstError::Io`
+/// when the file or a directory above it cannot be read, or the file is
+/// missing and was never indexed; `AstError::Parse` and `AstError::Database`
+/// as for a full index.
 pub fn update_single_file(
     conn: &mut Connection,
     root: &Path,
@@ -315,45 +362,52 @@ pub fn update_single_file(
     if Language::from_path(rel_path).is_none() {
         return Err(AstError::Unsupported(rel_path.to_string()));
     }
+    let exists = confine(root, rel_path)?.is_some();
     let before = load_symbols(conn, rel_path)?;
     let state = load_file_state(conn, rel_path)?;
     let absolute = root.join(rel_path);
-    let result = |status, diff| FileUpdate {
+    let resolver = Resolver::new(root);
+    let result = |status, diff, relinked| FileUpdate {
         status,
         path: rel_path.to_string(),
         diff,
+        relinked,
         duration_ms: elapsed_ms(started),
     };
 
-    // Symlinks and oversized files are not indexed, matching the walker.
-    let metadata = match fs::symlink_metadata(&absolute) {
-        Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES => Some(m),
-        Ok(_) => None,
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => return Err(AstError::io(&absolute, e)),
+    let walked = if exists {
+        walk_file(root, rel_path)?
+    } else {
+        None
     };
-    let Some(metadata) = metadata else {
+    let Some(file) = walked else {
+        let status = if exists {
+            UpdateStatus::Ignored
+        } else {
+            UpdateStatus::Removed
+        };
         if state.is_none() {
+            if exists {
+                return Ok(result(status, AstDiffReport::default(), 0));
+            }
             let missing = std::io::Error::new(ErrorKind::NotFound, "not on disk and not indexed");
             return Err(AstError::io(&absolute, missing));
         }
         let tx = immediate(conn)?;
         delete_file(&tx, rel_path)?;
+        let relinked = relink_dependents(&tx, &resolver, &[rel_path.to_string()], &HashSet::new())?;
         tx.commit()
             .map_err(|e| AstError::database("committing the file removal", e))?;
-        return Ok(result(
-            UpdateStatus::Removed,
-            compare_snapshots(&before, &[]),
-        ));
+        return Ok(result(status, compare_snapshots(&before, &[]), relinked));
     };
 
-    let size = to_i64(metadata.len());
-    let mtime = mtime_ms(&metadata);
+    let size = to_i64(file.size);
+    let mtime = file.mtime_ms;
     if let Some(state) = &state
         && state.size == size
         && state.mtime_ms == mtime
     {
-        return Ok(result(UpdateStatus::Unchanged, AstDiffReport::default()));
+        return Ok(result(UpdateStatus::Unchanged, AstDiffReport::default(), 0));
     }
     let bytes = fs::read(&absolute).map_err(|e| AstError::io(&absolute, e))?;
     let sha256 = sha256_hex(&bytes);
@@ -364,19 +418,27 @@ pub fn update_single_file(
         touch_mtime(&tx, rel_path, mtime)?;
         tx.commit()
             .map_err(|e| AstError::database("committing the mtime update", e))?;
-        return Ok(result(UpdateStatus::Unchanged, AstDiffReport::default()));
+        return Ok(result(UpdateStatus::Unchanged, AstDiffReport::default(), 0));
     }
 
-    let snapshot = parse_source(rel_path, &bytes, &Resolver::new(root))?;
+    let (snapshot, links) = parse_linked(rel_path, &bytes, &resolver)?;
     let diff = compare_snapshots(&before, &snapshot.symbols);
     let parsed = ParsedFile {
         snapshot,
+        links,
         size: to_i64(bytes.len() as u64),
         mtime_ms: mtime,
         sha256,
     };
     let tx = immediate(conn)?;
     write_file(&tx, &parsed, now_ms())?;
+    let relinked = match state {
+        Some(_) => 0,
+        None => {
+            let fresh = HashSet::from([rel_path.to_string()]);
+            relink_dependents(&tx, &resolver, &[rel_path.to_string()], &fresh)?
+        }
+    };
     tx.commit()
         .map_err(|e| AstError::database("committing the file update", e))?;
     let status = if state.is_some() {
@@ -384,7 +446,7 @@ pub fn update_single_file(
     } else {
         UpdateStatus::Added
     };
-    Ok(result(status, diff))
+    Ok(result(status, diff, relinked))
 }
 
 /// The symbols stored for one file, in source order.
@@ -478,10 +540,6 @@ fn write_file(tx: &Transaction, parsed: &ParsedFile, indexed_at: i64) -> Result<
     tx.prepare_cached("DELETE FROM ast_symbols WHERE path = ?1")
         .and_then(|mut s| s.execute([path]))
         .map_err(db("clearing ast_symbols"))?;
-    tx.prepare_cached("DELETE FROM ast_edges WHERE source_path = ?1")
-        .and_then(|mut s| s.execute([path]))
-        .map_err(db("clearing ast_edges"))?;
-
     let mut insert_symbol = tx
         .prepare_cached(
             "INSERT INTO ast_symbols (path, name, qualified_name, kind, is_public, start_line, end_line,
@@ -510,24 +568,8 @@ fn write_file(tx: &Transaction, parsed: &ParsedFile, indexed_at: i64) -> Result<
             .map_err(db("writing ast_symbols"))?;
     }
 
-    let mut insert_edge = tx
-        .prepare_cached(
-            "INSERT INTO ast_edges (source_path, source_symbol, target_path, target_symbol, edge_kind, line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .map_err(db("preparing ast_edges insert"))?;
-    for edge in &snapshot.edges {
-        insert_edge
-            .execute(params![
-                path,
-                edge.source_symbol,
-                edge.target_path,
-                edge.target_symbol,
-                edge.edge_kind.as_str(),
-                to_i64(edge.line as u64),
-            ])
-            .map_err(db("writing ast_edges"))?;
-    }
+    replace_edges(tx, path, &snapshot.edges)?;
+    write_links(tx, path, &parsed.links)?;
 
     tx.prepare_cached(
         "INSERT INTO ast_files (path, language, size, mtime_ms, content_sha256, indexed_at)
@@ -550,6 +592,149 @@ fn write_file(tx: &Transaction, parsed: &ParsedFile, indexed_at: i64) -> Result<
     Ok(())
 }
 
+fn replace_edges(tx: &Transaction, path: &str, edges: &[AstEdge]) -> Result<(), AstError> {
+    let db = |context: &'static str| move |e| AstError::database(context, e);
+    tx.prepare_cached("DELETE FROM ast_edges WHERE source_path = ?1")
+        .and_then(|mut s| s.execute([path]))
+        .map_err(db("clearing ast_edges"))?;
+    let mut insert_edge = tx
+        .prepare_cached(
+            "INSERT INTO ast_edges (source_path, source_symbol, target_path, target_symbol, edge_kind, line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(db("preparing ast_edges insert"))?;
+    for edge in edges {
+        insert_edge
+            .execute(params![
+                path,
+                edge.source_symbol,
+                edge.target_path,
+                edge.target_symbol,
+                edge.edge_kind.as_str(),
+                to_i64(edge.line as u64),
+            ])
+            .map_err(db("writing ast_edges"))?;
+    }
+    Ok(())
+}
+
+/// Stores a file's link state and probes. A file whose imports probed no
+/// indexable path can never need re-linking, so it gets no `ast_links` row.
+fn write_links(tx: &Transaction, path: &str, links: &Links) -> Result<(), AstError> {
+    tx.prepare_cached("DELETE FROM ast_links WHERE path = ?1")
+        .and_then(|mut s| s.execute([path]))
+        .map_err(|e| AstError::database("clearing ast_links", e))?;
+    replace_probes(tx, path, &links.probes)?;
+    if links.probes.is_empty() {
+        return Ok(());
+    }
+    let state_json = serde_json::to_string(&links.state).map_err(|e| AstError::Parse {
+        path: path.to_string(),
+        message: format!("could not serialize the link state: {e}"),
+    })?;
+    tx.prepare_cached("INSERT INTO ast_links (path, state_json) VALUES (?1, ?2)")
+        .and_then(|mut s| s.execute(params![path, state_json]))
+        .map(|_| ())
+        .map_err(|e| AstError::database("writing ast_links", e))
+}
+
+fn replace_probes(tx: &Transaction, path: &str, probes: &Probes) -> Result<(), AstError> {
+    let db = |context: &'static str| move |e| AstError::database(context, e);
+    tx.prepare_cached("DELETE FROM ast_link_probes WHERE source_path = ?1")
+        .and_then(|mut s| s.execute([path]))
+        .map_err(db("clearing ast_link_probes"))?;
+    let mut insert = tx
+        .prepare_cached("INSERT INTO ast_link_probes (source_path, probe_path) VALUES (?1, ?2)")
+        .map_err(db("preparing ast_link_probes insert"))?;
+    for probe in probes {
+        insert
+            .execute(params![path, probe])
+            .map_err(db("writing ast_link_probes"))?;
+    }
+    Ok(())
+}
+
+/// Re-links every file whose imports probed a path in `changed` (or a
+/// directory above one), except the `fresh` files just written. Returns how
+/// many files were re-linked.
+fn relink_dependents(
+    tx: &Transaction,
+    resolver: &Resolver,
+    changed: &[String],
+    fresh: &HashSet<String>,
+) -> Result<usize, AstError> {
+    let mut probed: BTreeSet<&str> = BTreeSet::new();
+    for path in changed {
+        probed.insert(path);
+        let mut dir = path.as_str();
+        while let Some((parent, _)) = dir.rsplit_once('/') {
+            probed.insert(parent);
+            dir = parent;
+        }
+    }
+    let context = "reading ast_link_probes";
+    let mut dependents: BTreeSet<String> = BTreeSet::new();
+    let mut query = tx
+        .prepare_cached("SELECT source_path FROM ast_link_probes WHERE probe_path = ?1")
+        .map_err(|e| AstError::database(context, e))?;
+    for probe in probed {
+        let rows = query
+            .query_map([probe], |row| row.get::<_, String>(0))
+            .map_err(|e| AstError::database(context, e))?;
+        for row in rows {
+            let source = row.map_err(|e| AstError::database(context, e))?;
+            if !fresh.contains(&source) {
+                dependents.insert(source);
+            }
+        }
+    }
+    let mut relinked = 0;
+    for path in &dependents {
+        if relink_file(tx, resolver, path)? {
+            relinked += 1;
+        }
+    }
+    Ok(relinked)
+}
+
+/// Recomputes one file's edges from its stored link state and symbols.
+fn relink_file(tx: &Transaction, resolver: &Resolver, path: &str) -> Result<bool, AstError> {
+    let state_json: Option<String> = tx
+        .query_row(
+            "SELECT state_json FROM ast_links WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| AstError::database("reading ast_links", e))?;
+    let Some(state_json) = state_json else {
+        return Ok(false);
+    };
+    let Ok(state) = serde_json::from_str::<LinkState>(&state_json) else {
+        // A state this build cannot read: clear the stat gate so the next
+        // sync re-parses the file instead.
+        tx.prepare_cached("UPDATE ast_files SET size = -1, content_sha256 = '' WHERE path = ?1")
+            .and_then(|mut s| s.execute([path]))
+            .map_err(|e| AstError::database("resetting ast_files", e))?;
+        return Ok(false);
+    };
+    let context = "reading ast_symbols";
+    let mut statement = tx
+        .prepare_cached("SELECT name, qualified_name FROM ast_symbols WHERE path = ?1 ORDER BY id")
+        .map_err(|e| AstError::database(context, e))?;
+    let symbols = statement
+        .query_map([path], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| AstError::database(context, e))?
+        .collect::<Result<Vec<(String, String)>, _>>()
+        .map_err(|e| AstError::database(context, e))?;
+    let Some((edges, probes)) = relink(path, &symbols, &state, resolver) else {
+        return Ok(false);
+    };
+    replace_edges(tx, path, &edges)?;
+    replace_probes(tx, path, &probes)?;
+    Ok(true)
+}
+
 fn touch_mtime(tx: &Transaction, path: &str, mtime_ms: i64) -> Result<(), AstError> {
     tx.prepare_cached("UPDATE ast_files SET mtime_ms = ?2 WHERE path = ?1")
         .and_then(|mut s| s.execute(params![path, mtime_ms]))
@@ -566,6 +751,11 @@ fn delete_file(tx: &Transaction, path: &str) -> Result<(), AstError> {
         (
             "DELETE FROM ast_edges WHERE source_path = ?1",
             "pruning ast_edges",
+        ),
+        ("DELETE FROM ast_links WHERE path = ?1", "pruning ast_links"),
+        (
+            "DELETE FROM ast_link_probes WHERE source_path = ?1",
+            "pruning ast_link_probes",
         ),
         ("DELETE FROM ast_files WHERE path = ?1", "pruning ast_files"),
     ] {
@@ -658,6 +848,48 @@ mod tests {
         fn rows(&self, sql: &str, path: &str) -> i64 {
             self.conn.query_row(sql, [path], |r| r.get(0)).unwrap()
         }
+
+        fn update(&mut self, rel_path: &str) -> Result<FileUpdate, AstError> {
+            let root = self.root();
+            update_single_file(&mut self.conn, &root, rel_path)
+        }
+
+        /// `(edge_kind, target_symbol, target_path)` for every edge from `path`.
+        fn edges(&self, path: &str) -> Vec<(String, String, Option<String>)> {
+            self.conn
+                .prepare(
+                    "SELECT edge_kind, target_symbol, target_path FROM ast_edges
+                     WHERE source_path = ?1 ORDER BY id",
+                )
+                .unwrap()
+                .query_map([path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+
+        /// Row counts for one file across `ast_files`, `ast_symbols`,
+        /// `ast_edges`, and `ast_symbols_fts`.
+        fn footprint(&self, path: &str) -> [i64; 4] {
+            [
+                self.rows("SELECT COUNT(*) FROM ast_files WHERE path = ?1", path),
+                self.rows("SELECT COUNT(*) FROM ast_symbols WHERE path = ?1", path),
+                self.rows(
+                    "SELECT COUNT(*) FROM ast_edges WHERE source_path = ?1",
+                    path,
+                ),
+                self.rows("SELECT COUNT(*) FROM ast_symbols_fts WHERE path = ?1", path),
+            ]
+        }
+    }
+
+    /// Sets permission bits; returns false when they do not restrict this
+    /// process (root ignores them), so a test can skip what it cannot show.
+    #[cfg(unix)]
+    fn chmod(path: &Path, mode: u32) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        mode & 0o400 != 0 || std::fs::File::open(path).is_err()
     }
 
     const FILES: &[(&str, &str)] = &[
@@ -831,6 +1063,175 @@ mod tests {
             update_single_file(&mut fixture.conn, &root, "never.ts"),
             Err(AstError::Io { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_defers_pruning_and_keeps_rows() {
+        let mut fixture = Fixture::new(&[
+            (
+                "sub/keep.js",
+                "import { b } from '../top.js';\nexport function keep() { b(); }\n",
+            ),
+            ("top.js", "export function b() {}\n"),
+            ("other.py", "def other():\n    pass\n"),
+        ])
+        .unwrap();
+        fixture.index();
+        let before = fixture.footprint("sub/keep.js");
+        assert_eq!(before, [1, 1, 2, 1]);
+        let sub = fixture.root().join("sub");
+        if !chmod(&sub, 0o000) {
+            chmod(&sub, 0o755);
+            return;
+        }
+        std::fs::remove_file(fixture.root().join("other.py")).unwrap();
+        let blocked = fixture.index();
+        chmod(&sub, 0o755);
+        assert_eq!((blocked.failed, blocked.removed), (1, 0));
+        assert_eq!(blocked.failures[0].path, "sub");
+        assert_eq!(fixture.footprint("sub/keep.js"), before);
+        assert_eq!(fixture.footprint("other.py")[0], 1);
+
+        let restored = fixture.index();
+        assert_eq!((restored.failed, restored.removed), (0, 1));
+        assert_eq!(fixture.footprint("sub/keep.js"), before);
+        assert_eq!(fixture.footprint("other.py"), [0, 0, 0, 0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_file_update_never_reads_through_a_symlink() {
+        let mut fixture = Fixture::new(&[("src/a.js", "export function a() {}\n")]).unwrap();
+        let outside = fixture.dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("private.js"), "export function secret() {}\n").unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.root().join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("private.js"), fixture.root().join("alias.js"))
+            .unwrap();
+        for path in ["linked/private.js", "alias.js"] {
+            assert!(
+                matches!(fixture.update(path), Err(AstError::InvalidArgument(_))),
+                "{path}"
+            );
+            assert_eq!(fixture.footprint(path), [0, 0, 0, 0], "{path}");
+        }
+        assert_eq!(
+            fixture.rows("SELECT COUNT(*) FROM ast_symbols WHERE name = ?1", "secret"),
+            0
+        );
+        assert_eq!(
+            fixture.update("src/a.js").unwrap().status,
+            UpdateStatus::Added
+        );
+    }
+
+    #[test]
+    fn single_file_update_agrees_with_the_walker_on_ignored_files() {
+        let mut fixture = Fixture::new(&[
+            ("kept.js", "export function kept() {}\n"),
+            ("ignored.js", "export function ignored() {}\n"),
+            ("node_modules/pkg/index.js", "export function dep() {}\n"),
+            (".gitignore", "ignored.js\n"),
+        ])
+        .unwrap();
+        for path in ["ignored.js", "node_modules/pkg/index.js"] {
+            let update = fixture.update(path).unwrap();
+            assert_eq!(
+                (update.status, update.diff.is_empty()),
+                (UpdateStatus::Ignored, true),
+                "{path}"
+            );
+            assert_eq!(fixture.footprint(path), [0, 0, 0, 0], "{path}");
+        }
+        assert_eq!(fixture.index().parsed, 1);
+
+        fixture
+            .write(".gitignore", "ignored.js\nkept.js\n")
+            .unwrap();
+        let excluded = fixture.update("kept.js").unwrap();
+        assert_eq!(excluded.status, UpdateStatus::Ignored);
+        assert_eq!(excluded.diff.removed.len(), 1);
+        assert_eq!(fixture.footprint("kept.js"), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn cross_file_edges_follow_targets_entering_and_leaving_the_index() {
+        const CONSUMER: &str = "import { provide } from './provider.js';\nexport function consume() { return provide(); }\n";
+        const PROVIDER: &str = "export function provide() { return 1; }\n";
+        let mut fixture = Fixture::new(&[("consumer.js", CONSUMER)]).unwrap();
+        let unresolved = vec![
+            ("imports".to_string(), "./provider.js".to_string(), None),
+            ("calls".to_string(), "provide".to_string(), None),
+        ];
+        let resolved = vec![
+            (
+                "imports".to_string(),
+                "./provider.js".to_string(),
+                Some("provider.js".to_string()),
+            ),
+            (
+                "calls".to_string(),
+                "provide".to_string(),
+                Some("provider.js".to_string()),
+            ),
+        ];
+        fixture.index();
+        assert_eq!(fixture.edges("consumer.js"), unresolved);
+
+        // An unreadable consumer proves re-linking never reads it.
+        let consumer = fixture.root().join("consumer.js");
+        #[cfg(unix)]
+        let locked = chmod(&consumer, 0o000);
+        #[cfg(not(unix))]
+        let locked = false;
+
+        fixture.write("provider.js", PROVIDER).unwrap();
+        let added = fixture.index();
+        assert_eq!(
+            (added.parsed, added.skipped, added.relinked, added.failed),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(fixture.edges("consumer.js"), resolved);
+
+        std::fs::remove_file(fixture.root().join("provider.js")).unwrap();
+        let removed = fixture.index();
+        assert_eq!(
+            (
+                removed.skipped,
+                removed.removed,
+                removed.relinked,
+                removed.failed
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(fixture.edges("consumer.js"), unresolved);
+
+        fixture.write("provider.js", PROVIDER).unwrap();
+        let update = fixture.update("provider.js").unwrap();
+        assert_eq!((update.status, update.relinked), (UpdateStatus::Added, 1));
+        assert_eq!(fixture.edges("consumer.js"), resolved);
+        let again = fixture.update("provider.js").unwrap();
+        assert_eq!((again.status, again.relinked), (UpdateStatus::Unchanged, 0));
+
+        std::fs::remove_file(fixture.root().join("provider.js")).unwrap();
+        let update = fixture.update("provider.js").unwrap();
+        assert_eq!((update.status, update.relinked), (UpdateStatus::Removed, 1));
+        assert_eq!(fixture.edges("consumer.js"), unresolved);
+        assert_eq!(
+            fixture.rows(
+                "SELECT COUNT(*) FROM ast_link_probes WHERE source_path = ?1",
+                "provider.js"
+            ),
+            0
+        );
+
+        #[cfg(unix)]
+        if locked {
+            chmod(&consumer, 0o644);
+        }
+        let quiet = fixture.index();
+        assert_eq!((quiet.parsed, quiet.skipped, quiet.relinked), (0, 1, 0));
     }
 
     #[test]

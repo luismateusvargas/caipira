@@ -311,6 +311,32 @@ const WORKSPACE_MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS symbol_evidence_symbol ON fact_symbol_evidence(path, qualified_name);
       `);
     }
+  },
+  //
+  // ast_links keeps each file's unresolved imports and references, and
+  // ast_link_probes the paths resolving them checked, so caipira-ast can
+  // re-link an unchanged importer when one of those paths enters or leaves
+  // the index without reading it. Files indexed before v4 have no link
+  // state, so their stat gate is cleared and the next sync re-parses them.
+  {
+    version: 4,
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ast_links (
+          path TEXT PRIMARY KEY,
+          state_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ast_link_probes (
+          source_path TEXT NOT NULL,
+          probe_path TEXT NOT NULL,
+          PRIMARY KEY (source_path, probe_path)
+        );
+        CREATE INDEX IF NOT EXISTS ast_link_probes_probe ON ast_link_probes(probe_path);
+
+        UPDATE ast_files SET size = -1, content_sha256 = '';
+      `);
+    }
   }
 ];
 

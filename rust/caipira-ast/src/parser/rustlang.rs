@@ -10,9 +10,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::{
-    Ctx, Decl, EdgeKind, ImportBinding, ParamSignature, collapse_ws, generic_names, named_children,
+    Ctx, Decl, EdgeKind, ParamSignature, collapse_ws, generic_names, named_children,
     strip_angle_groups,
 };
+use crate::resolve::ImportRequest;
 
 pub(super) fn extract(ctx: &mut Ctx, root: Node) {
     items(ctx, root, None);
@@ -241,15 +242,10 @@ fn mod_item(ctx: &mut Ctx, node: Node, module: Option<&str>) {
         }
         None => {
             // `mod walker;` pulls in walker.rs or walker/mod.rs.
-            let target = ctx.resolver.rust_mod(ctx.path, &name);
-            ctx.import_edge(&name, target.clone(), Ctx::line(node));
+            let target = ctx.request(ImportRequest::RustMod { name: name.clone() });
+            ctx.import_edge(&name, Some(target), Ctx::line(node));
             let imported = name.clone();
-            ctx.bind(ImportBinding {
-                local: name,
-                target_path: target,
-                imported,
-                namespace: true,
-            });
+            ctx.bind(name, target, imported, true);
         }
     }
 }
@@ -294,11 +290,10 @@ fn use_tree(ctx: &mut Ctx, node: Node, prefix: &str, line: usize) {
                 .next()
                 .map(|m| join(&ctx.text(m)));
             let module = module.unwrap_or_else(|| prefix.to_string());
-            let target = ctx
-                .resolver
-                .rust_use(ctx.path, &module)
-                .map(|(file, _)| file);
-            ctx.import_edge(&format!("{module}::*"), target, line);
+            let target = ctx.request(ImportRequest::RustUse {
+                path: module.clone(),
+            });
+            ctx.import_edge(&format!("{module}::*"), Some(target), line);
         }
         "self" => use_leaf(ctx, prefix, None, line),
         _ => use_leaf(ctx, &join(&collapse_ws(&ctx.text(node))), None, line),
@@ -306,18 +301,12 @@ fn use_tree(ctx: &mut Ctx, node: Node, prefix: &str, line: usize) {
 }
 
 fn use_leaf(ctx: &mut Ctx, path: &str, alias: Option<String>, line: usize) {
-    let resolved = ctx.resolver.rust_use(ctx.path, path);
-    ctx.import_edge(path, resolved.as_ref().map(|(file, _)| file.clone()), line);
-    let local = alias.unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path).to_string());
-    let Some((file, rest)) = resolved else { return };
-    let namespace = rest.is_empty();
-    let imported = if namespace { local.clone() } else { rest };
-    ctx.bind(ImportBinding {
-        local,
-        target_path: Some(file),
-        imported,
-        namespace,
+    let target = ctx.request(ImportRequest::RustUse {
+        path: path.to_string(),
     });
+    ctx.import_edge(path, Some(target), line);
+    let local = alias.unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path).to_string());
+    ctx.bind_use(local, target);
 }
 
 fn is_type_path(kind: &str) -> bool {

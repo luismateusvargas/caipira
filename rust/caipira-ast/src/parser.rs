@@ -3,8 +3,12 @@
 //!
 //! Walkers only recognise declarations. Everything they have in common —
 //! qualified names, doc summaries, signature text and hashes, call and type
-//! references, and resolving those references against this file's symbols and
-//! imports — lives in [`Ctx`], so every language reports the same shape.
+//! references — lives in [`Ctx`], so every language reports the same shape.
+//!
+//! Imports are recorded as unresolved [`ImportRequest`]s. A separate link
+//! step resolves them and every reference against this file's symbols and
+//! imports; the same step re-links a stored [`LinkState`] when an imported
+//! file appears or disappears, without reading or parsing the importer.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
 use crate::error::AstError;
-use crate::resolve::Resolver;
+use crate::resolve::{ImportRequest, Probes, Resolver};
 use crate::vue;
 
 mod cpp;
@@ -94,7 +98,7 @@ impl Language {
         Some(grammar.into())
     }
 
-    fn family(self) -> Family {
+    pub(crate) fn family(self) -> Family {
         match self {
             Self::JavaScript | Self::Jsx | Self::TypeScript | Self::Tsx | Self::Vue => {
                 Family::Script
@@ -265,6 +269,31 @@ pub fn parse_source(
     source: &[u8],
     resolver: &Resolver,
 ) -> Result<AstSnapshot, AstError> {
+    parse_linked(rel_path, source, resolver).map(|(snapshot, _)| snapshot)
+}
+
+/// What a file needs to be re-linked later without being read again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Links {
+    /// The file's unresolved imports and references.
+    pub state: LinkState,
+    /// Every path resolving its imports checked; when one of them enters or
+    /// leaves the index, the file's edges may change.
+    pub probes: Probes,
+}
+
+/// [`parse_source`], also returning the state needed to re-link the file.
+///
+/// # Arguments
+/// As for [`parse_source`].
+///
+/// # Errors
+/// As for [`parse_source`].
+pub(crate) fn parse_linked(
+    rel_path: &str,
+    source: &[u8],
+    resolver: &Resolver,
+) -> Result<(AstSnapshot, Links), AstError> {
     let language =
         Language::from_path(rel_path).ok_or_else(|| AstError::Unsupported(rel_path.to_string()))?;
     let (grammar_language, text) = match language {
@@ -289,7 +318,7 @@ pub fn parse_source(
     })?;
 
     let family = language.family();
-    let mut ctx = Ctx::new(&text, rel_path, resolver, family);
+    let mut ctx = Ctx::new(&text, family);
     let root = tree.root_node();
     match family {
         Family::Script => javascript::extract(&mut ctx, root),
@@ -298,30 +327,103 @@ pub fn parse_source(
         Family::Go => golang::extract(&mut ctx, root),
         Family::Cpp => cpp::extract(&mut ctx, root),
     }
-    let (symbols, edges) = ctx.finish();
-    Ok(AstSnapshot {
+    let (symbols, state) = ctx.finish();
+    let names: Vec<(String, String)> = symbols
+        .iter()
+        .map(|s| (s.name.clone(), s.qualified_name.clone()))
+        .collect();
+    let (edges, probes) = link(rel_path, family, &names, &state, resolver);
+    let snapshot = AstSnapshot {
         path: rel_path.to_string(),
         language,
         symbols,
         edges,
-    })
+    };
+    Ok((snapshot, Links { state, probes }))
+}
+
+/// Recomputes a file's edges from its stored [`LinkState`].
+///
+/// Gives exactly the edges a fresh parse would, as long as the file itself
+/// is unchanged; only import resolution is redone.
+///
+/// # Arguments
+/// `path`: the workspace-relative file. `symbols`: its `(name, qualified_name)`
+/// pairs. `state`: its stored link state. `resolver`: the workspace resolver.
+///
+/// Returns `None` when `path` has no supported extension.
+pub(crate) fn relink(
+    path: &str,
+    symbols: &[(String, String)],
+    state: &LinkState,
+    resolver: &Resolver,
+) -> Option<(Vec<AstEdge>, Probes)> {
+    let family = Language::from_path(path)?.family();
+    Some(link(path, family, symbols, state, resolver))
 }
 
 // ── extraction core ──
 
 /// A name a file binds from another module, used to resolve calls through it.
-pub(crate) struct ImportBinding {
+struct ImportBinding {
     /// The local name (`MS` in `from .store import MemoryStore as MS`).
-    pub local: String,
+    local: String,
     /// The workspace file the binding comes from, when resolved.
-    pub target_path: Option<String>,
+    target_path: Option<String>,
     /// The name inside the target module (`MemoryStore`), or the local name for namespaces.
-    pub imported: String,
+    imported: String,
     /// True when the binding is the module itself (`import * as ns`, `const x = require()`).
-    pub namespace: bool,
+    namespace: bool,
+}
+
+/// One import's contribution to a file's edges and bindings, kept
+/// unresolved; `request` fields index [`LinkState::requests`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "item", rename_all = "snake_case")]
+pub(crate) enum ImportItem {
+    /// An `imports` edge to what `request` resolves to; `None` never resolves.
+    Edge {
+        specifier: String,
+        request: Option<usize>,
+        line: usize,
+    },
+    /// A name bound from a module, kept whether or not the module resolves.
+    Bind {
+        local: String,
+        request: usize,
+        imported: String,
+        namespace: bool,
+    },
+    /// A Rust `use` leaf: binds only when it resolves, and binds the module
+    /// itself when no item path is left inside the file.
+    RustUse { local: String, request: usize },
+    /// `from <module> import <name>`: the submodule when one exists,
+    /// otherwise the name from the module.
+    PythonFrom {
+        module: String,
+        module_request: usize,
+        submodule: String,
+        submodule_request: usize,
+        local: String,
+        imported: String,
+        line: usize,
+    },
+}
+
+/// Everything about a file's imports and references that linking needs,
+/// so the file can be re-linked without being read or parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LinkState {
+    /// Distinct imports, resolved once each per link.
+    requests: Vec<ImportRequest>,
+    /// Imports in source order.
+    items: Vec<ImportItem>,
+    /// Call and type references in source order.
+    refs: Vec<PendingRef>,
 }
 
 /// A reference waiting to be resolved once every symbol in the file is known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingRef {
     source: Option<String>,
     scope: Option<String>,
@@ -368,26 +470,18 @@ impl<'t> Decl<'t> {
 /// Per-file extraction state shared by every language walker.
 pub(crate) struct Ctx<'t> {
     pub src: &'t [u8],
-    pub path: &'t str,
-    pub resolver: &'t Resolver,
     pub family: Family,
     symbols: Vec<SymbolSignature>,
-    bindings: Vec<ImportBinding>,
-    imports: Vec<AstEdge>,
-    refs: Vec<PendingRef>,
+    links: LinkState,
 }
 
 impl<'t> Ctx<'t> {
-    fn new(src: &'t [u8], path: &'t str, resolver: &'t Resolver, family: Family) -> Self {
+    fn new(src: &'t [u8], family: Family) -> Self {
         Self {
             src,
-            path,
-            resolver,
             family,
             symbols: Vec::new(),
-            bindings: Vec::new(),
-            imports: Vec::new(),
-            refs: Vec::new(),
+            links: LinkState::default(),
         }
     }
 
@@ -449,23 +543,53 @@ impl<'t> Ctx<'t> {
         qualified_name
     }
 
-    pub fn bind(&mut self, binding: ImportBinding) {
-        if !binding.local.is_empty() {
-            self.bindings.push(binding);
+    /// Registers an import for the link step and returns its handle.
+    pub fn request(&mut self, request: ImportRequest) -> usize {
+        let requests = &mut self.links.requests;
+        requests
+            .iter()
+            .position(|r| *r == request)
+            .unwrap_or_else(|| {
+                requests.push(request);
+                requests.len() - 1
+            })
+    }
+
+    /// Binds `local` to `imported` from the module `request` resolves to.
+    pub fn bind(&mut self, local: String, request: usize, imported: String, namespace: bool) {
+        if !local.is_empty() {
+            self.links.items.push(ImportItem::Bind {
+                local,
+                request,
+                imported,
+                namespace,
+            });
         }
     }
 
-    pub fn import_edge(&mut self, specifier: &str, target_path: Option<String>, line: usize) {
-        if specifier.is_empty() {
-            return;
+    /// Binds `local` from a Rust `use` path, once it resolves.
+    pub fn bind_use(&mut self, local: String, request: usize) {
+        if !local.is_empty() {
+            self.links
+                .items
+                .push(ImportItem::RustUse { local, request });
         }
-        self.imports.push(AstEdge {
-            source_symbol: None,
-            target_path,
-            target_symbol: specifier.to_string(),
-            edge_kind: EdgeKind::Imports,
-            line,
-        });
+    }
+
+    /// Records one name of a Python `from <module> import <name>`.
+    pub fn import_from(&mut self, item: ImportItem) {
+        self.links.items.push(item);
+    }
+
+    /// Records an `imports` edge to `specifier`; `request` resolves its file.
+    pub fn import_edge(&mut self, specifier: &str, request: Option<usize>, line: usize) {
+        if !specifier.is_empty() {
+            self.links.items.push(ImportItem::Edge {
+                specifier: specifier.to_string(),
+                request,
+                line,
+            });
+        }
     }
 
     /// Records an `extends`/`implements`/`uses_type` reference to a type name.
@@ -474,7 +598,7 @@ impl<'t> Ctx<'t> {
         if target.is_empty() || target.len() > MAX_CALLEE_CHARS {
             return;
         }
-        self.refs.push(PendingRef {
+        self.links.refs.push(PendingRef {
             source: Some(source.to_string()),
             scope: scope.map(str::to_string),
             target,
@@ -492,7 +616,7 @@ impl<'t> Ctx<'t> {
                 let name = strip_angle_groups(&self.text(current));
                 let name = name.trim_matches(['"', '\'']).to_string();
                 if !name.is_empty() && !generics.contains(&name) && !self.is_builtin_type(&name) {
-                    self.refs.push(PendingRef {
+                    self.links.refs.push(PendingRef {
                         source: Some(source.to_string()),
                         scope: None,
                         target: name,
@@ -657,7 +781,7 @@ impl<'t> Ctx<'t> {
         else {
             return;
         };
-        self.refs.push(PendingRef {
+        self.links.refs.push(PendingRef {
             source: source.map(str::to_string),
             scope: scope.map(str::to_string),
             target,
@@ -715,65 +839,167 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Resolves pending references and returns symbols and deduplicated edges.
-    fn finish(self) -> (Vec<SymbolSignature>, Vec<AstEdge>) {
-        let qualified: HashSet<&str> = self
-            .symbols
-            .iter()
-            .map(|s| s.qualified_name.as_str())
-            .collect();
-        let mut by_name: HashMap<&str, Vec<&str>> = HashMap::new();
-        for symbol in &self.symbols {
-            by_name
-                .entry(symbol.name.as_str())
-                .or_default()
-                .push(symbol.qualified_name.as_str());
-        }
-
-        let mut edges = Vec::with_capacity(self.imports.len() + self.refs.len());
-        let mut seen = HashSet::new();
-        for edge in &self.imports {
-            let key = (
-                None,
-                edge.target_path.clone(),
-                edge.target_symbol.clone(),
-                edge.edge_kind,
-            );
-            if seen.insert(key) {
-                edges.push(edge.clone());
-            }
-        }
-        for pending in &self.refs {
-            let (target_path, target_symbol) = self.resolve(pending, &qualified, &by_name);
-            let key = (
-                pending.source.clone(),
-                target_path.clone(),
-                target_symbol.clone(),
-                pending.kind,
-            );
-            if seen.insert(key) {
-                edges.push(AstEdge {
-                    source_symbol: pending.source.clone(),
-                    target_path,
-                    target_symbol,
-                    edge_kind: pending.kind,
-                    line: pending.line,
-                });
-            }
-        }
-        (self.symbols, edges)
+    /// The file's symbols and the state the link step needs.
+    fn finish(self) -> (Vec<SymbolSignature>, LinkState) {
+        (self.symbols, self.links)
     }
+}
 
-    fn resolve(
-        &self,
-        pending: &PendingRef,
-        qualified: &HashSet<&str>,
-        by_name: &HashMap<&str, Vec<&str>>,
-    ) -> (Option<String>, String) {
+/// Resolves a file's imports, then its references against its own symbols
+/// and those imports, and returns deduplicated edges plus the paths probed.
+fn link(
+    path: &str,
+    family: Family,
+    symbols: &[(String, String)],
+    state: &LinkState,
+    resolver: &Resolver,
+) -> (Vec<AstEdge>, Probes) {
+    let mut probes = Probes::new();
+    let resolved: Vec<Option<(String, String)>> = state
+        .requests
+        .iter()
+        .map(|request| resolver.resolve(path, request, &mut probes))
+        .collect();
+    let resolution = |request: usize| resolved.get(request).cloned().flatten();
+    let file = |request: usize| resolution(request).map(|(file, _)| file);
+
+    let mut imports = Vec::new();
+    let mut bindings = Vec::new();
+    let mut import = |specifier: &str, target_path: Option<String>, line: usize| {
+        imports.push(AstEdge {
+            source_symbol: None,
+            target_path,
+            target_symbol: specifier.to_string(),
+            edge_kind: EdgeKind::Imports,
+            line,
+        });
+    };
+    for item in &state.items {
+        match item {
+            ImportItem::Edge {
+                specifier,
+                request,
+                line,
+            } => import(specifier, request.and_then(file), *line),
+            ImportItem::Bind {
+                local,
+                request,
+                imported,
+                namespace,
+            } => bindings.push(ImportBinding {
+                local: local.clone(),
+                target_path: file(*request),
+                imported: imported.clone(),
+                namespace: *namespace,
+            }),
+            ImportItem::RustUse { local, request } => {
+                if let Some((file, rest)) = resolution(*request) {
+                    let namespace = rest.is_empty();
+                    bindings.push(ImportBinding {
+                        local: local.clone(),
+                        target_path: Some(file),
+                        imported: if namespace { local.clone() } else { rest },
+                        namespace,
+                    });
+                }
+            }
+            ImportItem::PythonFrom {
+                module,
+                module_request,
+                submodule,
+                submodule_request,
+                local,
+                imported,
+                line,
+            } => match file(*submodule_request) {
+                // `from . import utils` imports a submodule, not a name.
+                Some(target) => {
+                    import(submodule, Some(target.clone()), *line);
+                    bindings.push(ImportBinding {
+                        local: local.clone(),
+                        target_path: Some(target),
+                        imported: local.clone(),
+                        namespace: true,
+                    });
+                }
+                None => {
+                    import(module, file(*module_request), *line);
+                    bindings.push(ImportBinding {
+                        local: local.clone(),
+                        target_path: file(*module_request),
+                        imported: imported.clone(),
+                        namespace: false,
+                    });
+                }
+            },
+        }
+    }
+    bindings.retain(|b| !b.local.is_empty());
+
+    let linker = Linker {
+        path,
+        family,
+        bindings,
+        qualified: symbols.iter().map(|(_, q)| q.as_str()).collect(),
+        by_name: symbols
+            .iter()
+            .fold(HashMap::new(), |mut by_name, (name, q)| {
+                by_name
+                    .entry(name.as_str())
+                    .or_insert_with(Vec::new)
+                    .push(q.as_str());
+                by_name
+            }),
+    };
+    let mut edges = Vec::with_capacity(imports.len() + state.refs.len());
+    let mut seen = HashSet::new();
+    for edge in imports.into_iter().filter(|e| !e.target_symbol.is_empty()) {
+        let key = (
+            None,
+            edge.target_path.clone(),
+            edge.target_symbol.clone(),
+            edge.edge_kind,
+        );
+        if seen.insert(key) {
+            edges.push(edge);
+        }
+    }
+    for pending in &state.refs {
+        let (target_path, target_symbol) = linker.resolve(pending);
+        let key = (
+            pending.source.clone(),
+            target_path.clone(),
+            target_symbol.clone(),
+            pending.kind,
+        );
+        if seen.insert(key) {
+            edges.push(AstEdge {
+                source_symbol: pending.source.clone(),
+                target_path,
+                target_symbol,
+                edge_kind: pending.kind,
+                line: pending.line,
+            });
+        }
+    }
+    (edges, probes)
+}
+
+/// Resolves references against one file's symbols and import bindings.
+struct Linker<'a> {
+    path: &'a str,
+    family: Family,
+    bindings: Vec<ImportBinding>,
+    qualified: HashSet<&'a str>,
+    by_name: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl Linker<'_> {
+    fn resolve(&self, pending: &PendingRef) -> (Option<String>, String) {
         let here = || Some(self.path.to_string());
         let target = pending.target.as_str();
         let sep = self.family.separator();
-        if qualified.contains(target) {
+        if self.qualified.contains(target) {
             return (here(), target.to_string());
         }
         // Members of the enclosing type: `this.x()`, `self.x()`, and C++'s
@@ -782,7 +1008,7 @@ impl<'t> Ctx<'t> {
             && (pending.via_self || self.family == Family::Cpp)
         {
             let member = format!("{scope}{sep}{target}");
-            if qualified.contains(member.as_str()) {
+            if self.qualified.contains(member.as_str()) {
                 return (here(), member);
             }
         }
@@ -801,7 +1027,7 @@ impl<'t> Ctx<'t> {
             return (binding.target_path.clone(), symbol);
         }
         if segments.len() == 1
-            && let Some(candidates) = by_name.get(target)
+            && let Some(candidates) = self.by_name.get(target)
             && candidates.len() == 1
         {
             return (here(), candidates[0].to_string());
@@ -1172,6 +1398,103 @@ mod tests {
             None,
         ];
         assert_eq!(actual, expected);
+    }
+
+    /// Files that import one another, and the targets that appear later.
+    const LINKED: &[(&str, &str)] = &[
+        (
+            "src/app.js",
+            "import { provide as p } from './provider.js';\nimport * as ns from './gone';\n\
+             const util = require('./util');\nexport function run() { p(); ns.x(); util.y(); local(); }\n\
+             function local() {}\n",
+        ),
+        (
+            "pkg/app.py",
+            "from . import store\nfrom .models import User as U\nimport pkg.sub\n\
+             def f(u: U) -> None:\n    store.save(U())\n",
+        ),
+        (
+            "src/lib.rs",
+            "mod store;\nuse crate::store::Store;\nuse self::gone::X;\n\
+             pub fn open() -> Store { Store::new() }\n",
+        ),
+        (
+            "main.go",
+            "package main\nimport \"example.com/app/internal/db\"\nfunc main() { db.Open() }\n",
+        ),
+        (
+            "src/main.cpp",
+            "#include \"store.hpp\"\n#include <vector>\nint main() { return run(); }\n",
+        ),
+    ];
+    const TARGETS: &[&str] = &[
+        "src/provider.js",
+        "src/util.js",
+        "pkg/store.py",
+        "pkg/models.py",
+        "pkg/sub.py",
+        "src/store.rs",
+        "internal/db/db.go",
+        "src/store.hpp",
+    ];
+
+    #[test]
+    fn relinking_stored_state_matches_a_fresh_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("Cargo.toml", "[package]\nname = \"x\"\n");
+        write("go.mod", "module example.com/app\n");
+        write("pkg/__init__.py", "");
+        for (path, text) in LINKED {
+            write(path, text);
+        }
+        let resolver = Resolver::new(root);
+        let parse =
+            |path: &str, text: &str| parse_linked(path, text.as_bytes(), &resolver).expect("parse");
+        let names = |snapshot: &AstSnapshot| {
+            snapshot
+                .symbols
+                .iter()
+                .map(|s| (s.name.clone(), s.qualified_name.clone()))
+                .collect::<Vec<_>>()
+        };
+        let stored: Vec<(AstSnapshot, String)> = LINKED
+            .iter()
+            .map(|(path, text)| {
+                let (snapshot, links) = parse(path, text);
+                (snapshot, serde_json::to_string(&links.state).unwrap())
+            })
+            .collect();
+
+        for step in ["targets appear", "targets disappear"] {
+            for target in TARGETS {
+                match step {
+                    "targets appear" => write(target, ""),
+                    _ => std::fs::remove_file(root.join(target)).unwrap(),
+                }
+            }
+            if step == "targets disappear" {
+                // A Go import resolves to its package directory.
+                std::fs::remove_dir_all(root.join("internal")).unwrap();
+            }
+            for ((path, text), (before, state_json)) in LINKED.iter().zip(&stored) {
+                let (fresh, fresh_links) = parse(path, text);
+                let state: LinkState = serde_json::from_str(state_json).unwrap();
+                let relinked = relink(path, &names(before), &state, &resolver).unwrap();
+                assert_eq!(
+                    relinked,
+                    (fresh.edges.clone(), fresh_links.probes),
+                    "{path}: {step}"
+                );
+                let changed = fresh.edges != before.edges;
+                assert_eq!(changed, step == "targets appear", "{path}: {step}");
+            }
+        }
     }
 
     #[test]

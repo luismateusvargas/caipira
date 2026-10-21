@@ -24,8 +24,8 @@ const MAX_LIMIT = 500;
 const MAX_TEXT = 500;
 
 const ENGINE_CODES = new Set(['invalid_argument', 'unsupported', 'io', 'database', 'parse']);
-const UPDATE_STATUSES = new Set(['added', 'updated', 'unchanged', 'removed']);
-const STAT_FIELDS = ['parsed', 'skipped', 'hash_matched', 'removed', 'symbols_total', 'edges_total', 'duration_ms'];
+const UPDATE_STATUSES = new Set(['added', 'updated', 'unchanged', 'removed', 'ignored']);
+const STAT_FIELDS = ['parsed', 'skipped', 'hash_matched', 'removed', 'failed', 'relinked', 'symbols_total', 'edges_total', 'duration_ms'];
 
 /**
  * A caipira-ast failure. `code` is one of: binary_missing, timeout,
@@ -152,6 +152,7 @@ function checkStats(value) {
 function checkUpdate(value) {
   const diff = value && value.diff;
   const valid = value && UPDATE_STATUSES.has(value.status) && typeof value.path === 'string'
+    && Number.isInteger(value.relinked) && value.relinked >= 0
     && diff && ['added', 'removed', 'modified'].every(key => Array.isArray(diff[key]));
   if (!valid) throw badOutput('update-file result');
   return value;
@@ -185,11 +186,16 @@ function prepareDb(dbFile) {
 
 /**
  * Incrementally indexes every supported source file in a workspace.
+ * When a directory cannot be read, `failed` counts it and nothing is pruned
+ * (`removed` is 0) until a later sync can read everything. `relinked`
+ * counts unchanged files whose cross-file edges were updated, without being
+ * read, because a file they import entered or left the index.
  * @param {string} workspaceRoot Absolute workspace root.
  * @param {string} dbFile The workspace database.
  * @param {{timeoutMs?: number, bin?: string}} [opts]
  * @returns {{parsed: number, skipped: number, hash_matched: number, removed: number,
- *   failed: number, symbols_total: number, edges_total: number, duration_ms: number}}
+ *   failed: number, relinked: number, symbols_total: number, edges_total: number,
+ *   duration_ms: number, failures?: {path: string, message: string}[]}}
  * @throws {AstEngineError}
  */
 function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
@@ -201,13 +207,18 @@ function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
 
 /**
  * Re-indexes one file and returns the symbol diff against what was stored.
+ * A file a full sync would skip (ignore rules, hidden or node_modules
+ * directories, oversized) is never parsed: status `ignored`, and any rows
+ * it had are deleted.
  * @param {string} workspaceRoot Absolute workspace root.
  * @param {string} dbFile The workspace database.
  * @param {string} filePath Absolute, or relative to the workspace root.
  * @param {{timeoutMs?: number, bin?: string}} [opts]
- * @returns {{status: 'added'|'updated'|'unchanged'|'removed', path: string,
- *   diff: {added: object[], removed: object[], modified: {before: object, after: object}[]}, duration_ms: number}}
- * @throws {AstEngineError} unsupported for a non-source file, io when it is missing and was never indexed.
+ * @returns {{status: 'added'|'updated'|'unchanged'|'removed'|'ignored', path: string,
+ *   diff: {added: object[], removed: object[], modified: {before: object, after: object}[]},
+ *   relinked: number, duration_ms: number}}
+ * @throws {AstEngineError} unsupported for a non-source file, invalid_argument for a path
+ *   through a symlink, io when it is missing and was never indexed.
  */
 function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
   requireText('workspaceRoot', workspaceRoot);
@@ -224,7 +235,7 @@ function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
  * @param {string} filePath Absolute, or relative to the workspace root.
  * @param {{timeoutMs?: number, bin?: string}} [opts]
  * @returns {{path: string, language: string, symbols: object[], edges: object[]}}
- * @throws {AstEngineError}
+ * @throws {AstEngineError} invalid_argument for a path through a symlink.
  */
 function parseFileAst(workspaceRoot, filePath, opts = {}) {
   requireText('workspaceRoot', workspaceRoot);

@@ -10,9 +10,10 @@ use std::collections::HashSet;
 use tree_sitter::Node;
 
 use super::{
-    Ctx, Decl, EdgeKind, ImportBinding, ParamSignature, annotation_text, collapse_ws,
-    generic_names, named_children,
+    Ctx, Decl, EdgeKind, ParamSignature, annotation_text, collapse_ws, generic_names,
+    named_children,
 };
+use crate::resolve::ImportRequest;
 
 const DECLARATIONS: &[&str] = &[
     "function_declaration",
@@ -443,8 +444,10 @@ fn import_statement(ctx: &mut Ctx, node: Node) {
         return;
     };
     let specifier = string_value(ctx, source);
-    let target = ctx.resolver.script(ctx.path, &specifier);
-    ctx.import_edge(&specifier, target.clone(), Ctx::line(node));
+    let target = ctx.request(ImportRequest::Script {
+        spec: specifier.clone(),
+    });
+    ctx.import_edge(&specifier, Some(target), Ctx::line(node));
     for clause in named_children(node)
         .into_iter()
         .filter(|n| n.kind() == "import_clause")
@@ -453,12 +456,12 @@ fn import_statement(ctx: &mut Ctx, node: Node) {
             match part.kind() {
                 "identifier" => {
                     let local = ctx.text(part);
-                    bind(ctx, local.clone(), &target, local, false);
+                    ctx.bind(local.clone(), target, local, false);
                 }
                 "namespace_import" => {
                     if let Some(id) = named_children(part).into_iter().next() {
                         let local = ctx.text(id);
-                        bind(ctx, local.clone(), &target, local, true);
+                        ctx.bind(local.clone(), target, local, true);
                     }
                 }
                 "named_imports" => {
@@ -467,7 +470,7 @@ fn import_statement(ctx: &mut Ctx, node: Node) {
                             continue;
                         };
                         let local = field_text(ctx, spec, "alias").unwrap_or_else(|| name.clone());
-                        bind(ctx, local, &target, name, false);
+                        ctx.bind(local, target, name, false);
                     }
                 }
                 _ => {}
@@ -479,8 +482,10 @@ fn import_statement(ctx: &mut Ctx, node: Node) {
 fn export_statement(ctx: &mut Ctx, node: Node, scope: Option<&str>, exported: &HashSet<String>) {
     if let Some(source) = node.child_by_field_name("source") {
         let specifier = string_value(ctx, source);
-        let target = ctx.resolver.script(ctx.path, &specifier);
-        ctx.import_edge(&specifier, target, Ctx::line(node));
+        let target = ctx.request(ImportRequest::Script {
+            spec: specifier.clone(),
+        });
+        ctx.import_edge(&specifier, Some(target), Ctx::line(node));
         return;
     }
     if let Some(inner) = node.child_by_field_name("declaration") {
@@ -531,8 +536,10 @@ pub(super) fn import_call(ctx: &mut Ctx, call: Node) -> bool {
         return true;
     };
     let specifier = string_value(ctx, argument);
-    let target = ctx.resolver.script(ctx.path, &specifier);
-    ctx.import_edge(&specifier, target.clone(), Ctx::line(call));
+    let target = ctx.request(ImportRequest::Script {
+        spec: specifier.clone(),
+    });
+    ctx.import_edge(&specifier, Some(target), Ctx::line(call));
 
     // `const x = require('x')`, `const { a } = require('x')`, and
     // `const y = require('x').y` bind names; climb to the declarator.
@@ -558,8 +565,8 @@ pub(super) fn import_call(ctx: &mut Ctx, call: Node) -> bool {
         "identifier" => {
             let local = ctx.text(pattern);
             match property {
-                Some(imported) => bind(ctx, local, &target, imported, false),
-                None => bind(ctx, local.clone(), &target, local, true),
+                Some(imported) => ctx.bind(local, target, imported, false),
+                None => ctx.bind(local.clone(), target, local, true),
             }
         }
         "object_pattern" => {
@@ -567,7 +574,7 @@ pub(super) fn import_call(ctx: &mut Ctx, call: Node) -> bool {
                 match part.kind() {
                     "shorthand_property_identifier_pattern" => {
                         let name = ctx.text(part);
-                        bind(ctx, name.clone(), &target, name, false);
+                        ctx.bind(name.clone(), target, name, false);
                     }
                     "pair_pattern" => {
                         let key = field_text(ctx, part, "key");
@@ -576,7 +583,7 @@ pub(super) fn import_call(ctx: &mut Ctx, call: Node) -> bool {
                             .filter(|v| v.kind() == "identifier");
                         if let (Some(key), Some(value)) = (key, value) {
                             let local = ctx.text(value);
-                            bind(ctx, local, &target, key, false);
+                            ctx.bind(local, target, key, false);
                         }
                     }
                     _ => {}
@@ -586,15 +593,6 @@ pub(super) fn import_call(ctx: &mut Ctx, call: Node) -> bool {
         _ => {}
     }
     true
-}
-
-fn bind(ctx: &mut Ctx, local: String, target: &Option<String>, imported: String, namespace: bool) {
-    ctx.bind(ImportBinding {
-        local,
-        target_path: target.clone(),
-        imported,
-        namespace,
-    });
 }
 
 /// Names exported without `export` on their declaration: `export { a }`,

@@ -19,9 +19,11 @@ pub use error::AstError;
 pub use parser::{
     AstEdge, AstSnapshot, EdgeKind, Language, ParamSignature, SymbolSignature, parse_source,
 };
-pub use resolve::Resolver;
+pub use resolve::{ImportRequest, Probes, Resolver};
 pub use store::{
-    FileFailure, FileUpdate, IndexStats, UpdateStatus, index_workspace, load_symbols,
-    open_database, update_single_file,
+    FileUpdate, IndexStats, UpdateStatus, index_workspace, load_symbols, open_database,
+    update_single_file,
 };
-pub use walker::{WalkedFile, walk_workspace, workspace_relative};
+pub use walker::{
+    FileFailure, Walk, WalkedFile, confine, walk_file, walk_workspace, workspace_relative,
+};

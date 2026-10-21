@@ -6,9 +6,8 @@ use std::collections::HashSet;
 
 use tree_sitter::Node;
 
-use super::{
-    Ctx, Decl, EdgeKind, ImportBinding, ParamSignature, collapse_ws, generic_names, named_children,
-};
+use super::{Ctx, Decl, EdgeKind, ParamSignature, collapse_ws, generic_names, named_children};
+use crate::resolve::ImportRequest;
 
 pub(super) fn extract(ctx: &mut Ctx, root: Node) {
     for node in named_children(root) {
@@ -271,8 +270,8 @@ fn imports(ctx: &mut Ctx, declaration: Node) {
             continue;
         };
         let path = ctx.text(path_node).trim_matches(['"', '`']).to_string();
-        let target = ctx.resolver.go_import(&path);
-        ctx.import_edge(&path, target.clone(), Ctx::line(node));
+        let target = ctx.request(ImportRequest::GoImport { spec: path.clone() });
+        ctx.import_edge(&path, Some(target), Ctx::line(node));
         let alias = node.child_by_field_name("name").map(|n| ctx.text(n));
         let local = match alias {
             Some(alias) if alias == "_" || alias == "." => continue,
@@ -280,12 +279,7 @@ fn imports(ctx: &mut Ctx, declaration: Node) {
             None => package_name(&path),
         };
         let imported = local.clone();
-        ctx.bind(ImportBinding {
-            local,
-            target_path: target,
-            imported,
-            namespace: true,
-        });
+        ctx.bind(local, target, imported, true);
     }
 }
 

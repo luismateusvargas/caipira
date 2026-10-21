@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use caipira_ast::{
-    AstError, Resolver, index_workspace, open_database, parse_source, update_single_file,
+    AstError, Resolver, confine, index_workspace, open_database, parse_source, update_single_file,
     workspace_relative,
 };
 use clap::{Parser, Subcommand};
@@ -88,6 +88,11 @@ fn run(command: Command) -> Result<String, AstError> {
             let rel_path = workspace_relative(&workspace, &file)?;
             let root = workspace_root(&workspace)?;
             let absolute = root.join(&rel_path);
+            // Same boundary as the index: never read through a symlink.
+            if confine(&root, &rel_path)?.is_none() {
+                let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+                return Err(AstError::io(&absolute, missing));
+            }
             let bytes = std::fs::read(&absolute).map_err(|e| AstError::io(&absolute, e))?;
             to_json(&parse_source(&rel_path, &bytes, &Resolver::new(&root))?)
         }

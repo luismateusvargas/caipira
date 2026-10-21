@@ -1,10 +1,17 @@
 //! Resolves import specifiers to workspace-relative files.
 //!
 //! Resolution is lexical plus a file-existence check under the workspace
-//! root; a specifier that would climb above the root never resolves.
+//! root; a specifier that would climb above the root never resolves. Every
+//! path a resolution checks is recorded as a probe, so a file can be
+//! re-linked when one of those paths enters or leaves the index.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
+
+use crate::parser::Language;
 
 /// Maps import specifiers to workspace files under one root.
 #[derive(Debug)]
@@ -12,6 +19,30 @@ pub struct Resolver {
     root: PathBuf,
     go_module: OnceLock<Option<String>>,
 }
+
+/// An import as written, waiting to be resolved against the importing file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImportRequest {
+    /// A relative JS/TS/Vue specifier (`./store.js`, `../workspace`).
+    Script { spec: String },
+    /// A dotted Python module (`.store`, `..pkg.mod`, `pkg.mod`).
+    Python { module: String },
+    /// `from <module> import <name>` where `name` may itself be a submodule.
+    PythonSubmodule { module: String, name: String },
+    /// `mod name;`.
+    RustMod { name: String },
+    /// A `use` path; resolves to the file and the item path left inside it.
+    RustUse { path: String },
+    /// A quoted `#include "x.hpp"`.
+    CppInclude { spec: String },
+    /// A Go import path inside this workspace's module.
+    GoImport { spec: String },
+}
+
+/// Paths a resolution checked, workspace-relative: candidate source files
+/// and directories. Candidates that can never be indexed are left out.
+pub type Probes = BTreeSet<String>;
 
 const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "vue"];
 
@@ -27,26 +58,63 @@ impl Resolver {
         }
     }
 
-    fn is_file(&self, rel: &str) -> bool {
-        !rel.is_empty() && self.root.join(rel).is_file()
-    }
-
-    fn is_dir(&self, rel: &str) -> bool {
-        !rel.is_empty() && self.root.join(rel).is_dir()
-    }
-
-    fn first_file(&self, candidates: impl IntoIterator<Item = String>) -> Option<String> {
-        candidates.into_iter().find(|c| self.is_file(c))
-    }
-
-    /// A relative JS/TS/Vue specifier (`./store.js`, `../workspace`).
+    /// Resolves one import made by `from`.
     ///
-    /// Tries the path as written, TypeScript's `.js` -> `.ts` convention,
-    /// each script extension, then `index.*` inside a directory.
+    /// Returns the workspace file (a package directory for Go) and, for a
+    /// Rust `use`, the item path left inside that file (empty otherwise).
     ///
     /// # Arguments
-    /// `from`: the importing file. `spec`: the specifier as written.
-    pub fn script(&self, from: &str, spec: &str) -> Option<String> {
+    /// `from`: the importing file. `request`: the import as written.
+    /// `probes`: receives every candidate path checked.
+    pub fn resolve(
+        &self,
+        from: &str,
+        request: &ImportRequest,
+        probes: &mut Probes,
+    ) -> Option<(String, String)> {
+        let file = |found: Option<String>| found.map(|path| (path, String::new()));
+        match request {
+            ImportRequest::Script { spec } => file(self.script(from, spec, probes)),
+            ImportRequest::Python { module } => file(self.python(from, module, probes)),
+            ImportRequest::PythonSubmodule { module, name } => {
+                file(self.python_submodule(from, module, name, probes))
+            }
+            ImportRequest::RustMod { name } => file(self.rust_mod(from, name, probes)),
+            ImportRequest::RustUse { path } => self.rust_use(from, path, probes),
+            ImportRequest::CppInclude { spec } => file(self.cpp_include(from, spec, probes)),
+            ImportRequest::GoImport { spec } => file(self.go_import(spec, probes)),
+        }
+    }
+
+    fn is_file(&self, rel: &str, probes: &mut Probes) -> bool {
+        if rel.is_empty() {
+            return false;
+        }
+        if Language::from_path(rel).is_some() {
+            probes.insert(rel.to_string());
+        }
+        self.root.join(rel).is_file()
+    }
+
+    fn is_dir(&self, rel: &str, probes: &mut Probes) -> bool {
+        if rel.is_empty() {
+            return false;
+        }
+        probes.insert(rel.to_string());
+        self.root.join(rel).is_dir()
+    }
+
+    fn first_file(
+        &self,
+        candidates: impl IntoIterator<Item = String>,
+        probes: &mut Probes,
+    ) -> Option<String> {
+        candidates.into_iter().find(|c| self.is_file(c, probes))
+    }
+
+    /// Tries the path as written, TypeScript's `.js` -> `.ts` convention,
+    /// each script extension, then `index.*` inside a directory.
+    fn script(&self, from: &str, spec: &str, probes: &mut Probes) -> Option<String> {
         if !(spec.starts_with("./") || spec.starts_with("../") || spec == "." || spec == "..") {
             return None;
         }
@@ -69,14 +137,10 @@ impl Resolver {
                 .iter()
                 .map(|ext| format!("{base}/index.{ext}")),
         );
-        self.first_file(candidates)
+        self.first_file(candidates, probes)
     }
 
-    /// A Python module (`.store`, `..pkg.mod`, `pkg.mod`) to its file.
-    ///
-    /// # Arguments
-    /// `from`: the importing file. `module`: the dotted module as written.
-    pub fn python(&self, from: &str, module: &str) -> Option<String> {
+    fn python(&self, from: &str, module: &str, probes: &mut Probes) -> Option<String> {
         let dots = module.chars().take_while(|c| *c == '.').count();
         let rest = &module[dots..];
         let segments: Vec<&str> = rest.split('.').filter(|s| !s.is_empty()).collect();
@@ -89,95 +153,104 @@ impl Resolver {
                 dir = parent(&dir).to_string();
             }
             let base = join_segments(&dir, &segments);
-            return self.python_candidates(&base, segments.is_empty());
+            return self.python_candidates(&base, segments.is_empty(), probes);
         }
-        ["", "src"]
-            .iter()
-            .find_map(|prefix| self.python_candidates(&join_segments(prefix, &segments), false))
+        ["", "src"].iter().find_map(|prefix| {
+            self.python_candidates(&join_segments(prefix, &segments), false, probes)
+        })
     }
 
-    /// `from <module> import <name>` where `name` is itself a submodule.
-    ///
-    /// # Arguments
-    /// `from`: the importing file. `module`: the module as written. `name`: the imported name.
-    pub fn python_submodule(&self, from: &str, module: &str, name: &str) -> Option<String> {
+    fn python_submodule(
+        &self,
+        from: &str,
+        module: &str,
+        name: &str,
+        probes: &mut Probes,
+    ) -> Option<String> {
         let dotted = if module.chars().all(|c| c == '.') {
             format!("{module}{name}")
         } else {
             format!("{module}.{name}")
         };
-        self.python(from, &dotted)
+        self.python(from, &dotted, probes)
     }
 
-    fn python_candidates(&self, base: &str, is_package_dir: bool) -> Option<String> {
+    fn python_candidates(
+        &self,
+        base: &str,
+        is_package_dir: bool,
+        probes: &mut Probes,
+    ) -> Option<String> {
         if is_package_dir {
-            return self.first_file([join_segments(base, &["__init__.py"])]);
+            return self.first_file([join_segments(base, &["__init__.py"])], probes);
         }
         if base.is_empty() {
             return None;
         }
-        self.first_file([
-            format!("{base}.py"),
-            format!("{base}.pyi"),
-            format!("{base}/__init__.py"),
-        ])
+        self.first_file(
+            [
+                format!("{base}.py"),
+                format!("{base}.pyi"),
+                format!("{base}/__init__.py"),
+            ],
+            probes,
+        )
     }
 
-    /// `mod name;` declared in `from`.
-    ///
-    /// # Arguments
-    /// `from`: the declaring file. `name`: the module name.
-    pub fn rust_mod(&self, from: &str, name: &str) -> Option<String> {
+    fn rust_mod(&self, from: &str, name: &str, probes: &mut Probes) -> Option<String> {
         let dir = rust_module_dir(from);
-        self.first_file([
-            join_segments(&dir, &[&format!("{name}.rs")]),
-            join_segments(&dir, &[name, "mod.rs"]),
-        ])
+        self.first_file(
+            [
+                join_segments(&dir, &[&format!("{name}.rs")]),
+                join_segments(&dir, &[name, "mod.rs"]),
+            ],
+            probes,
+        )
     }
 
-    /// A `use` path to the file defining it and the item path left inside
-    /// that file (empty when the path names the module itself).
-    ///
     /// Handles `crate::`, `self::`, and child modules of the current module;
     /// `super::` and external crates stay unresolved.
-    ///
-    /// # Arguments
-    /// `from`: the importing file. `path`: the `::`-separated path.
-    pub fn rust_use(&self, from: &str, path: &str) -> Option<(String, String)> {
+    fn rust_use(&self, from: &str, path: &str, probes: &mut Probes) -> Option<(String, String)> {
         let segments: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
         let (base, rest, crate_root) = match segments.first().copied()? {
-            "crate" => (self.crate_src(from)?, &segments[1..], true),
+            "crate" => (self.crate_src(from, probes)?, &segments[1..], true),
             "self" => (rust_module_dir(from), &segments[1..], false),
             "super" => return None,
             _ => (rust_module_dir(from), &segments[..], false),
         };
         for depth in (1..=rest.len()).rev() {
             let module = rest[..depth].join("/");
-            let found = self.first_file([
-                join_segments(&base, &[&format!("{module}.rs")]),
-                join_segments(&base, &[&module, "mod.rs"]),
-            ]);
+            let found = self.first_file(
+                [
+                    join_segments(&base, &[&format!("{module}.rs")]),
+                    join_segments(&base, &[&module, "mod.rs"]),
+                ],
+                probes,
+            );
             if let Some(file) = found {
                 return Some((file, rest[depth..].join("::")));
             }
         }
         if crate_root && !rest.is_empty() {
-            let root_file = self.first_file([
-                join_segments(&base, &["lib.rs"]),
-                join_segments(&base, &["main.rs"]),
-            ])?;
+            let root_file = self.first_file(
+                [
+                    join_segments(&base, &["lib.rs"]),
+                    join_segments(&base, &["main.rs"]),
+                ],
+                probes,
+            )?;
             return Some((root_file, rest.join("::")));
         }
         None
     }
 
     /// The `src` directory of the crate containing `from`.
-    fn crate_src(&self, from: &str) -> Option<String> {
+    fn crate_src(&self, from: &str, probes: &mut Probes) -> Option<String> {
         let mut dir = parent(from).to_string();
         loop {
-            if self.is_file(&join_segments(&dir, &["Cargo.toml"])) {
+            if self.is_file(&join_segments(&dir, &["Cargo.toml"]), probes) {
                 let src = join_segments(&dir, &["src"]);
-                return self.is_dir(&src).then_some(src);
+                return self.is_dir(&src, probes).then_some(src);
             }
             if dir.is_empty() {
                 return None;
@@ -186,34 +259,26 @@ impl Resolver {
         }
     }
 
-    /// A quoted `#include "x.hpp"`, searched beside the file, at the root,
-    /// then under `include/` and `src/`.
-    ///
-    /// # Arguments
-    /// `from`: the including file. `spec`: the path inside the quotes.
-    pub fn cpp_include(&self, from: &str, spec: &str) -> Option<String> {
+    /// Searched beside the file, at the root, then under `include/` and `src/`.
+    fn cpp_include(&self, from: &str, spec: &str, probes: &mut Probes) -> Option<String> {
         let candidates = [
             join(parent(from), spec),
             join("", spec),
             join("include", spec),
             join("src", spec),
         ];
-        self.first_file(candidates.into_iter().flatten())
+        self.first_file(candidates.into_iter().flatten(), probes)
     }
 
-    /// A Go import path inside this workspace's module (from `go.mod`), as
-    /// the package directory.
-    ///
-    /// # Arguments
-    /// `spec`: the import path.
-    pub fn go_import(&self, spec: &str) -> Option<String> {
+    /// The package directory of an import path inside the `go.mod` module.
+    fn go_import(&self, spec: &str, probes: &mut Probes) -> Option<String> {
         let module = self
             .go_module
             .get_or_init(|| read_go_module(&self.root))
             .as_deref()?;
         let rest = spec.strip_prefix(module)?.strip_prefix('/')?;
         let dir = join("", rest)?;
-        self.is_dir(&dir).then_some(dir)
+        self.is_dir(&dir, probes).then_some(dir)
     }
 }
 
@@ -275,17 +340,39 @@ mod tests {
         Ok(dir)
     }
 
+    /// The resolved file alone, discarding probes and the item path.
+    fn file(resolver: &Resolver, from: &str, request: ImportRequest) -> Option<String> {
+        resolver
+            .resolve(from, &request, &mut Probes::new())
+            .map(|(path, _)| path)
+    }
+
+    fn script(spec: &str) -> ImportRequest {
+        ImportRequest::Script { spec: spec.into() }
+    }
+
+    fn python(module: &str) -> ImportRequest {
+        ImportRequest::Python {
+            module: module.into(),
+        }
+    }
+
+    fn rust_use(path: &str) -> ImportRequest {
+        ImportRequest::RustUse { path: path.into() }
+    }
+
     #[test]
     fn script_specifiers_resolve_extensions_and_index_files() {
         let dir = fixture(&["src/store.ts", "src/ui/index.tsx", "lib/util.js"]).unwrap();
         let resolver = Resolver::new(dir.path());
+        let from = "src/app.ts";
         let actual = vec![
-            resolver.script("src/app.ts", "./store.js"),
-            resolver.script("src/app.ts", "./store"),
-            resolver.script("src/app.ts", "./ui"),
-            resolver.script("src/app.ts", "../lib/util.js"),
-            resolver.script("src/app.ts", "react"),
-            resolver.script("src/app.ts", "../../outside"),
+            file(&resolver, from, script("./store.js")),
+            file(&resolver, from, script("./store")),
+            file(&resolver, from, script("./ui")),
+            file(&resolver, from, script("../lib/util.js")),
+            file(&resolver, from, script("react")),
+            file(&resolver, from, script("../../outside")),
         ];
         let expected = vec![
             Some("src/store.ts".to_string()),
@@ -299,6 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn probes_stop_at_the_first_hit_and_skip_unindexable_candidates() {
+        let dir = fixture(&["src/store.ts"]).unwrap();
+        let resolver = Resolver::new(dir.path());
+        let probed = |request: ImportRequest| {
+            let mut probes = Probes::new();
+            resolver.resolve("src/app.ts", &request, &mut probes);
+            probes.into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            probed(script("./store.js")),
+            vec!["src/store.js".to_string(), "src/store.ts".to_string()]
+        );
+        assert_eq!(probed(script("react")), Vec::<String>::new());
+        let missing = probed(script("./gone"));
+        assert!(missing.contains(&"src/gone.js".to_string()));
+        assert!(missing.contains(&"src/gone/index.vue".to_string()));
+        assert!(missing.contains(&"src/gone.mts".to_string()));
+        assert!(!missing.contains(&"src/gone".to_string()));
+    }
+
+    #[test]
     fn python_modules_resolve_relative_and_absolute() {
         let dir = fixture(&[
             "pkg/__init__.py",
@@ -308,14 +416,18 @@ mod tests {
         ])
         .unwrap();
         let resolver = Resolver::new(dir.path());
+        let submodule = |module: &str, name: &str| ImportRequest::PythonSubmodule {
+            module: module.into(),
+            name: name.into(),
+        };
         let actual = vec![
-            resolver.python("pkg/sub/mod.py", "..store"),
-            resolver.python("pkg/a.py", ".store"),
-            resolver.python("pkg/a.py", "."),
-            resolver.python("x.py", "pkg.sub.mod"),
-            resolver.python("x.py", "lib.core"),
-            resolver.python_submodule("pkg/a.py", ".", "store"),
-            resolver.python_submodule("pkg/a.py", ".store", "Row"),
+            file(&resolver, "pkg/sub/mod.py", python("..store")),
+            file(&resolver, "pkg/a.py", python(".store")),
+            file(&resolver, "pkg/a.py", python(".")),
+            file(&resolver, "x.py", python("pkg.sub.mod")),
+            file(&resolver, "x.py", python("lib.core")),
+            file(&resolver, "pkg/a.py", submodule(".", "store")),
+            file(&resolver, "pkg/a.py", submodule(".store", "Row")),
         ];
         let expected = vec![
             Some("pkg/store.py".to_string()),
@@ -341,13 +453,15 @@ mod tests {
         .unwrap();
         let resolver = Resolver::new(dir.path());
         let from = "crates/x/src/lib.rs";
+        let resolve =
+            |from: &str, path: &str| resolver.resolve(from, &rust_use(path), &mut Probes::new());
         let actual = vec![
-            resolver.rust_use(from, "crate::store::Store"),
-            resolver.rust_use(from, "crate::parser::javascript::extract"),
-            resolver.rust_use(from, "crate::AstError"),
-            resolver.rust_use("crates/x/src/parser.rs", "self::javascript"),
-            resolver.rust_use(from, "std::collections::HashMap"),
-            resolver.rust_use(from, "super::x"),
+            resolve(from, "crate::store::Store"),
+            resolve(from, "crate::parser::javascript::extract"),
+            resolve(from, "crate::AstError"),
+            resolve("crates/x/src/parser.rs", "self::javascript"),
+            resolve(from, "std::collections::HashMap"),
+            resolve(from, "super::x"),
         ];
         let expected = vec![
             Some(("crates/x/src/store.rs".to_string(), "Store".to_string())),
@@ -365,7 +479,13 @@ mod tests {
         ];
         assert_eq!(actual, expected);
         assert_eq!(
-            resolver.rust_mod("crates/x/src/parser.rs", "javascript"),
+            file(
+                &resolver,
+                "crates/x/src/parser.rs",
+                ImportRequest::RustMod {
+                    name: "javascript".into()
+                }
+            ),
             Some("crates/x/src/parser/javascript.rs".to_string())
         );
     }
@@ -375,18 +495,22 @@ mod tests {
         let dir = fixture(&["include/a.hpp", "src/b.h", "internal/db/db.go"]).unwrap();
         std::fs::write(dir.path().join("go.mod"), "module example.com/app\n").unwrap();
         let resolver = Resolver::new(dir.path());
+        let include = |spec: &str| ImportRequest::CppInclude { spec: spec.into() };
+        let go = |spec: &str| ImportRequest::GoImport { spec: spec.into() };
         assert_eq!(
-            resolver.cpp_include("src/main.cpp", "a.hpp"),
+            file(&resolver, "src/main.cpp", include("a.hpp")),
             Some("include/a.hpp".to_string())
         );
         assert_eq!(
-            resolver.cpp_include("src/main.cpp", "b.h"),
+            file(&resolver, "src/main.cpp", include("b.h")),
             Some("src/b.h".to_string())
         );
+        let mut probes = Probes::new();
         assert_eq!(
-            resolver.go_import("example.com/app/internal/db"),
-            Some("internal/db".to_string())
+            resolver.resolve("main.go", &go("example.com/app/internal/db"), &mut probes),
+            Some(("internal/db".to_string(), String::new()))
         );
-        assert_eq!(resolver.go_import("github.com/other/db"), None);
+        assert_eq!(probes.into_iter().collect::<Vec<_>>(), vec!["internal/db"]);
+        assert_eq!(file(&resolver, "main.go", go("github.com/other/db")), None);
     }
 }

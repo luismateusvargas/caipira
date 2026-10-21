@@ -15,6 +15,7 @@ use super::{
     Ctx, Decl, EdgeKind, ParamSignature, children, collapse_ws, generic_names, lossy,
     named_children, strip_angle_groups,
 };
+use crate::resolve::ImportRequest;
 
 pub(super) fn extract(ctx: &mut Ctx, root: Node) {
     let mut namespaces = HashSet::new();
@@ -476,8 +477,8 @@ fn include(ctx: &mut Ctx, node: Node) {
         return;
     }
     let spec = ctx.text(path).trim_matches('"').to_string();
-    let target = ctx.resolver.cpp_include(ctx.path, &spec);
-    ctx.import_edge(&spec, target, line);
+    let target = ctx.request(ImportRequest::CppInclude { spec: spec.clone() });
+    ctx.import_edge(&spec, Some(target), line);
 }
 
 #[cfg(test)]
