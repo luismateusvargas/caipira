@@ -522,6 +522,164 @@ console.log('\n17. a missing, failing or slow caipira-ast never blocks session s
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+// Raw stdin, any environment and cwd: for input no client should send.
+function runRaw(client, event, input, env = {}, cwd = os.tmpdir()) {
+  const child = require('child_process').spawnSync(NODE, [HOOK, '--client', client, '--event', event], {
+    input, encoding: 'utf8', env: { ...process.env, ...env }, cwd
+  });
+  return { stdout: child.stdout, stderr: child.stderr, status: child.status };
+}
+
+const STATS = '{"parsed":0,"skipped":0,"hash_matched":0,"removed":0,"failed":0,"relinked":0,"symbols_total":0,"edges_total":0,"duration_ms":0';
+// A stand-in caipira-ast: `index` prints `indexOutput` or, when that is
+// null, hangs like every other subcommand; each run is logged to `log`.
+function fakeParser(dir, name, indexOutput) {
+  const log = path.join(dir, `${name}.log`);
+  const bin = path.join(dir, name);
+  const index = indexOutput === null ? 'exec sleep 30' : `printf '%s\\n' '${indexOutput}'; exit 0`;
+  fs.writeFileSync(bin, `#!/bin/sh\necho "$1" >> '${log}'\nif [ "$1" = index ]; then ${index}; fi\nexec sleep 30\n`, { mode: 0o755 });
+  return { bin, runs: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []) };
+}
+
+// Six facts anchored to one symbol and two to another, indexed by the real
+// parser, then both files changed on disk with no PostToolUse to see it.
+function anchoredWorkspace(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value) { return value; }\n');
+  fs.writeFileSync(path.join(dir, 'b.js'), 'export function beta(value) { return value; }\n');
+  const info = ensureWorkspace(dir);
+  const ast = require(ROOT + '/ast.js');
+  ast.syncWorkspaceAst(dir, info.dbFile);
+  const db = openWorkspaceDb(info.dbFile);
+  const store = new FactStore(db, { machine: machineId(), agent: 'test', root: dir });
+  const anchor = (file, name) => ({ path: file, qualifiedName: name,
+    signatureHash: ast.inspectSymbol(db, `${file}::${name}`).symbol.signature_hash });
+  const ids = [];
+  for (let i = 0; i < 6; i++) {
+    ids.push(store.record({ kind: 'constraint', title: `api rule ${i}`, summary: `api rule ${i} holds.`,
+      body: 'api takes one argument', evidenceSymbols: [anchor('api.js', 'api')] }));
+  }
+  for (let i = 0; i < 2; i++) {
+    ids.push(store.record({ kind: 'constraint', title: `beta rule ${i}`, summary: `beta rule ${i} holds.`,
+      body: 'beta takes one argument', evidenceSymbols: [anchor('b.js', 'beta')] }));
+  }
+  db.close();
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value, extra) { return value + extra; }\n');
+  fs.writeFileSync(path.join(dir, 'b.js'), 'export function beta(value, extra) { return value + extra; }\n');
+  return { dir, ids };
+}
+
+const flaggedAll = (text, ids) => ids.every(id => (text.split(`#${id}]`)[1] || '').split('\n')[0].includes('NEEDS REVIEW'));
+
+console.log('\n18. session start stays inside the client timeout with a hung parser');
+{
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-hung-ast-'));
+  const cases = [
+    ['a hung sync', 'hung-index', null, ['index'], 7000],
+    ['a hung re-index after a good sync', 'hung-update', `${STATS}}`, ['index', 'update-file'], 4000],
+    ['a missing parser', 'absent', undefined, [], 2000]
+  ];
+  for (const [label, name, indexOutput, expectedRuns, withinMs] of cases) {
+    const { dir, ids } = anchoredWorkspace('hook-bounded-');
+    const parser = indexOutput === undefined ? { bin: path.join(fake, name), runs: () => [] } : fakeParser(fake, name, indexOutput);
+    const started = Date.now();
+    const { stdout, stderr, status } = runRaw('codex', 'SessionStart', JSON.stringify({ session_id: `hook-bounded-${name}`, cwd: dir }),
+      { CAIPIRA_AST_BIN: parser.bin });
+    const elapsed = Date.now() - started;
+    let reply = {};
+    try { reply = JSON.parse(stdout); } catch { /* checked below */ }
+    const text = reply.hookSpecificOutput?.additionalContext || '';
+    check(`${label}: valid SessionStart reply in ${elapsed} ms (< ${withinMs})`, status === 0 && elapsed < withinMs &&
+      reply.hookSpecificOutput?.hookEventName === 'SessionStart', `${elapsed} ${stdout.slice(0, 120)}`);
+    check(`${label}: the parser ran ${expectedRuns.length} time(s) for eight facts on two files`,
+      JSON.stringify(parser.runs()) === JSON.stringify(expectedRuns), JSON.stringify(parser.runs()));
+    check(`${label}: unconfirmed facts are flagged, not verified`, flaggedAll(text, ids), text.slice(0, 600));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  fs.rmSync(fake, { recursive: true, force: true });
+}
+
+console.log('\n19. a partial sync is reported once and startup carries on');
+{
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-partial-ast-'));
+  const dir = symbolWorkspace('hook-partial-', ['alpha']);
+  run('codex', 'SessionStart', { session_id: 'hook-partial-seed', cwd: dir });
+  const partial = fakeParser(fake, 'partial', `${STATS.replace('"failed":0', '"failed":1')},"failures":[{"path":"src/alpha.js","message":"Permission denied"}]}`);
+  let outcome = runWith('codex', 'SessionStart', { session_id: 'hook-partial-1', cwd: dir }, { CAIPIRA_AST_BIN: partial.bin });
+  const warnings = outcome.stderr.split('\n').filter(line => line.includes('AST sync incomplete'));
+  check('one bounded warning names the count and the path', warnings.length === 1 &&
+    warnings[0] === '[caipira-hook] AST sync incomplete: 1 unreadable path(s) kept their previous symbols (src/alpha.js: Permission denied)',
+  outcome.stderr);
+  check('startup still injects the map it has', outcome.status === 0 &&
+    outcome.result.hookSpecificOutput?.additionalContext.includes('- src/alpha.js::alpha (function L1-1)'), JSON.stringify(outcome.result).slice(0, 200));
+  const clean = fakeParser(fake, 'clean', `${STATS}}`);
+  outcome = runWith('codex', 'SessionStart', { session_id: 'hook-partial-2', cwd: dir }, { CAIPIRA_AST_BIN: clean.bin });
+  check('a sync with no failures is silent', outcome.stderr === '' && outcome.status === 0, outcome.stderr);
+  fs.rmSync(fake, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n20. bad input and broken storage still get the client\'s own reply');
+{
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-input-'));
+  const fileHome = path.join(scratch, 'not-a-directory');
+  fs.writeFileSync(fileHome, '');
+  const replies = { 'codex': '{}', 'claude-code': '{"continue":true}', 'antigravity': '{}' };
+  const events = { 'codex': 'SessionStart', 'claude-code': 'UserPromptSubmit', 'antigravity': 'pre-invocation' };
+  const inputs = [
+    ['malformed JSON', '{not json', {}],
+    ['a null payload', 'null', {}],
+    ['an array payload', '[1,2]', {}],
+    ['an unusable memory directory', JSON.stringify({ session_id: 'hook-broken-home', cwd: scratch, prompt: 'x' }), { CAIPIRA_HOME: fileHome }]
+  ];
+  for (const [label, input, env] of inputs) {
+    for (const client of Object.keys(replies)) {
+      const { stdout, stderr, status } = runRaw(client, events[client], input, env, scratch);
+      check(`${client}, ${label}: exits 0 with ${replies[client]}`, status === 0 && stdout === `${replies[client]}\n`, stdout);
+      check(`${client}, ${label}: the cause is on stderr only`, /\[caipira-hook\] (SyntaxError|HookInputError|SqliteError)/.test(stderr), stderr);
+    }
+    const other = runRaw('other-client', 'SessionStart', input, env, scratch);
+    check(`unknown client, ${label}: stable failure code, no raw error`, other.status === 0 &&
+      other.stdout === '{"ok":false,"event":"session-start","client":"other-client","error":"hook_failed"}\n', other.stdout);
+  }
+
+  const dir = symbolWorkspace('hook-invalid-fields-', ['alpha']);
+  let outcome = runRaw('codex', 'SessionStart', JSON.stringify({ session_id: { id: 1 }, cwd: dir }));
+  check('an object session_id is dropped before storage and named on stderr', outcome.status === 0 &&
+    JSON.parse(outcome.stdout).hookSpecificOutput?.hookEventName === 'SessionStart' && !/parameter/i.test(outcome.stdout) &&
+    outcome.stderr.includes('ignored invalid payload fields: session_id'), `${outcome.stdout.slice(0, 120)} ${outcome.stderr}`);
+  outcome = runRaw('claude-code', 'UserPromptSubmit', JSON.stringify({ session_id: 'hook-invalid', cwd: dir, prompt: ['x'] }));
+  check('a non-string prompt counts as no prompt', outcome.stdout === '{"continue":true}\n' &&
+    outcome.stderr.includes('ignored invalid payload fields: prompt'), `${outcome.stdout} ${outcome.stderr}`);
+  outcome = runRaw('antigravity', 'pre-invocation', JSON.stringify({ conversationId: 'hook-invalid-agy',
+    cwd: 7, workspacePaths: [dir], invocationNum: '3' }));
+  check('a wrongly typed cwd and step counter are dropped, the valid workspace path kept',
+    (JSON.parse(outcome.stdout).injectSteps || []).some(step => step.ephemeralMessage.includes('src/alpha.js::alpha')) &&
+    outcome.stderr.includes('ignored invalid payload fields: cwd, invocationNum'), `${outcome.stdout.slice(0, 120)} ${outcome.stderr}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(scratch, { recursive: true, force: true });
+}
+
+console.log('\n21. a failed recall block is diagnosed once at the hook');
+{
+  const dir = symbolWorkspace('hook-degraded-', ['alpha']);
+  run('codex', 'SessionStart', { session_id: 'hook-degraded-seed', cwd: dir });
+  const info = ensureWorkspace(dir);
+  const db = openWorkspaceDb(info.dbFile);
+  new FactStore(db, { machine: machineId(), agent: 'test', root: dir }).record({ kind: 'status', title: 'Degraded probe',
+    summary: 'The degraded probe stands.', body: 'The degraded probe stands.' });
+  db.exec('DROP TABLE ast_edges');
+  db.close();
+  const { result, stderr, status } = runWith('claude-code', 'SessionStart', { session_id: 'hook-degraded', cwd: dir },
+    { CAIPIRA_AST_BIN: path.join(dir, 'no-parser') });
+  const text = result.hookSpecificOutput?.additionalContext || '';
+  check('standing facts survive the failed symbol block', status === 0 && text.includes('The degraded probe stands.') &&
+    !text.includes('Workspace symbols:'), text.slice(-300));
+  check('one diagnostic names it', stderr.split('\n').filter(line => line.includes('recall degraded: workspace symbols failed')).length === 1, stderr);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 for (const probe of probes) fs.rmSync(probe.dir, { recursive: true, force: true });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

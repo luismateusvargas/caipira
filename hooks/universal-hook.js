@@ -6,9 +6,35 @@
 const path = require('path');
 const { MemoryStore } = require('../store');
 const { ensureWorkspace, machineId } = require('../workspace');
-const { buildInjection, buildDriftNotice, selectFacts, renderInjection } = require('../inject');
-const { FactStore } = require('../facts');
+const {
+  buildInjection, buildDriftNotice, selectFacts, renderInjection, PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS
+} = require('../inject');
+const { FactStore, AstRefreshScope } = require('../facts');
 const { syncWorkspaceAst, updateFileAst } = require('../ast');
+
+// install.js registers every recall hook with a 15 s client timeout (only
+// Codex's SessionEnd gets less). Parser work for recall (the startup sync,
+// then any evidence re-indexing) must end this long after the run starts,
+// which leaves the rest for process start, hashing, and rendering.
+const RECALL_PARSER_BUDGET_MS = 9000;
+// The startup sync's own allowance, inside that budget.
+const STARTUP_SYNC_TIMEOUT_MS = 5000;
+// One PostToolUse re-index of a written file.
+const POST_TOOL_AST_TIMEOUT_MS = 2000;
+
+// What a PostToolUse reminder and a session digest may carry.
+const DELTA_CALLER_LIMIT = 12;
+const DELTA_CHANGE_LIMIT = 8;
+const DIGEST_OBSERVATION_LIMIT = 500;
+const DIGEST_LIST_LIMIT = 6;
+const DIGEST_SUMMARY_CHARS = 500;
+// Tool arguments or results kept in one observation.
+const OBSERVATION_TEXT_CHARS = 6000;
+// One stderr diagnostic, and how many unreadable paths it names.
+const DIAGNOSTIC_CHARS = 600;
+const SYNC_FAILURE_SAMPLES = 3;
+
+const KNOWN_CLIENTS = new Set(['codex', 'claude-code', 'antigravity']);
 
 const EVENT_ALIASES = new Map([
   ['session-start', 'session-start'],
@@ -58,27 +84,107 @@ function readArgument(name, fallback) {
   return index >= 0 && process.argv[index + 1] ? process.argv[index + 1] : fallback;
 }
 
-function resolveEvent(payload) {
-  const rawEvent = readArgument('--event', payload.hook_event_name || payload.event || '');
+// The command line names the event and client the hook was installed for, so
+// they are known even when stdin cannot be parsed; the payload only fills in
+// what the command line left out.
+/** @param {string|null} fromPayload @returns {string} */
+function resolveEvent(fromPayload) {
+  const rawEvent = readArgument('--event', fromPayload || '');
   return EVENT_ALIASES.get(rawEvent) || rawEvent.toLowerCase().replace(/_/g, '-');
 }
 
-function resolveClient(payload) {
-  return readArgument('--client', payload.client || payload.ide || 'unknown');
+/** @param {string|null} fromPayload @returns {string} */
+function resolveClient(fromPayload) {
+  return readArgument('--client', fromPayload || 'unknown');
 }
 
-function resolveSessionId(payload) {
-  return payload.session_id || payload.sessionId || payload.conversationId || payload.conversation_id || null;
+// Diagnostics go to stderr, never into the client protocol, and are bounded
+// so a raw storage error cannot flood the client's log.
+/** @param {string} message */
+function diagnose(message) {
+  const text = String(message);
+  const bounded = text.length > DIAGNOSTIC_CHARS ? `${text.slice(0, DIAGNOSTIC_CHARS)}...` : text;
+  process.stderr.write(`[caipira-hook] ${bounded}\n`);
 }
 
-function resolveWorkspace(payload) {
-  if (typeof payload.cwd === 'string' && payload.cwd) return payload.cwd;
-  if (Array.isArray(payload.workspacePaths) && payload.workspacePaths[0]) return payload.workspacePaths[0];
-  if (typeof payload.workspace === 'string' && payload.workspace) return payload.workspace;
+/** Stdin that is not a JSON object. */
+class HookInputError extends Error {
+  /** @param {string} message */
+  constructor(message) {
+    super(message);
+    this.name = 'HookInputError';
+  }
+}
+
+// The first of these fields holding a non-empty string. A present field of
+// any other type is named in `invalid` and passed over.
+/** @param {object} payload @param {string[]} names @param {string[]} invalid @returns {string|null} */
+function textField(payload, names, invalid) {
+  for (const name of names) {
+    const value = payload[name];
+    if (value === undefined || value === null || value === '') continue;
+    if (typeof value === 'string') return value;
+    invalid.push(name);
+  }
   return null;
 }
 
-function safeText(value, maxLength = 6000) {
+/** @param {object} payload @param {string[]} invalid @returns {string|null} */
+function resolveWorkspace(payload, invalid) {
+  const cwd = textField(payload, ['cwd'], invalid);
+  if (cwd) return cwd;
+  const paths = payload.workspacePaths;
+  if (Array.isArray(paths) && paths.length > 0) {
+    if (typeof paths[0] === 'string' && paths[0]) return paths[0];
+    invalid.push('workspacePaths');
+  } else if (paths !== undefined && paths !== null && !Array.isArray(paths)) {
+    invalid.push('workspacePaths');
+  }
+  return textField(payload, ['workspace'], invalid);
+}
+
+/**
+ * @typedef {object} HookInput
+ * @property {string} event Canonical lifecycle event.
+ * @property {string} client Client the reply is shaped for.
+ * @property {object} payload The client's JSON object, for tool and invocation details.
+ * @property {string|null} sessionId
+ * @property {string} prompt Empty when the event carries none.
+ * @property {string|null} workspacePath Directory the client reported.
+ * @property {number|undefined} invocationNum Antigravity's step counter; undefined when absent.
+ */
+
+/**
+ * Parses one hook payload and validates the fields the adapter acts on. A
+ * field of the wrong type is dropped and named on stderr, so a client bug
+ * costs the part of the run that needed it and nothing more.
+ * @param {string} text Raw stdin; empty input is an empty payload.
+ * @returns {HookInput}
+ * @throws {SyntaxError} When stdin is not JSON.
+ * @throws {HookInputError} When it is JSON but not an object.
+ */
+function readHookInput(text) {
+  const trimmed = text.trim();
+  const payload = trimmed ? JSON.parse(trimmed) : {};
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new HookInputError('payload must be a JSON object');
+  }
+  const invalid = [];
+  const event = resolveEvent(textField(payload, ['hook_event_name', 'event'], invalid));
+  const client = resolveClient(textField(payload, ['client', 'ide'], invalid));
+  const sessionId = textField(payload, ['session_id', 'sessionId', 'conversationId', 'conversation_id'], invalid);
+  const prompt = textField(payload, ['prompt', 'userPrompt'], invalid) || '';
+  const workspacePath = resolveWorkspace(payload, invalid);
+  // A null counter is as good as none; anything but a step number is dropped.
+  let invocationNum;
+  const counter = payload.invocationNum;
+  if (Number.isSafeInteger(counter) && counter >= 0) invocationNum = counter;
+  else if (counter !== undefined && counter !== null) invalid.push('invocationNum');
+  if (invalid.length) diagnose(`ignored invalid payload fields: ${invalid.join(', ')}`);
+  return { event, client, payload, sessionId, prompt, workspacePath, invocationNum };
+}
+
+function safeText(value, maxLength = OBSERVATION_TEXT_CHARS) {
   if (value === undefined || value === null) return '';
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   return text.length > maxLength ? `${text.slice(0, maxLength)}...[truncated]` : text;
@@ -134,8 +240,9 @@ function writtenPaths(payload) {
 
 // Antigravity fires pre-invocation before every model step. A payload with no
 // counter is treated as the first, so standing facts are never lost outright.
-function isFirstInvocation(payload) {
-  return payload.invocationNum === 0 || payload.invocationNum === undefined;
+/** @param {number|undefined} invocationNum @returns {boolean} */
+function isFirstInvocation(invocationNum) {
+  return invocationNum === 0 || invocationNum === undefined;
 }
 
 function describeInvocation(payload) {
@@ -147,20 +254,52 @@ function describeInvocation(payload) {
   ].filter(Boolean).join('\n');
 }
 
+// Exactly one JSON reply per run: once one is written, later ones are dropped.
+let replied = false;
 function writeResult(result) {
+  if (replied) return;
+  replied = true;
   process.stdout.write(`${JSON.stringify(result)}\n`);
+}
+
+// A sync that could not read some paths still succeeds and keeps their old
+// rows, so the map is usable but may be stale there: worth one stderr line,
+// never a failed start.
+/** @param {{failed: number, failures?: unknown}} stats @returns {string[]} Workspace-relative paths it could not read. */
+function reportPartialSync(stats) {
+  if (!stats.failed) return [];
+  const failures = (Array.isArray(stats.failures) ? stats.failures : [])
+    .filter(failure => failure && typeof failure.path === 'string' && typeof failure.message === 'string');
+  const sample = failures.slice(0, SYNC_FAILURE_SAMPLES).map(failure => `${failure.path}: ${failure.message}`).join('; ');
+  diagnose(`AST sync incomplete: ${stats.failed} unreadable path(s) kept their previous symbols${sample ? ` (${sample})` : ''}`);
+  return failures.map(failure => failure.path);
 }
 
 // The symbol map injected at session start must describe the files as they
 // are now, including edits made outside any session. The sync is incremental,
 // but a missing, slow or failing parser only costs the map its freshness.
-function syncSessionAst(workspace) {
-  if (!workspace) return;
-  try {
-    syncWorkspaceAst(workspace.root, workspace.dbFile, { timeoutMs: 5000 });
-  } catch (error) {
-    process.stderr.write(`[caipira-hook] AST sync skipped: ${error.message}\n`);
+// What the sync learns also bounds the evidence checks after it: a parser
+// that failed is not asked again this run, paths it could not read are not
+// retried one by one, and nothing starts after the recall deadline.
+/** @param {{root: string, dbFile: string}} workspace @param {number} deadlineAtMs @returns {AstRefreshScope} */
+function syncSessionAst(workspace, deadlineAtMs) {
+  const timeoutMs = Math.min(STARTUP_SYNC_TIMEOUT_MS, deadlineAtMs - Date.now());
+  if (timeoutMs <= 0) {
+    diagnose('AST sync skipped: the recall parser budget is spent');
+    return new AstRefreshScope({ deadlineAtMs, parserUnavailable: true });
   }
+  try {
+    const stats = syncWorkspaceAst(workspace.root, workspace.dbFile, { timeoutMs });
+    return new AstRefreshScope({ deadlineAtMs, unreadablePaths: reportPartialSync(stats) });
+  } catch (error) {
+    diagnose(`AST sync skipped: ${error.message}`);
+    return new AstRefreshScope({ deadlineAtMs, parserUnavailable: true });
+  }
+}
+
+/** @param {string} operation @param {Error} error */
+function reportRecallFailure(operation, error) {
+  diagnose(`recall degraded: ${operation} failed: ${error.message}`);
 }
 
 // Antigravity's first step can carry the user's prompt as well. Only facts it
@@ -169,7 +308,8 @@ function recallBeyondStanding(db, prompt, opts, standing) {
   try {
     return renderInjection(selectFacts(db, prompt, opts)
       .filter(({ fact }) => !(standing || '').includes(`[${fact.kind}#${fact.id}]`)));
-  } catch {
+  } catch (error) {
+    reportRecallFailure('prompt facts', error);
     return null;
   }
 }
@@ -177,41 +317,48 @@ function recallBeyondStanding(db, prompt, opts, standing) {
 // Recall the facts worth putting in front of the model for this event. Never
 // allowed to throw or to be slow: memory is an accelerant, and a hook that
 // fails must cost nothing but the recall it would have provided.
-function recallContext(db, event, payload, workspace) {
+/** @param {object|null} db @param {HookInput} input @param {object|null} workspace @param {number} deadlineAtMs @returns {string|null} */
+function recallContext(db, input, workspace, deadlineAtMs) {
   if (!db) return null;
-  const starting = event === 'session-start' || (event === 'pre-invocation' && isFirstInvocation(payload));
+  const { event, prompt } = input;
+  const starting = event === 'session-start' || (event === 'pre-invocation' && isFirstInvocation(input.invocationNum));
   if (!starting && event !== 'user-prompt-submit' && event !== 'pre-invocation') return null;
   try {
-    const opts = { machine: machineId() };
+    const opts = { machine: machineId(), onFailure: reportRecallFailure };
 
     // A git pull or another editor can move evidence between sessions with no
     // PostToolUse to notice, so a new session re-indexes the workspace and
-    // re-checks every fact before anything is injected as settled.
+    // re-checks every fact before anything is injected as settled. One
+    // refresh scope carries the deadline through all of it.
+    let astScope = new AstRefreshScope({ deadlineAtMs });
     if (starting) {
-      syncSessionAst(workspace);
-      new FactStore(db, { ...opts, agent: 'hook', root: workspace?.root }).verify();
+      astScope = syncSessionAst(workspace, deadlineAtMs);
+      new FactStore(db, { machine: opts.machine, agent: 'hook', root: workspace?.root }).verify(undefined, astScope);
     }
 
     // Drift rides along with whatever else is being injected. It is appended
     // rather than gated on relevance: the fact that its evidence moved is
     // established, so the agent is told even when the prompt is unrelated.
     const drift = buildDriftNotice(db, opts);
-    const prompt = payload.prompt || payload.userPrompt || '';
-    const cwd = resolveWorkspace(payload) || workspace?.root;
+    const cwd = input.workspacePath || workspace?.root;
 
     // Session context (standing facts, digests, the symbol map) opens the
     // conversation once. Later turns carry only what their prompt recalls, so
     // the cached conversation prefix stays put and an unrelated prompt adds
     // nothing at all.
     if (starting) {
-      const recalled = buildInjection(db, workspace, { ...opts, cwd, budget: 24000, prompt: '' });
-      const extra = prompt ? recallBeyondStanding(db, prompt, { ...opts, root: workspace?.root }, recalled) : null;
+      const recalled = buildInjection(db, workspace, { ...opts, cwd, budget: STARTUP_BUDGET_CHARS, prompt: '' });
+      const extra = prompt
+        ? recallBeyondStanding(db, prompt, { machine: opts.machine, root: workspace?.root, astScope }, recalled)
+        : null;
       return [recalled, extra, drift].filter(Boolean).join('\n\n') || null;
     }
-    const recalled = prompt ? buildInjection(db, workspace, { ...opts, cwd, budget: 2400, prompt }) : null;
+    const recalled = prompt
+      ? buildInjection(db, workspace, { ...opts, cwd, budget: PROMPT_BUDGET_CHARS, prompt, astScope })
+      : null;
     return [recalled, drift].filter(Boolean).join('\n\n') || null;
   } catch (error) {
-    process.stderr.write(`[caipira-hook] recall skipped: ${error.message}\n`);
+    diagnose(`recall skipped: ${error.message}`);
     return null;
   }
 }
@@ -227,7 +374,23 @@ const HOOK_EVENT_NAMES = {
   'session-end': 'SessionEnd'
 };
 
-function writeClientResult(result, event, client, payload, recalled) {
+// The reply that carries no context, in the shape each known client accepts.
+/** @param {string} client @returns {object} */
+function acknowledgement(client) {
+  return client === 'claude-code' ? { continue: true } : {};
+}
+
+// A failed run still owes the client a reply it accepts: a known client gets
+// its plain acknowledgement, and any other caller Caipira's own result shape
+// with a stable code. The error itself only ever reaches stderr.
+/** @param {string} event @param {string} client */
+function writeFailure(event, client) {
+  writeResult(KNOWN_CLIENTS.has(client) ? acknowledgement(client) : { ok: false, event, client, error: 'hook_failed' });
+}
+
+/** @param {object} result @param {HookInput} input @param {string|null} recalled */
+function writeClientResult(result, input, recalled) {
+  const { event, client } = input;
   if (client === 'codex' || client === 'claude-code') {
     // SessionStart and UserPromptSubmit carry recall. PostToolUse can carry
     // an AST reminder through its own additionalContext output.
@@ -258,26 +421,26 @@ function writeClientResult(result, event, client, payload, recalled) {
       });
       return;
     }
-    writeResult(client === 'codex' ? {} : { continue: true });
+    writeResult(acknowledgement(client));
     return;
   }
 
   if (client === 'antigravity' && event === 'pre-invocation') {
     const steps = [];
-    if (isFirstInvocation(payload)) {
+    if (isFirstInvocation(input.invocationNum)) {
       steps.push(
         { ephemeralMessage: CAIPIRA_STARTUP_INSTRUCTION },
         { ephemeralMessage: AST_STARTUP_INSTRUCTION }
       );
     }
     if (recalled) steps.push({ ephemeralMessage: recalled });
-    writeResult(steps.length ? { injectSteps: steps } : {});
+    writeResult(steps.length ? { injectSteps: steps } : acknowledgement(client));
     return;
   }
 
   if (client === 'antigravity' && ['post-tool-use', 'pre-invocation', 'post-invocation', 'stop'].includes(event)) {
     writeResult(event === 'post-tool-use' && result.reminder
-      ? { injectSteps: [{ ephemeralMessage: result.reminder }] } : {});
+      ? { injectSteps: [{ ephemeralMessage: result.reminder }] } : acknowledgement(client));
     return;
   }
   writeResult(result);
@@ -300,23 +463,24 @@ function verifyTouchedFacts(db, payload, workspacePath, workspaceRoot) {
     if (ids.length) facts.verify(ids);
   } catch (error) {
     // Drift detection must never break the tool call that triggered it.
-    process.stderr.write(`[caipira-hook] drift check skipped: ${error.message}\n`);
+    diagnose(`drift check skipped: ${error.message}`);
   }
 }
 
-function postToolAstDelta(db, workspace, payload) {
+/** @param {object|null} db @param {object|null} workspace @param {HookInput} input */
+function postToolAstDelta(db, workspace, input) {
   if (!workspace || !db) return { reminder: null, symbols: [] };
   const changes = [];
   const symbols = [];
-  for (const file of writtenPaths(payload)) {
-    const absolute = path.resolve(resolveWorkspace(payload) || workspace.root, file);
+  for (const file of writtenPaths(input.payload)) {
+    const absolute = path.resolve(input.workspacePath || workspace.root, file);
     if (absolute !== workspace.root && !absolute.startsWith(`${workspace.root}${path.sep}`)) continue;
     let result;
     try {
-      result = updateFileAst(workspace.root, workspace.dbFile, absolute, { timeoutMs: 2000 });
+      result = updateFileAst(workspace.root, workspace.dbFile, absolute, { timeoutMs: POST_TOOL_AST_TIMEOUT_MS });
     } catch (error) {
       if (error.code !== 'unsupported' && error.code !== 'io') {
-        process.stderr.write(`[caipira-hook] AST delta skipped: ${error.message}\n`);
+        diagnose(`AST delta skipped: ${error.message}`);
       }
       continue;
     }
@@ -334,8 +498,8 @@ function postToolAstDelta(db, workspace, payload) {
         WHERE edge_kind = 'calls' AND
           ((target_path = ? AND target_symbol IN (?, ?)) OR
            (target_path IS NULL AND target_symbol IN (?, ?)))
-        ORDER BY source_path, line LIMIT 12`)
-        .all(result.path, entry.qualified_name, entry.name, entry.qualified_name, entry.name);
+        ORDER BY source_path, line LIMIT ?`)
+        .all(result.path, entry.qualified_name, entry.name, entry.qualified_name, entry.name, DELTA_CALLER_LIMIT);
       changes.push({ symbol: entry.qualified_name, path: result.path,
         signature: after ? `${entry.signature_text} → ${after.signature_text}` : `${entry.signature_text} (removed)`,
         callers: callers.map(c => `${c.source_path}::${c.source_symbol || '?'}:${c.line}`),
@@ -344,7 +508,7 @@ function postToolAstDelta(db, workspace, payload) {
   }
   if (!changes.length) return { reminder: null, symbols };
   const lines = ['<system-reminder>', 'Caipira AST signature changes:'];
-  for (const change of changes.slice(0, 8)) {
+  for (const change of changes.slice(0, DELTA_CHANGE_LIMIT)) {
     lines.push(`- ${change.path}::${change.symbol}: ${change.signature}`);
     if (change.callers.length) lines.push(`  Callers: ${change.callers.join(', ')}`);
     if (change.facts.length) lines.push(`  Impacted facts: ${change.facts.join(', ')}`);
@@ -358,7 +522,7 @@ function synthesizeSessionDigest(store, sessionId) {
   const existing = db.prepare('SELECT summary FROM sessions WHERE id = ?').get(sessionId);
   if (!existing) return null;
   const rows = db.prepare(`SELECT content, metadata FROM observations
-    WHERE session_id = ? AND kind = 'tool_result' ORDER BY id LIMIT 500`).all(sessionId);
+    WHERE session_id = ? AND kind = 'tool_result' ORDER BY id LIMIT ?`).all(sessionId, DIGEST_OBSERVATION_LIMIT);
   if (rows.length === 0) return existing.summary || null;
   const tools = new Set(), files = new Set(), symbols = new Set();
   for (const row of rows) {
@@ -369,10 +533,10 @@ function synthesizeSessionDigest(store, sessionId) {
     for (const file of meta.files || []) files.add(file);
     for (const symbol of meta.symbols || []) symbols.add(symbol);
   }
-  const list = values => [...values].sort().slice(0, 6).join(', ');
+  const list = values => [...values].sort().slice(0, DIGEST_LIST_LIMIT).join(', ');
   const summary = [`Tools: ${list(tools)} (${rows.length} calls)`,
     files.size ? `Files: ${list(files)}` : '', symbols.size ? `Symbols: ${list(symbols)}` : '']
-    .filter(Boolean).join('; ').slice(0, 500);
+    .filter(Boolean).join('; ').slice(0, DIGEST_SUMMARY_CHARS);
   db.prepare('UPDATE sessions SET summary = ? WHERE id = ? AND (summary IS NULL OR summary != ?)')
     .run(summary, sessionId, summary);
   return summary;
@@ -380,7 +544,9 @@ function synthesizeSessionDigest(store, sessionId) {
 
 // db is the store's own connection, or null when no workspace resolved and
 // the store fell back to the legacy database, which holds no facts to check.
-function captureEvent(store, event, payload, client, sessionId, workspacePath, db, workspace) {
+/** @param {object} store @param {HookInput} input @param {object|null} db @param {object|null} workspace @returns {object} */
+function captureEvent(store, input, db, workspace) {
+  const { event, client, payload, sessionId, workspacePath } = input;
   if (!sessionId) return { ok: false, skipped: true, reason: 'missing session identifier' };
 
   // A client whose start hook never fired still gets its session attributed.
@@ -390,12 +556,12 @@ function captureEvent(store, event, payload, client, sessionId, workspacePath, d
     store.ensureSession(sessionId, client, workspacePath);
   }
 
-  if (event === 'user-prompt-submit' && payload.prompt) {
-    store.addObservation({ session_id: sessionId, kind: 'user_prompt', content: payload.prompt });
+  if (event === 'user-prompt-submit' && input.prompt) {
+    store.addObservation({ session_id: sessionId, kind: 'user_prompt', content: input.prompt });
   }
 
   if (event === 'post-tool-use') {
-    const delta = postToolAstDelta(db, workspace, payload);
+    const delta = postToolAstDelta(db, workspace, input);
     store.addObservation({ session_id: sessionId, kind: 'tool_result', content: describeTool(payload),
       metadata: { tool: payload.tool_name || payload.toolName || payload.toolCall?.name || 'unknown-tool',
         files: writtenPaths(payload), symbols: delta.symbols } });
@@ -408,7 +574,9 @@ function captureEvent(store, event, payload, client, sessionId, workspacePath, d
   }
 
   if (event === 'stop') {
-    const finalMessage = payload.last_assistant_message || payload.lastAssistantMessage || payload.error;
+    // An error object is kept as text; other non-string messages are dropped.
+    const finalMessage = textField(payload, ['last_assistant_message', 'lastAssistantMessage', 'error'], [])
+      || (payload.error ? safeText(payload.error) : null);
     if (finalMessage) {
       store.addObservation({ session_id: sessionId, kind: 'session_stop', content: finalMessage });
       store.addSummary({ session_id: sessionId, scope: 'session', content: finalMessage });
@@ -426,42 +594,44 @@ function captureEvent(store, event, payload, client, sessionId, workspacePath, d
 }
 
 function main() {
+  // Recall's parser budget runs from here, as close as the adapter gets to
+  // the moment the client started its own timeout.
+  const deadlineAtMs = Date.now() + RECALL_PARSER_BUDGET_MS;
   const chunks = [];
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => chunks.push(chunk));
   process.stdin.on('end', () => {
-    let payload = {};
+    // Known before stdin is parsed, so even unreadable input gets a reply in
+    // the shape the client expects.
+    let event = resolveEvent(null);
+    let client = resolveClient(null);
     try {
-      const input = chunks.join('').trim();
-      payload = input ? JSON.parse(input) : {};
-      const event = resolveEvent(payload);
-      const client = resolveClient(payload);
-      const sessionId = resolveSessionId(payload);
-      const workspacePath = resolveWorkspace(payload);
+      const input = readHookInput(chunks.join(''));
+      ({ event, client } = input);
 
       // Provisioned here as well as at SessionStart: a hook that never fired,
       // or fired late while PostToolUse was already writing, must not be able
       // to cost us an observation.
       let workspace = null;
       try {
-        workspace = ensureWorkspace(workspacePath || process.cwd());
+        workspace = ensureWorkspace(input.workspacePath || process.cwd());
       } catch (error) {
-        process.stderr.write(`[caipira-hook] workspace resolve failed: ${error.message}\n`);
+        diagnose(`workspace resolve failed: ${error.message}`);
       }
 
       // One connection per hook run: capture, drift checks, and recall share it.
       const store = new MemoryStore(workspace ? { dbPath: workspace.dbFile } : {});
       try {
         const db = workspace ? store.storage.db : null;
-        const result = captureEvent(store, event, payload, client, sessionId, workspacePath, db, workspace);
-        const recalled = recallContext(db, event, payload, workspace);
-        writeClientResult(result, event, client, payload, recalled);
+        const result = captureEvent(store, input, db, workspace);
+        const recalled = recallContext(db, input, workspace, deadlineAtMs);
+        writeClientResult(result, input, recalled);
       } finally {
         store.close();
       }
     } catch (error) {
-      process.stderr.write(`[caipira-hook] ${error.name}: ${error.message}\n`);
-      writeResult({ ok: false, error: error.message });
+      diagnose(`${error.name}: ${error.message}`);
+      writeFailure(event, client);
     }
   });
 }

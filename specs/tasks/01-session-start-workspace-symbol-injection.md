@@ -27,21 +27,21 @@ Outside scope: Changes to the Rust `caipira-ast` parser binary, SQLite schema mi
 
 ## Implementation plan
 
-1. **Upgrade [`inject.js`](file:///home/htxzz77/Projects/caipira/inject.js) (`buildInjection` & symbol projection)**:
+1. **Upgrade [`inject.js`](../../inject.js) (`buildInjection` & symbol projection)**:
    - Raise the maximum allowed `budget` clamp in `buildInjection` from `12000` to `64000` characters (keeping `2400` as the default when `opts.budget` is omitted so existing unit-test callers keep their expected bound, while allowing `universal-hook.js` to pass a `24000` startup budget).
    - Separate standing/session-start injection (`!opts.prompt`) from prompt-turn injection (`Boolean(opts.prompt)`):
      - When `opts.prompt` is non-empty, select and format only matching facts (`Caipira recalled facts:`); return `null` immediately if no facts pass `selectFacts`, without appending `Recent sessions:` or `Workspace symbols:`.
      - When `!opts.prompt` (session start), emit standing facts (`Caipira standing facts for this workspace:`), recent session digests (`Recent sessions:`), and the global public symbol map (`Workspace symbols:`).
    - Replace the `LIMIT 5` symbol query in `buildInjection` with a helper `selectWorkspaceSymbols(db, subpath)` that queries all `is_public = 1` rows from `ast_symbols` alongside their incoming resolved edge count (`ast_edges` fan-in), ranks them by `(in_subpath DESC, fan_in DESC, path_depth ASC, path ASC, start_line ASC)`, packs as many `- ${path}::${qualified_name} (${kind} L${start_line}-${end_line})` lines (plus the omission footer when truncated) as fit the remaining character budget, and re-sorts the kept symbols by `(in_subpath DESC, path ASC, start_line ASC)` for byte-deterministic output.
-2. **Sync AST at session start in [`hooks/universal-hook.js`](file:///home/htxzz77/Projects/caipira/hooks/universal-hook.js)**:
+2. **Sync AST at session start in [`hooks/universal-hook.js`](../../hooks/universal-hook.js)**:
    - Import `syncWorkspaceAst` from `../ast`.
    - In `recallContext(db, event, payload, workspace)`:
      - When `starting` is true (`event === 'session-start'` or `event === 'pre-invocation' && isFirstInvocation(payload)`), call `syncWorkspaceAst(workspace.root, workspace.dbFile, { timeoutMs: 5000 })` inside a `try/catch` before `new FactStore(...).verify()` so both symbol-anchored fact verification and `buildInjection` see current workspace symbols.
      - Pass `budget: starting ? 24000 : 2400` and `prompt: starting ? '' : prompt` to `buildInjection`. If `starting` is true on Antigravity `pre-invocation` #0 and `prompt` is also present, append `buildPromptInjection(db, prompt, { ...opts, root: workspace?.root })` if it recalls additional facts not already covered.
    - Update `AST_STARTUP_INSTRUCTION` to reference the session-start symbol map (`path::qualified_name (kind Lstart-end)`) for ranged reads and `inspect_symbol`.
-3. **Update documentation in [`README.md`](file:///home/htxzz77/Projects/caipira/README.md)**:
+3. **Update documentation in [`README.md`](../../README.md)**:
    - Update Section 3 (`High-Precision Prompt Injection & Subpath Recall`) and Section 4 (`Fail-Open Cross-Client Lifecycle Adapter`) to document that `SessionStart` incrementally syncs the workspace AST and injects the global public symbol map once per session, while `UserPromptSubmit` injects only prompt-matched facts and drift notices.
-4. **Expand tests in [`test/test-inject.js`](file:///home/htxzz77/Projects/caipira/test/test-inject.js) and [`test/test-hook.js`](file:///home/htxzz77/Projects/caipira/test/test-hook.js)**:
+4. **Expand tests in [`test/test-inject.js`](../../test/test-inject.js) and [`test/test-hook.js`](../../test/test-hook.js)**:
    - In `test/test-inject.js`: verify that standing `buildInjection` includes more than 5 public symbols with `(kind Lstart-end)` metadata, prioritizes `subpath` and fan-in when budget-constrained, emits the omission notice when truncated, and never emits `Workspace symbols:` or `Recent sessions:` when `opts.prompt` is set.
    - In `test/test-hook.js`: verify that `SessionStart` indexes the workspace and injects the global `Workspace symbols:` map, and that subsequent `UserPromptSubmit` / `pre-invocation` (`invocationNum > 0`) turns on an indexed workspace do not re-inject `Workspace symbols:` or `Recent sessions:`.
 

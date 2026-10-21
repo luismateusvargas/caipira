@@ -10,8 +10,9 @@
 // plants a premise the model then reasons from. So the gate returns nothing
 // unless it is reasonably sure, and never returns a ranked-best-of-N.
 
-const { FactStore, trustScore } = require('./facts');
+const { FactStore, AstRefreshScope, trustScore } = require('./facts');
 const { compress, expand, termForms, buildOrMatch } = require('./compress');
+const fs = require('fs');
 const path = require('path');
 
 // Injecting the top N of anything guarantees noise on an unrelated prompt.
@@ -27,6 +28,26 @@ const MIN_TRUST = 0.25;     // excludes revoked/superseded; admits needs_review
 const MAX_FACTS = 3;
 const MAX_CHARS = 1200;
 const MAX_CANDIDATES = 40;
+
+// buildInjection's character budgets. A prompt turn (and any caller that
+// names no budget) gets the small one; session start pays for the symbol map
+// once, so it gets a larger one; no caller may exceed the cap.
+const PROMPT_BUDGET_CHARS = 2400;
+const STARTUP_BUDGET_CHARS = 24000;
+const MAX_BUDGET_CHARS = 64000;
+
+// Session start ranks this many of the most recently updated facts and shows
+// at most MAX_STANDING_FACTS of them; buildStandingInjection shows as many.
+const STANDING_CANDIDATES = 40;
+const MAX_STANDING_FACTS = 8;
+const RECENT_SESSION_DIGESTS = 2;
+const DRIFT_NOTICE_LIMIT = 5;
+
+// Ranking bonuses added to a fact's prompt score: where the work stands
+// first, then the traps, then the standing rules; and a fact whose evidence
+// lies under the session's subdirectory over one from elsewhere.
+const KIND_WEIGHT = { status: 0.5, gotcha: 0.4, constraint: 0.3, preference: 0.2, decision: 0.1 };
+const LOCALITY_BONUS = 0.25;
 
 const PROMPT_STOPWORDS = new Set([
   'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'whose', 'why', 'how',
@@ -98,34 +119,38 @@ function coverageOf(groups, haystack) {
   return hit / groups.length;
 }
 
-/** @param {object} db @param {string} prompt @param {{machine?: string}} [opts] @returns {InjectionCandidate[]} */
+/**
+ * The facts a prompt recalls, best first, or none.
+ * @param {object} db Open workspace database.
+ * @param {string} prompt
+ * @param {{machine?: string, root?: string, astScope?: AstRefreshScope}} [opts] astScope bounds and
+ *   shares the parser refreshes evidence checks need; a fresh unbounded scope when omitted.
+ * @returns {InjectionCandidate[]} Empty when nothing clears the gates.
+ * @throws {Error} When the fact store cannot be read; a miss is an empty list, never an error.
+ */
 function selectFacts(db, prompt, opts = {}) {
   const machine = opts.machine || 'unknown';
   const groups = termGroups(prompt || '');
   if (groups.length === 0) return [];
 
   const match = buildOrMatch(groups);
-  let rows;
-  try {
-    rows = db.prepare(`
-      SELECT f.*, bm25(facts_fts, 10.0, 6.0, 1.0) AS bm25
-      FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
-      WHERE facts_fts MATCH ? AND f.state IN ('active','needs_review')
-      ORDER BY bm25 ASC LIMIT ?
-    `).all(match, MAX_CANDIDATES);
-  } catch {
-    return [];
-  }
+  const rows = db.prepare(`
+    SELECT f.*, bm25(facts_fts, 10.0, 6.0, 1.0) AS bm25
+    FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
+    WHERE facts_fts MATCH ? AND f.state IN ('active','needs_review')
+    ORDER BY bm25 ASC LIMIT ?
+  `).all(match, MAX_CANDIDATES);
   if (rows.length === 0) return [];
 
   const store = new FactStore(db, { machine, root: opts.root });
+  const scope = opts.astScope || new AstRefreshScope();
   const scored = [];
   for (const fact of rows) {
     const haystack = `${fact.title}\n${fact.summary}\n${fact.body}`.toLowerCase();
     const coverage = coverageOf(groups, haystack);
     if (coverage < MIN_COVERAGE) continue;
 
-    const evidence = store.checkEvidence(fact.id);
+    const evidence = store.checkEvidence(fact.id, scope);
     const trust = trustScore(fact, evidence);
     if (trust < MIN_TRUST) continue;
     const score = coverage * trust;
@@ -134,6 +159,36 @@ function selectFacts(db, prompt, opts = {}) {
   }
 
   return scored.sort((a, b) => b.score - a.score).slice(0, MAX_FACTS);
+}
+
+/**
+ * @callback RecallFailureHandler
+ * @param {string} operation The recall block that failed, e.g. 'workspace symbols'.
+ * @param {Error} error The underlying failure.
+ * @returns {void}
+ */
+
+// Recall is optional context, so a failure must never cost the caller its
+// turn, but it must not pass for a relevance miss either: it is reported once
+// to whoever owns the boundary, or to stderr when nobody claimed it.
+/** @param {RecallFailureHandler|undefined} onFailure @param {string} operation @param {Error} error */
+function reportFailure(onFailure, operation, error) {
+  if (typeof onFailure === 'function') {
+    onFailure(operation, error);
+    return;
+  }
+  process.stderr.write(`[caipira-inject] ${operation} failed: ${error && error.message}\n`);
+}
+
+// One review rule for every rendered fact. A stale fact is still worth
+// injecting, but it must say so rather than present itself as current: the
+// needs_review state alone earns the flag, and changed paths make it specific.
+/** @param {{kind: string, id: number, summary: string, state?: string}} fact @param {string[]} [stale] @returns {string} */
+function factLine(fact, stale = []) {
+  const flag = stale.length
+    ? ` (NEEDS REVIEW — changed since recorded: ${stale.join(', ')})`
+    : fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
+  return `- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`;
 }
 
 // Only summaries are injected, never bodies: the summary is written to be
@@ -146,12 +201,7 @@ function renderInjection(selected) {
   let budget = MAX_CHARS;
 
   for (const { fact, stale } of selected) {
-    let line = `- [${fact.kind}#${fact.id}] ${fact.summary}`;
-    if ((fact.state === 'needs_review' || stale.length > 0) && stale.length) {
-      // A stale fact is still worth injecting, but it must say so rather than
-      // present itself as current.
-      line += ` (NEEDS REVIEW — changed since recorded: ${stale.join(', ')})`;
-    }
+    const line = factLine(fact, stale);
     if (line.length > budget) continue;
     budget -= line.length;
     lines.push(line);
@@ -162,18 +212,29 @@ function renderInjection(selected) {
   return lines.join('\n');
 }
 
-/** @param {object} db @param {string} prompt @param {{machine?: string}} [opts] @returns {string|null} */
-function buildPromptInjection(db, prompt, opts) {
+/**
+ * @param {object} db Open workspace database.
+ * @param {string} prompt
+ * @param {{machine?: string, root?: string, astScope?: AstRefreshScope, onFailure?: RecallFailureHandler}} [opts]
+ * @returns {string|null} null when nothing is recalled; a storage failure is reported through
+ *   onFailure (stderr by default) and also yields null.
+ */
+function buildPromptInjection(db, prompt, opts = {}) {
   try {
     return renderInjection(selectFacts(db, prompt, opts));
-  } catch {
+  } catch (error) {
+    reportFailure(opts.onFailure, 'prompt facts', error);
     return null;
   }
 }
 
 // SessionStart has no prompt to match against, so it carries only the small
 // set of standing facts, and only the ones still verified.
-/** @param {object} db @param {{limit?: number}} [opts] @returns {string|null} */
+/**
+ * @param {object} db Open workspace database.
+ * @param {{limit?: number, onFailure?: RecallFailureHandler}} [opts]
+ * @returns {string|null} null when there are no standing facts or they cannot be read (reported).
+ */
 function buildStandingInjection(db, opts = {}) {
   try {
     // Every kind belongs here, ordered by how much a fresh session needs it
@@ -188,7 +249,7 @@ function buildStandingInjection(db, opts = {}) {
                  WHEN 'constraint' THEN 2 WHEN 'preference' THEN 3 ELSE 4 END,
                updated_at DESC
       LIMIT ?
-    `).all(opts.limit || 8);
+    `).all(opts.limit || MAX_STANDING_FACTS);
     if (rows.length === 0) return null;
 
     const lines = ['Caipira standing facts for this workspace:'];
@@ -198,7 +259,8 @@ function buildStandingInjection(db, opts = {}) {
     }
     lines.push('Act on these directly — do not re-derive anything they cover. Use search_facts for the full body or for facts not listed here, check_drift before trusting one whose files may have moved, and record_fact for anything settled this session that is not already here.');
     return lines.join('\n');
-  } catch {
+  } catch (error) {
+    reportFailure(opts.onFailure, 'standing facts', error);
     return null;
   }
 }
@@ -211,6 +273,60 @@ function compareText(a, b) {
 
 const symbolPlace = (a, b) => compareText(a.path, b.path) || a.start - b.start || compareText(a.qualified, b.qualified);
 
+// Workspace-relative POSIX form of target, or null at base itself or outside
+// it. Whole components are compared, so "..tools" is a directory, not a way
+// out; a different Windows drive comes back absolute and is outside too.
+/** @param {typeof path} pathApi @param {string} base @param {string} target @returns {string|null} */
+function relativeInside(pathApi, base, target) {
+  const relative = pathApi.relative(base, target);
+  if (!relative || pathApi.isAbsolute(relative)) return null;
+  const parts = relative.split(pathApi.sep);
+  return parts[0] === '..' ? null : parts.join('/');
+}
+
+/** @param {string} target @returns {string|null} */
+function realpathOrNull(target) {
+  try {
+    return fs.realpathSync.native(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Where a session runs inside its workspace, for locality ranking.
+ *
+ * A workspace keeps the spelling it was first registered under, which can be
+ * a symlink to the directory a later session reports as its cwd, so both are
+ * compared by their real paths. When either cannot be resolved (deleted, or
+ * never created) both are compared as written instead. Workspace identity
+ * and database routing are not affected.
+ * @param {string|null|undefined} root Workspace root as registered.
+ * @param {string|undefined} cwd Directory the session reports.
+ * @param {{pathApi?: typeof path, realpath?: (target: string) => string|null}} [adapters]
+ *   Path rules (path.win32 for Windows comparison) and resolver; the host's by default.
+ * @returns {{subpath: string, roots: string[]}} subpath is '' at the root or outside it;
+ *   roots are the spellings of the root that recorded evidence paths may start with.
+ */
+function locateSession(root, cwd, adapters = {}) {
+  const pathApi = adapters.pathApi || path;
+  const realpath = adapters.realpath || realpathOrNull;
+  if (typeof root !== 'string' || !root) return { subpath: '', roots: [] };
+  const lexicalRoot = pathApi.resolve(root);
+  if (typeof cwd !== 'string' || !cwd) return { subpath: '', roots: [lexicalRoot] };
+  const realRoot = realpath(root);
+  const realCwd = realpath(cwd);
+  const subpath = (realRoot && realCwd
+    ? relativeInside(pathApi, realRoot, realCwd)
+    : relativeInside(pathApi, lexicalRoot, pathApi.resolve(cwd))) || '';
+  return { subpath, roots: [...new Set([lexicalRoot, realRoot].filter(Boolean))] };
+}
+
+/** @param {string} subpath @param {string|null} relPath @returns {boolean} */
+function withinSubpath(subpath, relPath) {
+  return Boolean(subpath && relPath) && (relPath === subpath || relPath.startsWith(`${subpath}/`));
+}
+
 /**
  * Renders the workspace's public symbol map within `room` characters.
  *
@@ -220,10 +336,13 @@ const symbolPlace = (a, b) => compareText(a.path, b.path) || a.start - b.start |
  * then the most depended-on symbols, then the shallowest files. Every kept
  * symbol outranks every omitted one, and the kept lines are printed in
  * (subpath, path, line) order so the same index always renders the same text.
+ * When not even one symbol fits, the header and omission notice alone still
+ * tell the agent the symbols exist.
  * @param {object} db Open workspace database.
  * @param {string} subpath Workspace-relative directory the session runs in, or ''.
  * @param {number} room Characters available for the whole block.
- * @returns {string|null} null when there are no public symbols or none fits.
+ * @returns {string|null} null when there are no public symbols or not even the notice fits.
+ * @throws {Error} When the symbol index cannot be read.
  */
 function selectWorkspaceSymbols(db, subpath, room) {
   const rows = db.prepare(`SELECT path, name, qualified_name, kind, start_line, end_line
@@ -247,7 +366,7 @@ function selectWorkspaceSymbols(db, subpath, room) {
     path: row.path,
     start: row.start_line,
     qualified: row.qualified_name,
-    local: subpath && (row.path === subpath || row.path.startsWith(`${subpath}/`)) ? 1 : 0,
+    local: withinSubpath(subpath, row.path) ? 1 : 0,
     fanIn: (symbolFanIn.get(`${row.path}\0${row.qualified_name}`) || 0)
       + (row.name !== row.qualified_name ? symbolFanIn.get(`${row.path}\0${row.name}`) || 0 : 0)
       + (fileFanIn.get(row.path) || 0),
@@ -268,7 +387,10 @@ function selectWorkspaceSymbols(db, subpath, room) {
     used += 1 + symbol.line.length;
     kept.push(symbol);
   }
-  if (kept.length === 0) return null;
+  if (kept.length === 0) {
+    const notice = `${header}\n${footer(symbols.length)}`;
+    return notice.length <= room ? notice : null;
+  }
 
   kept.sort((a, b) => b.local - a.local || symbolPlace(a, b));
   const lines = [header, ...kept.map(symbol => symbol.line)];
@@ -276,80 +398,101 @@ function selectWorkspaceSymbols(db, subpath, room) {
   return lines.join('\n');
 }
 
+// The facts a block of recall carries, ranked: prompt score first, then
+// kind, then locality to the session's subdirectory, newest breaking ties.
+/**
+ * @param {object} db
+ * @param {{root: string}|null|undefined} workspace
+ * @param {{prompt?: string, machine?: string, astScope?: AstRefreshScope}} opts
+ * @param {{subpath: string, roots: string[]}} place
+ * @returns {object[]}
+ */
+function rankedFacts(db, workspace, opts, place) {
+  const facts = opts.prompt
+    ? selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root, astScope: opts.astScope })
+      .map(row => ({ ...row.fact, score: row.score, stale: row.stale }))
+    : db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
+        ORDER BY updated_at DESC LIMIT ?`).all(STANDING_CANDIDATES);
+  if (facts.length === 0) return facts;
+
+  // Evidence files are recorded as absolute paths under whichever spelling of
+  // the root was current, symbol evidence as workspace-relative paths; both
+  // are judged by the same subpath.
+  const locality = new Set();
+  if (place.subpath) {
+    for (const row of db.prepare(`SELECT fact_id, path FROM fact_evidence`).all()) {
+      if (place.roots.some(root => withinSubpath(place.subpath, relativeInside(path, root, row.path)))) {
+        locality.add(row.fact_id);
+      }
+    }
+    for (const row of db.prepare(`SELECT fact_id, path FROM fact_symbol_evidence`).all()) {
+      if (withinSubpath(place.subpath, row.path)) locality.add(row.fact_id);
+    }
+  }
+  const rank = fact => fact.score + (KIND_WEIGHT[fact.kind] || 0) + (locality.has(fact.id) ? LOCALITY_BONUS : 0);
+  return facts.sort((a, b) => rank(b) - rank(a) || b.updated_at - a.updated_at);
+}
+
 /**
  * Builds bounded recall. Without a prompt (session start) it carries standing
  * facts, recent session digests, and the public symbol map; with one it
  * carries only the facts the prompt recalls, or nothing.
+ *
+ * Each block is built on its own, so a block that fails to read is left out
+ * and reported through onFailure (stderr by default) while the blocks that
+ * did build are kept. A prompt turn whose facts cannot be read returns null.
  * @param {object} db Open workspace database.
  * @param {{root: string}} workspace Resolved workspace.
- * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string}} [opts]
- *   budget defaults to 2400 characters and is capped at 64000.
- * @returns {string|null}
+ * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string,
+ *   astScope?: AstRefreshScope, onFailure?: RecallFailureHandler}} [opts]
+ *   budget defaults to PROMPT_BUDGET_CHARS and is capped at MAX_BUDGET_CHARS.
+ * @returns {string|null} null when there is nothing to say.
  */
 function buildInjection(db, workspace, opts = {}) {
-  try {
-    const budget = Math.max(0, Math.min(64000, Number.isInteger(opts.budget) ? opts.budget : 2400));
-    if (!budget) return null;
-    const relative = workspace && workspace.root && opts.cwd
-      ? path.relative(workspace.root, opts.cwd).split(path.sep).join('/') : '';
-    const subpath = relative && relative !== '.' && !relative.startsWith('..') ? relative : '';
-    let facts;
-    if (opts.prompt) {
-      facts = selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root })
-        .map(row => ({ ...row.fact, score: row.score, stale: row.stale }));
-      // A prompt turn carries what the prompt recalled or nothing: repeating
-      // session context here would only break the cached prefix.
-      if (facts.length === 0) return null;
-    } else {
-      facts = db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
-        ORDER BY updated_at DESC LIMIT 40`).all();
+  const budget = Math.max(0, Math.min(MAX_BUDGET_CHARS,
+    Number.isInteger(opts.budget) ? opts.budget : PROMPT_BUDGET_CHARS));
+  if (!budget) return null;
+  const attempt = (operation, build) => {
+    try {
+      return build();
+    } catch (error) {
+      reportFailure(opts.onFailure, operation, error);
+      return null;
     }
-    const locality = new Set();
-    if (subpath) {
-      const prefix = `${subpath}/`;
-      const absolute = path.join(workspace.root, prefix);
-      for (const row of db.prepare(`SELECT fact_id, path FROM fact_evidence`).all()) {
-        if (row.path.startsWith(absolute)) locality.add(row.fact_id);
-      }
-      for (const row of db.prepare(`SELECT fact_id, path FROM fact_symbol_evidence`).all()) {
-        if (row.path.startsWith(prefix)) locality.add(row.fact_id);
-      }
-    }
-    const kindWeight = { status: 0.5, gotcha: 0.4, constraint: 0.3, preference: 0.2, decision: 0.1 };
-    facts.sort((a, b) => (b.score + (kindWeight[b.kind] || 0) + (locality.has(b.id) ? 0.25 : 0)) -
-      (a.score + (kindWeight[a.kind] || 0) + (locality.has(a.id) ? 0.25 : 0)) || b.updated_at - a.updated_at);
+  };
+  const place = locateSession(workspace?.root, opts.cwd);
 
-    const blocks = [];
-    let used = 0;
-    const add = line => {
-      const candidate = blocks.length ? `\n${line}` : line;
-      if (used + candidate.length > budget) return false;
-      blocks.push(line);
-      used += candidate.length;
-      return true;
-    };
-    if (facts.length) {
-      add(opts.prompt ? 'Caipira recalled facts:' : 'Caipira standing facts for this workspace:');
-      for (const fact of facts.slice(0, 8)) {
-        const flag = fact.stale?.length
-          ? ` (NEEDS REVIEW — changed since recorded: ${fact.stale.join(', ')})`
-          : fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
-        add(`- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`);
-      }
-    }
-    if (!opts.prompt) {
-      const sessions = db.prepare(`SELECT summary FROM sessions WHERE summary IS NOT NULL AND trim(summary) != ''
-        ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 2`).all();
-      if (sessions.length && add('Recent sessions:')) {
-        for (const session of sessions) add(`- ${session.summary}`);
-      }
-      const symbols = selectWorkspaceSymbols(db, subpath, budget - used - (blocks.length ? 1 : 0));
-      if (symbols) add(symbols);
-    }
-    return blocks.length ? blocks.join('\n') : null;
-  } catch {
-    return null;
+  const facts = attempt(opts.prompt ? 'prompt facts' : 'standing facts',
+    () => rankedFacts(db, workspace, opts, place)) || [];
+  // A prompt turn carries what the prompt recalled or nothing: repeating
+  // session context here would only break the cached prefix.
+  if (opts.prompt && facts.length === 0) return null;
+
+  const blocks = [];
+  let used = 0;
+  const add = line => {
+    const candidate = blocks.length ? `\n${line}` : line;
+    if (used + candidate.length > budget) return false;
+    blocks.push(line);
+    used += candidate.length;
+    return true;
+  };
+  if (facts.length) {
+    add(opts.prompt ? 'Caipira recalled facts:' : 'Caipira standing facts for this workspace:');
+    for (const fact of facts.slice(0, MAX_STANDING_FACTS)) add(factLine(fact, fact.stale));
   }
+  if (!opts.prompt) {
+    const sessions = attempt('session digests', () => db.prepare(`SELECT summary FROM sessions
+      WHERE summary IS NOT NULL AND trim(summary) != ''
+      ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`).all(RECENT_SESSION_DIGESTS)) || [];
+    if (sessions.length && add('Recent sessions:')) {
+      for (const session of sessions) add(`- ${session.summary}`);
+    }
+    const symbols = attempt('workspace symbols',
+      () => selectWorkspaceSymbols(db, place.subpath, budget - used - (blocks.length ? 1 : 0)));
+    if (symbols) add(symbols);
+  }
+  return blocks.length ? blocks.join('\n') : null;
 }
 
 // Facts whose evidence files have moved. Unlike prompt injection this is not
@@ -357,7 +500,11 @@ function buildInjection(db, workspace, opts = {}) {
 // the ground truth changed, so the only question is whether the fact survived
 // the change. Surfaced unconditionally, because a stale fact that keeps being
 // injected is worse than one nobody recorded.
-/** @param {object} db @param {{limit?: number}} [opts] @returns {string|null} */
+/**
+ * @param {object} db Open workspace database.
+ * @param {{limit?: number, onFailure?: RecallFailureHandler}} [opts]
+ * @returns {string|null} null when nothing drifted or the facts cannot be read (reported).
+ */
 function buildDriftNotice(db, opts = {}) {
   try {
     const rows = db.prepare(`
@@ -365,7 +512,7 @@ function buildDriftNotice(db, opts = {}) {
              (SELECT GROUP_CONCAT(path, '|') FROM fact_evidence WHERE fact_id = f.id) AS paths
       FROM facts f WHERE f.state = 'needs_review'
       ORDER BY f.updated_at DESC LIMIT ?
-    `).all(opts.limit || 5);
+    `).all(opts.limit || DRIFT_NOTICE_LIMIT);
     if (rows.length === 0) return null;
 
     const lines = ['Caipira facts whose evidence changed — resolve before relying on them:'];
@@ -375,12 +522,14 @@ function buildDriftNotice(db, opts = {}) {
     }
     lines.push('For each: if it still holds, reaffirm it via update_fact; if the change made it wrong, update_fact with the correction, or revoke it and record_fact the replacement with supersedes.');
     return lines.join('\n');
-  } catch {
+  } catch (error) {
+    reportFailure(opts.onFailure, 'drift notice', error);
     return null;
   }
 }
 
 module.exports = {
   buildPromptInjection, buildStandingInjection, buildInjection, buildDriftNotice, selectFacts, renderInjection,
-  selectWorkspaceSymbols, coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS
+  selectWorkspaceSymbols, locateSession, coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS,
+  PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS, MAX_BUDGET_CHARS
 };

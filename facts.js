@@ -22,7 +22,20 @@ const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'propos
 // Facts that are worth re-checking on a clock, not just on file changes.
 const DEFAULT_TTL_DAYS = { status: 14, decision: null, constraint: null, preference: null, gotcha: null };
 
-/** @typedef {{checked: number, unchanged: number, changed: number, missing: number, unverified: number, foreign: number, changedPaths: string[]}} EvidenceStatus */
+// The longest one evidence check may wait for the parser to re-index a file.
+const EVIDENCE_REFRESH_TIMEOUT_MS = 2000;
+
+// Parser failures that say the parser itself cannot run, as opposed to one
+// file it could not read or parse: after one, nothing else is worth trying.
+const PARSER_DOWN_CODES = new Set(['binary_missing', 'timeout', 'bad_output', 'failed']);
+
+/**
+ * @typedef {{checked: number, unchanged: number, changed: number, missing: number, unverified: number,
+ *   foreign: number, unchecked: number, changedPaths: string[],
+ *   broken: {path: string, symbol: string, reason: string}[]}} EvidenceStatus
+ * `unchecked` counts symbol evidence the parser could not refresh in time,
+ * which is neither confirmed nor contradicted.
+ */
 /** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], evidence_ranges?: {path: string, start_line: number, end_line: number}[], evidenceSymbols?: {path: string, qualifiedName: string, signatureHash: string}[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
 /** @typedef {Partial<FactInput>} FactChanges */
 
@@ -83,6 +96,76 @@ function trustScore(fact, evidenceStatus) {
     if (ageDays > fact.ttl_days) score *= 0.5;
   }
   return score;
+}
+
+// ── AST refresh ──
+
+/**
+ * @typedef {object} AstRefreshOptions
+ * @property {number} [deadlineAtMs] Clock time after which no parser starts; unbounded when omitted.
+ * @property {boolean} [parserUnavailable] The parser already failed this run, so nothing is refreshed.
+ * @property {string[]} [unreadablePaths] Workspace-relative files or directories ('.' for the root)
+ *   the last sync could not read; their rows are left as they are.
+ * @property {() => number} [clock] Millisecond clock the deadline is measured on; defaults to Date.now.
+ * @property {(root: string, dbFile: string, file: string, opts: {timeoutMs: number}) => unknown} [updateFile]
+ *   Re-indexes one file; defaults to ast.js updateFileAst.
+ */
+
+/**
+ * Brings symbol rows up to date for evidence checks.
+ *
+ * A verification batch can rest many facts on one changed file, so each
+ * workspace-relative path is refreshed at most once per scope. Once the
+ * deadline passes, or the parser times out or proves missing, nothing more
+ * is spawned, and the symbol evidence it would have confirmed is reported
+ * as unchecked rather than as verified. A scope serves one workspace.
+ */
+class AstRefreshScope {
+  /** @param {AstRefreshOptions} [opts] */
+  constructor(opts = {}) {
+    this.deadlineAtMs = Number.isFinite(opts.deadlineAtMs) ? opts.deadlineAtMs : Infinity;
+    this.parserDown = Boolean(opts.parserUnavailable);
+    this.unreadable = (opts.unreadablePaths || []).filter(p => typeof p === 'string' && p.length > 0);
+    this.clock = opts.clock || Date.now;
+    this.updateFile = opts.updateFile || null;
+    this.outcomes = new Map();
+  }
+
+  /**
+   * @param {import('better-sqlite3').Database} db Workspace database.
+   * @param {string} root Workspace root.
+   * @param {string} relPath Workspace-relative file.
+   * @returns {boolean} true when the file's rows describe it as it is now.
+   */
+  refresh(db, root, relPath) {
+    if (!this.outcomes.has(relPath)) this.outcomes.set(relPath, this.attempt(db, root, relPath));
+    return this.outcomes.get(relPath);
+  }
+
+  /** @param {import('better-sqlite3').Database} db @param {string} root @param {string} relPath @returns {boolean} */
+  attempt(db, root, relPath) {
+    const indexed = db.prepare('SELECT size, mtime_ms FROM ast_files WHERE path = ?').get(relPath);
+    let stat;
+    try { stat = fs.statSync(path.join(root, relPath)); } catch { /* deletion needs an AST update */ }
+    if (stat && indexed && indexed.size === stat.size && indexed.mtime_ms === Math.floor(stat.mtimeMs)) return true;
+
+    const remainingMs = this.deadlineAtMs - this.clock();
+    if (this.parserDown || remainingMs <= 0 || this.isUnreadable(relPath)) return false;
+    const updateFile = this.updateFile || require('./ast').updateFileAst;
+    try {
+      updateFile(root, db.name, path.join(root, relPath),
+        { timeoutMs: Math.min(EVIDENCE_REFRESH_TIMEOUT_MS, remainingMs) });
+      return true;
+    } catch (error) {
+      if (PARSER_DOWN_CODES.has(error && error.code)) this.parserDown = true;
+      return false;
+    }
+  }
+
+  /** @param {string} relPath @returns {boolean} */
+  isUnreadable(relPath) {
+    return this.unreadable.some(p => p === '.' || relPath === p || relPath.startsWith(`${p}/`));
+  }
 }
 
 // ── store ──
@@ -273,31 +356,24 @@ class FactStore {
   }
 
   // Two-tier: stat gates the hash, hash gates the verdict.
-  /** @param {number} factId @returns {EvidenceStatus} */
-  checkEvidence(factId) {
+  /**
+   * @param {number} factId
+   * @param {AstRefreshScope} [scope] Shared refresh state; a fresh unbounded one when omitted.
+   * @returns {EvidenceStatus}
+   */
+  checkEvidence(factId, scope = new AstRefreshScope()) {
     const rows = this.db.prepare('SELECT * FROM fact_evidence WHERE fact_id = ?').all(factId);
     const symbols = this.db.prepare('SELECT * FROM fact_symbol_evidence WHERE fact_id = ?').all(factId);
-    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, unverified: 0, foreign: 0, changedPaths: [], broken: [] };
+    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, unverified: 0, foreign: 0, unchecked: 0,
+      changedPaths: [], broken: [] };
     const symbolsByPath = new Map();
     for (const symbol of symbols) {
       const group = symbolsByPath.get(symbol.path) || [];
       group.push(symbol);
       symbolsByPath.set(symbol.path, group);
     }
-    const refreshed = new Set();
-    const unavailable = new Set();
-    const refreshAst = relPath => {
-      if (!this.root || refreshed.has(relPath)) return;
-      refreshed.add(relPath);
-      const indexed = this.db.prepare('SELECT size, mtime_ms FROM ast_files WHERE path = ?').get(relPath);
-      let stat;
-      try { stat = fs.statSync(path.join(this.root, relPath)); } catch { /* deletion needs an AST update */ }
-      if (stat && indexed && indexed.size === stat.size && indexed.mtime_ms === Math.floor(stat.mtimeMs)) return;
-      try {
-        const { updateFileAst } = require('./ast');
-        updateFileAst(this.root, this.db.name, path.join(this.root, relPath), { timeoutMs: 2000 });
-      } catch { unavailable.add(relPath); }
-    };
+    // Without a root there is nothing to re-index, so the rows are taken as they are.
+    const isCurrent = relPath => !this.root || scope.refresh(this.db, this.root, relPath);
 
     for (const row of rows) {
       // Evidence recorded on another machine cannot be verified here; treating
@@ -339,12 +415,11 @@ class FactStore {
         const relPath = this.root ? path.relative(this.root, row.path).split(path.sep).join('/') : null;
         const anchored = relPath && symbolsByPath.has(relPath);
         if (anchored) {
-          refreshAst(relPath);
-          const allCurrent = symbolsByPath.get(relPath).every(symbol => {
+          const allCurrent = isCurrent(relPath) && symbolsByPath.get(relPath).every(symbol => {
             const current = this.db.prepare(`SELECT signature_hash FROM ast_symbols
               WHERE path = ? AND qualified_name = ? ORDER BY start_line LIMIT 1`)
               .get(relPath, symbol.qualified_name);
-            return !unavailable.has(relPath) && current && current.signature_hash === symbol.signature_hash;
+            return current && current.signature_hash === symbol.signature_hash;
           });
           if (allCurrent) {
             this.db.prepare('UPDATE fact_evidence SET sha256 = ?, size = ?, mtime = ? WHERE id = ?')
@@ -358,12 +433,14 @@ class FactStore {
       }
     }
     for (const symbol of symbols) {
-      refreshAst(symbol.path);
+      const refreshed = isCurrent(symbol.path);
       const exists = !this.root || fs.existsSync(path.join(this.root, symbol.path));
+      // A file that is still there but could not be re-indexed proves nothing
+      // either way about its symbols.
+      if (!refreshed && exists) { status.unchecked++; continue; }
       const current = exists && this.db.prepare(`SELECT signature_hash FROM ast_symbols
         WHERE path = ? AND qualified_name = ? ORDER BY start_line LIMIT 1`)
         .get(symbol.path, symbol.qualified_name);
-      if (unavailable.has(symbol.path) && exists) continue;
       if (!current || current.signature_hash !== symbol.signature_hash) {
         status.broken.push({ path: symbol.path, symbol: symbol.qualified_name,
           reason: current ? 'symbol_signature_changed' : 'symbol_missing' });
@@ -376,8 +453,14 @@ class FactStore {
   }
 
   // Re-checks facts and flips those whose evidence moved into needs_review.
-  /** @param {number[]} [ids] @returns {(EvidenceStatus & {id: number, title: string, drifted: boolean, ttlExpired: boolean})[]} */
-  verify(ids) {
+  // One refresh scope covers the whole batch, so facts sharing a changed
+  // file share its re-index, and a scope with a deadline bounds the batch.
+  /**
+   * @param {number[]} [ids] Facts to check; every active or needs_review fact when omitted.
+   * @param {AstRefreshScope} [scope] Shared refresh state; a fresh unbounded one when omitted.
+   * @returns {(EvidenceStatus & {id: number, title: string, drifted: boolean, ttlExpired: boolean})[]}
+   */
+  verify(ids, scope = new AstRefreshScope()) {
     const targets = ids && ids.length
       ? ids
       : this.db.prepare(`SELECT id FROM facts WHERE state IN ('active','needs_review')`).all().map(r => r.id);
@@ -387,19 +470,21 @@ class FactStore {
     for (const id of targets) {
       const fact = this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id);
       if (!fact) continue;
-      const status = this.checkEvidence(id);
+      const status = this.checkEvidence(id, scope);
       const ttlExpired = Boolean(fact.ttl_days && fact.last_verified_at &&
         (now - fact.last_verified_at) / 86400000 > fact.ttl_days);
       const drifted = status.changed > 0 || status.missing > 0 || ttlExpired;
+      // Evidence left unchecked keeps a fact from counting as verified now.
+      const confirmed = status.checked > 0 && status.unchecked === 0;
 
       if (drifted && fact.state === 'active') {
         this.db.prepare(`UPDATE facts SET state = 'needs_review', last_checked_at = ? WHERE id = ?`)
           .run(now, id);
-      } else if (!drifted && fact.state === 'needs_review' && status.checked > 0) {
+      } else if (!drifted && fact.state === 'needs_review' && confirmed) {
         // Evidence came back into line (a revert, or the fact was re-recorded).
         this.db.prepare(`UPDATE facts SET state = 'active', last_checked_at = ?, last_verified_at = ? WHERE id = ?`)
           .run(now, now, id);
-      } else if (!drifted && status.checked > 0) {
+      } else if (!drifted && confirmed) {
         this.db.prepare('UPDATE facts SET last_checked_at = ?, last_verified_at = ? WHERE id = ?')
           .run(now, now, id);
       } else {
@@ -553,6 +638,6 @@ function searchWorkspaces(query, opts = {}) {
 }
 
 module.exports = {
-  FactStore, fingerprint, hashFile, trustScore, buildMatch, termForms,
-  searchWorkspaces, RRF_K, VALID_KINDS, VALID_STATES
+  FactStore, AstRefreshScope, fingerprint, hashFile, trustScore, buildMatch, termForms,
+  searchWorkspaces, RRF_K, VALID_KINDS, VALID_STATES, EVIDENCE_REFRESH_TIMEOUT_MS
 };

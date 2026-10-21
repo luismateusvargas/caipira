@@ -269,6 +269,124 @@ console.log('\n10. session-start symbol map ranking, packing and budget');
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+const fs = require('fs'), os = require('os'), path = require('path');
+const { openWorkspaceDb } = require(ROOT + '/workspace.js');
+const {
+  selectWorkspaceSymbols, locateSession, PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS, MAX_BUDGET_CHARS
+} = require(ROOT + '/inject.js');
+const addPublic = (sdb, file, name, start = 1, end = 1) => sdb.prepare(`INSERT INTO ast_symbols
+  (path, name, qualified_name, kind, is_public, start_line, end_line, params_json, signature_text, signature_hash)
+  VALUES (?, ?, ?, 'function', 1, ?, ?, '[]', ?, ?)`).run(file, name, name, start, end, name, name);
+const footerFor = n => `(... ${n} more public symbols omitted to fit budget; use workspace_symbols or inspect_symbol)`;
+
+console.log('\n11. every rendered needs_review fact carries its own flag');
+{
+  const ttlExpired = renderInjection([{ fact: { id: 123, kind: 'decision', summary: 'TTL expired.', state: 'needs_review' }, stale: [] }]);
+  check('needs_review with no changed paths is flagged', ttlExpired?.split('\n')[1] === '- [decision#123] TTL expired. (NEEDS REVIEW)', ttlExpired);
+  const changed = renderInjection([{ fact: { id: 124, kind: 'decision', summary: 'Moved.', state: 'active' }, stale: ['/w/a.js'] }]);
+  check('changed paths keep the detailed flag', changed?.split('\n')[1] === '- [decision#124] Moved. (NEEDS REVIEW — changed since recorded: /w/a.js)', changed);
+  const current = renderInjection([{ fact: { id: 125, kind: 'decision', summary: 'Current.', state: 'active' }, stale: [] }]);
+  check('an active unchanged fact stays unflagged', current?.split('\n')[1] === '- [decision#125] Current.', current);
+}
+
+console.log('\n12. a failing block costs only itself, and says so');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-failure-'));
+  const fdb = openWorkspaceDb(path.join(dir, 'failure.db'));
+  const { FactStore } = require(ROOT + '/facts.js');
+  new FactStore(fdb, { machine: machineId(), agent: 'test' }).record({ kind: 'status', title: 'Release status',
+    summary: 'Release candidate is frozen.', body: 'The release candidate is frozen.' });
+  fdb.prepare(`INSERT INTO sessions (id, ide, started_at, ended_at, summary) VALUES ('s1', 'test', 1, 2, 'Froze the release')`).run();
+  addPublic(fdb, 'api.js', 'api');
+  const failures = [];
+  const onFailure = (operation, error) => failures.push(`${operation}: ${error.message}`);
+  const healthy = buildInjection(fdb, { root: dir }, { budget: 2400, onFailure });
+
+  // Fault injection without touching the schema: only fact reads fail.
+  const factsFail = { name: fdb.name, prepare: sql => {
+    if (/\bfacts\b/.test(sql) && !/ast_/.test(sql)) throw new Error('disk I/O error');
+    return fdb.prepare(sql);
+  } };
+  const withoutFacts = buildInjection(factsFail, { root: dir }, { budget: 2400, onFailure });
+  check('a failed fact query keeps digests and symbols at session start',
+    withoutFacts === healthy.slice(healthy.indexOf('Recent sessions:')) && withoutFacts.includes('Workspace symbols:') &&
+    failures.length === 1 && failures[0] === 'standing facts: disk I/O error', `${withoutFacts} ${JSON.stringify(failures)}`);
+  failures.length = 0;
+  check('a failed fact query on a prompt turn is reported, not mistaken for a miss',
+    buildInjection(factsFail, { root: dir }, { prompt: 'is the release candidate frozen?', budget: 2400, onFailure }) === null &&
+    failures.length === 1 && failures[0] === 'prompt facts: disk I/O error', JSON.stringify(failures));
+
+  failures.length = 0;
+  fdb.exec('DROP TABLE ast_edges');
+  const degraded = buildInjection(fdb, { root: dir }, { budget: 2400, onFailure });
+  check('facts and digests survive a failed symbol query', degraded ===
+    healthy.slice(0, healthy.indexOf('\nWorkspace symbols:')) && degraded.includes('Release candidate') &&
+    degraded.includes('Froze the release'), degraded);
+  check('one diagnostic names the failing operation', failures.length === 1 &&
+    failures[0].startsWith('workspace symbols: ') && failures[0].includes('ast_edges'), JSON.stringify(failures));
+
+  failures.length = 0;
+  check('an unrelated healthy prompt is a silent miss', buildInjection(fdb, { root: dir },
+    { prompt: 'add a dark mode toggle to the settings page', budget: 2400, onFailure }) === null && failures.length === 0,
+  JSON.stringify(failures));
+  fdb.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n13. the omission notice survives when no symbol fits');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-omitted-'));
+  const odb = openWorkspaceDb(path.join(dir, 'omitted.db'));
+  for (const name of ['alpha', 'beta', 'gamma', 'delta']) addPublic(odb, `${name}.js`, name);
+  const notice = `Workspace symbols:\n${footerFor(4)}`;
+  check('all four omitted within 120 characters', selectWorkspaceSymbols(odb, '', 120) === notice, selectWorkspaceSymbols(odb, '', 120));
+  check('exactly the notice length still fits it', selectWorkspaceSymbols(odb, '', notice.length) === notice);
+  check('one character less leaves the block out', selectWorkspaceSymbols(odb, '', notice.length - 1) === null);
+  const full = ['Workspace symbols:', '- alpha.js::alpha (function L1-1)', '- beta.js::beta (function L1-1)',
+    '- delta.js::delta (function L1-1)', '- gamma.js::gamma (function L1-1)'].join('\n');
+  check('exactly the full map length needs no notice', selectWorkspaceSymbols(odb, '', full.length) === full);
+  const partial = ['Workspace symbols:', '- alpha.js::alpha (function L1-1)', footerFor(3)].join('\n');
+  check('ordinary partial packing is unchanged', selectWorkspaceSymbols(odb, '', partial.length) === partial,
+    selectWorkspaceSymbols(odb, '', partial.length));
+  odb.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n14. locality compares canonical paths by whole components');
+{
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-locality-'));
+  fs.mkdirSync(path.join(real, 'z'));
+  fs.mkdirSync(path.join(real, '..tools'));
+  const alias = `${real}-alias`;
+  fs.symlinkSync(real, alias, 'dir');
+  const ldb = openWorkspaceDb(path.join(real, 'locality.db'));
+  addPublic(ldb, 'a.js', 'outside');
+  addPublic(ldb, 'z/local.js', 'local');
+  const expected = ['Workspace symbols:', '- z/local.js::local (function L1-1)', '- a.js::outside (function L1-1)'].join('\n');
+  const aliasRoot = buildInjection(ldb, { root: alias }, { cwd: path.join(real, 'z'), budget: 2400 });
+  check('symlink-registered root with a real cwd ranks the subpath first', aliasRoot === expected, aliasRoot);
+  const aliasCwd = buildInjection(ldb, { root: real }, { cwd: path.join(alias, 'z'), budget: 2400 });
+  check('real root with a symlinked cwd ranks the subpath first', aliasCwd === expected, aliasCwd);
+  check('a directory named ..tools is inside the workspace', locateSession(real, path.join(real, '..tools')).subpath === '..tools');
+  check('parent traversal is outside', locateSession(path.join(real, 'z'), real).subpath === '');
+  check('a sibling sharing the root as a prefix is outside', locateSession(real, `${real}-alias`).subpath === '' &&
+    locateSession(path.join(real, 'z'), path.join(real, 'zz')).subpath === '');
+  check('missing paths fall back to lexical comparison', locateSession('/no/such/root', '/no/such/root/pkg/src').subpath === 'pkg/src');
+  check('root spellings cover both the alias and the real path',
+    JSON.stringify(locateSession(alias, path.join(real, 'z')).roots) === JSON.stringify([alias, fs.realpathSync.native(real)]));
+  const win = { pathApi: path.win32, realpath: () => null };
+  check('Windows comparison ignores drive and directory case', locateSession('C:\\Work\\Repo', 'c:\\work\\repo\\Src\\Lib', win).subpath === 'Src/Lib');
+  check('a different Windows drive is outside', locateSession('C:\\Work\\Repo', 'D:\\Work\\Repo\\src', win).subpath === '');
+  check('Windows parent traversal is outside', locateSession('C:\\Work\\Repo', 'C:\\Work', win).subpath === '');
+  ldb.close();
+  fs.rmSync(alias, { force: true });
+  fs.rmSync(real, { recursive: true, force: true });
+}
+
+console.log('\n15. named budgets keep their specified values');
+check('prompt, startup and maximum budgets', PROMPT_BUDGET_CHARS === 2400 && STARTUP_BUDGET_CHARS === 24000 &&
+  MAX_BUDGET_CHARS === 64000);
+
 db.close();
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

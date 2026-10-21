@@ -276,6 +276,109 @@ if (process.platform !== 'win32') {
   check('symlink resolves to recorded evidence file', store.factsForPaths([linkedFile]).includes(liveId));
 }
 
+console.log('\n19. a refresh scope re-indexes each file once, within its deadline');
+{
+  const { AstRefreshScope, EVIDENCE_REFRESH_TIMEOUT_MS } = require('../facts.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'facts-refresh-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  const sdb = new D(path.join(tmp, 'refresh.db'));
+  migrate(sdb, WORKSPACE_MIGRATIONS);
+  const rstore = new FactStore(sdb, { machine: 'testbox', agent: 'test', root });
+  const DAY_AGO = Date.now() - 86400000;
+
+  // Index a file as it is now with one public symbol, then anchor facts to it.
+  const indexFile = rel => {
+    const stat = fs.statSync(path.join(root, rel));
+    sdb.prepare(`INSERT OR REPLACE INTO ast_files (path, language, size, mtime_ms, content_sha256, indexed_at)
+      VALUES (?, 'javascript', ?, ?, '', 0)`).run(rel, stat.size, Math.floor(stat.mtimeMs));
+  };
+  const anchored = (rel, count) => {
+    fs.writeFileSync(path.join(root, rel), 'export function api(value) { return value; }\n');
+    indexFile(rel);
+    sdb.prepare(`INSERT INTO ast_symbols (path, name, qualified_name, kind, is_public, start_line, end_line,
+      params_json, signature_text, signature_hash) VALUES (?, 'api', 'api', 'function', 1, 1, 1, '[]', 'api(value)', 'h1')`).run(rel);
+    const ids = [];
+    for (let i = 0; i < count; i++) {
+      ids.push(rstore.record({ kind: 'constraint', title: `${rel} ${i}`, body: 'api takes one argument',
+        evidenceSymbols: [{ path: rel, qualifiedName: 'api', signatureHash: 'h1' }] }));
+    }
+    sdb.prepare(`UPDATE facts SET last_verified_at = ? WHERE id IN (${ids.join(',')})`).run(DAY_AGO);
+    return ids;
+  };
+  // A different size, so the change is seen within one mtime tick.
+  const edit = rel => fs.writeFileSync(path.join(root, rel), 'export function api(value, extra) { return value + extra; }\n');
+  // Stands in for caipira-ast: records each call, then fails with `code` or,
+  // with no code, re-indexes the file with its signature unchanged.
+  const parser = code => {
+    const calls = [];
+    const updateFile = (workspaceRoot, dbFile, file, opts) => {
+      calls.push({ path: path.relative(workspaceRoot, file).split(path.sep).join('/'), timeoutMs: opts.timeoutMs });
+      if (code) throw Object.assign(new Error(code), { code });
+      indexFile(path.relative(workspaceRoot, file));
+    };
+    return { calls, updateFile };
+  };
+  const facts = ids => ids.map(factId => sdb.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(factId));
+  const reset = ids => sdb.prepare(`UPDATE facts SET state = 'active', last_verified_at = ? WHERE id IN (${ids.join(',')})`).run(DAY_AGO);
+
+  const shared = anchored('src/shared.js', 6);
+  edit('src/shared.js');
+  const slow = parser('timeout');
+  const timedOut = rstore.verify(shared, new AstRefreshScope({ updateFile: slow.updateFile }));
+  check('six facts on one changed file start the parser once', slow.calls.length === 1, JSON.stringify(slow.calls));
+  check('the refresh asks for at most its own timeout', slow.calls[0]?.timeoutMs === EVIDENCE_REFRESH_TIMEOUT_MS, JSON.stringify(slow.calls));
+  check('unconfirmed facts are flagged, never reported verified', timedOut.every(r => r.drifted && r.unchecked === 1) &&
+    facts(shared).every(f => f.state === 'needs_review' && f.last_verified_at === DAY_AGO), JSON.stringify(facts(shared)));
+
+  reset(shared);
+  const healthy = parser(null);
+  rstore.verify(shared, new AstRefreshScope({ updateFile: healthy.updateFile }));
+  check('a working parser is still asked once for the shared file', healthy.calls.length === 1, JSON.stringify(healthy.calls));
+  check('facts it confirms are verified now', facts(shared).every(f => f.state === 'active' && f.last_verified_at > DAY_AGO),
+    JSON.stringify(facts(shared)));
+
+  const spread = ['src/a.js', 'src/b.js', 'src/c.js'].flatMap(rel => anchored(rel, 2));
+  ['src/a.js', 'src/b.js', 'src/c.js'].forEach(edit);
+  const missing = parser('binary_missing');
+  rstore.verify(spread, new AstRefreshScope({ updateFile: missing.updateFile }));
+  check('a missing parser is tried once across several anchor files', missing.calls.length === 1, JSON.stringify(missing.calls));
+  check('none of their facts count as verified', facts(spread).every(f => f.state === 'needs_review' && f.last_verified_at === DAY_AGO));
+
+  reset(spread);
+  const broken = parser('parse');
+  rstore.verify(spread, new AstRefreshScope({ updateFile: broken.updateFile }));
+  check('a file-specific failure still lets other files refresh, each once',
+    JSON.stringify(broken.calls.map(c => c.path)) === '["src/a.js","src/b.js","src/c.js"]', JSON.stringify(broken.calls));
+
+  reset(spread);
+  let now = 1000;
+  const late = parser(null);
+  const deadline = new AstRefreshScope({ deadlineAtMs: 1500, clock: () => now, updateFile: late.updateFile });
+  const first = deadline.refresh(sdb, root, 'src/a.js');
+  now = 1600;
+  const second = deadline.refresh(sdb, root, 'src/b.js');
+  check('a refresh near the deadline gets only the time left', first === true && late.calls[0]?.timeoutMs === 500, JSON.stringify(late.calls));
+  check('nothing starts after the deadline', second === false && late.calls.length === 1, JSON.stringify(late.calls));
+
+  const skipped = parser(null);
+  const unreadable = new AstRefreshScope({ unreadablePaths: ['src'], updateFile: skipped.updateFile });
+  check('paths the last sync could not read are not retried',
+    unreadable.refresh(sdb, root, 'src/c.js') === false && skipped.calls.length === 0, JSON.stringify(skipped.calls));
+
+  // Unchanged file evidence alone used to count as verification even when
+  // the symbol evidence beside it could not be re-checked.
+  const [stale] = anchored('src/stale.js', 1);
+  sdb.prepare(`UPDATE ast_files SET size = size + 1 WHERE path = 'src/stale.js'`).run();
+  const down = parser('timeout');
+  const [result] = rstore.verify([stale], new AstRefreshScope({ updateFile: down.updateFile }));
+  check('unchecked symbol evidence keeps an otherwise unchanged fact from being verified',
+    result.unchecked === 1 && !result.drifted && facts([stale])[0].state === 'active' &&
+    facts([stale])[0].last_verified_at === DAY_AGO, JSON.stringify({ result, fact: facts([stale])[0] }));
+
+  sdb.close();
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

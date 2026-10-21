@@ -22,7 +22,8 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::types::Type;
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -34,6 +35,9 @@ use crate::parser::{
 };
 use crate::resolve::{Probes, Resolver};
 use crate::walker::{FileFailure, WalkedFile, confine, walk_file, walk_workspace};
+
+/// How long a connection waits for another writer's lock before failing.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The `ast_*` schema, identical to workspace migrations v3 and v4 in
 /// `migrate.js` so either side can create it first.
@@ -212,7 +216,7 @@ enum Outcome {
 pub fn open_database(db_path: &Path) -> Result<Connection, AstError> {
     let conn = Connection::open(db_path)
         .map_err(|e| AstError::database("opening the workspace database", e))?;
-    conn.busy_timeout(Duration::from_secs(5))
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
         .map_err(|e| AstError::database("setting busy_timeout", e))?;
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
         .map_err(|e| AstError::database("enabling WAL", e))?;
@@ -488,30 +492,44 @@ pub fn update_single_file(
 /// `conn`: an open workspace database. `path`: the workspace-relative file.
 ///
 /// # Errors
-/// `AstError::Database` when the query fails.
+/// `AstError::Database` when the query fails or a stored row is corrupt:
+/// `params_json` that is not a parameter list, or a line span that is not
+/// positive and ordered. A corrupt row is never repaired with made-up
+/// values, because the diff built from it would report them as real.
 pub fn load_symbols(conn: &Connection, path: &str) -> Result<Vec<SymbolSignature>, AstError> {
-    let context = "reading ast_symbols";
     let mut statement = conn
         .prepare_cached(
             "SELECT name, qualified_name, kind, is_public, start_line, end_line, params_json,
                     return_type, doc_summary, signature_text, signature_hash
              FROM ast_symbols WHERE path = ?1 ORDER BY id",
         )
-        .map_err(|e| AstError::database(context, e))?;
+        .map_err(|e| AstError::database("reading ast_symbols", e))?;
     let rows = statement
         .query_map([path], |row| {
+            let start_line = line_number(row, 4)?;
+            let end_line = line_number(row, 5)?;
+            if end_line < start_line {
+                let reversed = ReversedSpan {
+                    start_line,
+                    end_line,
+                };
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    Type::Integer,
+                    Box::new(reversed),
+                ));
+            }
             let params_json: String = row.get(6)?;
-            // A corrupt params column degrades to "no parameters" rather than
-            // failing the whole diff.
-            let params: Vec<ParamSignature> =
-                serde_json::from_str(&params_json).unwrap_or_default();
+            let params: Vec<ParamSignature> = serde_json::from_str(&params_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(e))
+            })?;
             Ok(SymbolSignature {
                 name: row.get(0)?,
                 qualified_name: row.get(1)?,
                 kind: row.get(2)?,
                 is_public: row.get::<_, i64>(3)? != 0,
-                start_line: row.get::<_, i64>(4)?.try_into().unwrap_or(0),
-                end_line: row.get::<_, i64>(5)?.try_into().unwrap_or(0),
+                start_line,
+                end_line,
                 params,
                 return_type: row.get(7)?,
                 doc_summary: row.get(8)?,
@@ -519,9 +537,27 @@ pub fn load_symbols(conn: &Connection, path: &str) -> Result<Vec<SymbolSignature
                 signature_hash: row.get(10)?,
             })
         })
-        .map_err(|e| AstError::database(context, e))?;
+        .map_err(|e| AstError::database("reading ast_symbols", e))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AstError::database(context, e))
+        .map_err(|e| AstError::database(&format!("decoding ast_symbols for {path}"), e))
+}
+
+/// A stored symbol whose last line precedes its first.
+#[derive(Debug, thiserror::Error)]
+#[error("end_line {end_line} precedes start_line {start_line}")]
+struct ReversedSpan {
+    start_line: usize,
+    end_line: usize,
+}
+
+/// Reads a stored 1-based line number, rejecting zero, negatives, and
+/// values a `usize` cannot hold.
+fn line_number(row: &Row<'_>, index: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(index)?;
+    usize::try_from(value)
+        .ok()
+        .filter(|line| *line >= 1)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
 fn load_file_states(conn: &Connection) -> Result<HashMap<String, FileState>, AstError> {
@@ -1143,6 +1179,73 @@ mod tests {
         assert_eq!((restored.failed, restored.removed), (0, 1));
         assert_eq!(fixture.footprint("sub/keep.js"), before);
         assert_eq!(fixture.footprint("other.py"), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn stored_symbols_round_trip_unchanged() {
+        let mut fixture = Fixture::new(FILES).unwrap();
+        fixture.index();
+        let source = std::fs::read(fixture.root().join("a.js")).unwrap();
+
+        let actual = load_symbols(&fixture.conn, "a.js").unwrap();
+        let expected = parse_unlinked("a.js", &source).unwrap().0.symbols;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn corrupt_symbol_rows_fail_the_update_and_leave_every_row_alone() {
+        // Every stored value, quoted, so a REAL line number still prints.
+        let dump = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT quote(path) || quote(qualified_name) || quote(start_line)
+                        || quote(end_line) || quote(params_json) FROM ast_symbols ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        let fixture = [
+            ("params_json", "'invalid-json'"),
+            ("params_json", r#"'{"name": "x"}'"#),
+            ("start_line", "-1"),
+            ("start_line", "0"),
+            ("end_line", "0"),
+            ("start_line", "end_line + 1"),
+            ("end_line", "9223372036854775808"),
+        ];
+        for (column, value) in fixture {
+            let mut workspace = Fixture::new(FILES).unwrap();
+            workspace.index();
+            workspace
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE ast_symbols SET {column} = {value} WHERE qualified_name = 'alpha'"
+                    ),
+                    [],
+                )
+                .unwrap();
+            let stored = dump(&workspace.conn);
+            workspace
+                .write(
+                    "a.js",
+                    "export function alpha(x, y) { return beta(x); }\nfunction beta(y) { return y; }\n",
+                )
+                .unwrap();
+
+            let error = workspace.update("a.js").unwrap_err();
+            let actual = (
+                error.code(),
+                error
+                    .to_string()
+                    .starts_with("database error while decoding ast_symbols for a.js: "),
+                dump(&workspace.conn),
+            );
+            let expected = ("database", true, stored);
+            assert_eq!(actual, expected, "{column} = {value}: {error}");
+        }
     }
 
     #[cfg(unix)]
