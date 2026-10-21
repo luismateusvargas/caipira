@@ -10,7 +10,7 @@
 // plants a premise the model then reasons from. So the gate returns nothing
 // unless it is reasonably sure, and never returns a ranked-best-of-N.
 
-const { FactStore } = require('./facts');
+const { FactStore, trustScore } = require('./facts');
 const { compress, expand, termForms, buildOrMatch } = require('./compress');
 
 // Injecting the top N of anything guarantees noise on an unrelated prompt.
@@ -125,7 +125,7 @@ function selectFacts(db, prompt, opts = {}) {
     if (coverage < MIN_COVERAGE) continue;
 
     const evidence = store.checkEvidence(fact.id);
-    const trust = require('./facts').trustScore(fact, evidence);
+    const trust = trustScore(fact, evidence);
     if (trust < MIN_TRUST) continue;
     const score = coverage * trust;
 

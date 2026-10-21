@@ -61,11 +61,13 @@ function hybridRank(items, alpha) {
   const b = bounds(items, 'bm25');
   const c = bounds(items, 'cosine');
   return items.map(x => {
-    // A lone or tied keyword hit is a full match, not the bottom of a range.
+    // A lone or tied hit is a full match, not the bottom of a range.
     const bn = x.bm25 == null ? 0
       : b.max === b.min ? (b.max > 0 ? 1 : 0)
       : (x.bm25 - b.min) / (b.max - b.min);
-    const cn = x.cosine == null ? 0 : (x.cosine - c.min) / (c.max - c.min || 1);
+    const cn = x.cosine == null ? 0
+      : c.max === c.min ? (c.max > 0 ? 1 : 0)
+      : (x.cosine - c.min) / (c.max - c.min);
     return { id: x.id, score: alpha * bn + (1 - alpha) * cn };
   }).sort((a, b) => b.score - a.score);
 }

@@ -164,9 +164,11 @@ r = caipira('doctor');
 check('workspace databases verified', /\[ok\] +2 workspace database\(s\) open/.test(r.out), r.out);
 check('missing Codex config is a warning', /\[warn\] Codex config\.toml not found/.test(r.out) && !/\[FAIL\] Codex/.test(r.out), r.out);
 
-console.log('\n4. caipira.cmd never leaks CAIPIRA_HOME into the child');
+console.log('\n4. launchers never leak CAIPIRA_HOME into the child');
 const cmd = fs.readFileSync(path.join(ROOT, 'caipira.cmd'), 'utf8');
+const sh = fs.readFileSync(path.join(ROOT, 'caipira.sh'), 'utf8');
 check('caipira.cmd does not set CAIPIRA_HOME', !/CAIPIRA_HOME/.test(cmd), cmd);
+check('caipira.sh does not set CAIPIRA_HOME', !/CAIPIRA_HOME/.test(sh), sh);
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

@@ -206,10 +206,15 @@ memory.putEmbedding(onlyId, 'probe', vec);
 const embedder = { model: 'probe', dim: 3, embed: async () => vec };
 
 (async () => {
-  let hits = [], searchError = null;
-  try { hits = await memory.search('registry', 5, embedder); } catch (error) { searchError = error; }
-  check('a single hybrid hit scores above zero', hits.length === 1 && hits[0].score > 0,
+  let hits = [], semanticHits = [], searchError = null;
+  try {
+    hits = await memory.search('registry', 5, embedder);
+    semanticHits = await memory.search('unindexed-synonym', 5, embedder);
+  } catch (error) { searchError = error; }
+  check('a single hybrid hit scores full weight', hits.length === 1 && hits[0].score === 1,
     searchError ? searchError.message : JSON.stringify(hits));
+  check('a single semantic-only hit scores above zero', semanticHits.length === 1 && semanticHits[0].score > 0,
+    searchError ? searchError.message : JSON.stringify(semanticHits));
   memory.close();
 
   fs.rmSync(tmp, { recursive: true, force: true });

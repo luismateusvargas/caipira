@@ -7,12 +7,16 @@
 
 // ── shared ──
 
+/** @typedef {{version: number, up: (db: import('better-sqlite3').Database) => void}} Migration */
+
+/** @param {import('better-sqlite3').Database} db @returns {number} */
 function currentVersion(db) {
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)');
   const row = db.prepare('SELECT MAX(version) AS v FROM schema_version').get();
   return row && row.v !== null ? row.v : 0;
 }
 
+/** @param {import('better-sqlite3').Database} db @param {Migration[]} migrations @returns {{from: number, to: number, applied: number[]}} */
 function migrate(db, migrations) {
   const from = currentVersion(db);
   const pending = migrations.filter(m => m.version > from).sort((a, b) => a.version - b.version);
