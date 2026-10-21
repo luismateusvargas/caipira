@@ -6,6 +6,7 @@
 //   Linux:   ./node22/node-v22.20.0-linux-x64/bin/node install.js  (caipira.sh)
 //
 // Commands: install | uninstall | status | doctor | prune [--apply] | mode <lite|full|ultra>
+//           explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]
 
 const fs = require('fs');
 const os = require('os');
@@ -21,6 +22,9 @@ const NPM_CLI = IS_WINDOWS
   ? path.join(NODE_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js')
   : path.join(NODE_DIR, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
 const MCP_ENTRY = path.join(ROOT, 'mcp.js');
+const EXPLORE_SERVER = path.join(ROOT, 'explore-server.js');
+const EXPLORE_UI_DIR = path.join(ROOT, 'explore-ui');
+const EXPLORE_DIST = path.join(EXPLORE_UI_DIR, 'dist');
 const HOOK_ENTRY = path.join(ROOT, 'hooks', 'universal-hook.js');
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
@@ -143,6 +147,62 @@ function buildAstEngine() {
     return;
   }
   ok(`caipira-ast installed at ${INSTALLED_BIN}`);
+}
+
+// The explorer UI is optional like the AST engine: when its first npm
+// install has no network, or the build fails, `caipira explore` still serves
+// the API and says the UI is missing.
+function buildExploreUi() {
+  if (!fs.existsSync(path.join(EXPLORE_UI_DIR, 'package.json'))) {
+    warn('explore-ui not found — caipira explore will serve the API only');
+    return;
+  }
+  // npm scripts resolve `node` from PATH; put the bundled runtime first.
+  const env = { ...process.env, PATH: `${path.dirname(NODE_BIN)}${path.delimiter}${process.env.PATH || ''}` };
+  try {
+    if (!fs.existsSync(path.join(EXPLORE_UI_DIR, 'node_modules', 'vite', 'package.json'))) {
+      log('  installing explore-ui dependencies with bundled Node 22...');
+      execFileSync(NODE_BIN, [NPM_CLI, 'ci', '--no-audit', '--no-fund'], { cwd: EXPLORE_UI_DIR, stdio: 'inherit', env });
+    }
+    log('  building explore-ui (vite build)...');
+    execFileSync(NODE_BIN, [NPM_CLI, 'run', 'build'], { cwd: EXPLORE_UI_DIR, stdio: 'inherit', env });
+  } catch (error) {
+    warn(`explore-ui build failed — ${error.message}`);
+    return;
+  }
+  ok(`explore UI built at ${EXPLORE_DIST}`);
+  deployExplore();
+}
+
+function realPath(target) {
+  try { return fs.realpathSync(target); } catch { return path.resolve(target); }
+}
+
+// Installing from a checkout copies the explorer into the Caipira home;
+// installing from the home itself has nothing to copy. The bundle is staged
+// and renamed into place, so a running server never serves half of it.
+function deployExplore() {
+  const { ROOT: HOME_DIR } = require('./workspace');
+  if (realPath(HOME_DIR) === realPath(ROOT)) return;
+  const targetDist = path.join(HOME_DIR, 'explore-ui', 'dist');
+  const staging = `${targetDist}.caipira-tmp`;
+  const serverTmp = path.join(HOME_DIR, 'explore-server.js.caipira-tmp');
+  try {
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(targetDist), { recursive: true });
+    fs.cpSync(EXPLORE_DIST, staging, { recursive: true });
+    fs.rmSync(targetDist, { recursive: true, force: true });
+    fs.renameSync(staging, targetDist);
+    fs.copyFileSync(EXPLORE_SERVER, serverTmp);
+    fs.renameSync(serverTmp, path.join(HOME_DIR, 'explore-server.js'));
+  } catch (error) {
+    for (const leftover of [staging, serverTmp]) {
+      try { fs.rmSync(leftover, { recursive: true, force: true }); } catch {}
+    }
+    warn(`explore server and UI could not be copied to ${HOME_DIR} — ${error.message}`);
+    return;
+  }
+  ok(`explore server and UI copied to ${HOME_DIR}`);
 }
 
 function ensureDirectories() {
@@ -504,6 +564,8 @@ function doctor() {
   } catch {
     warn('caipira-ast not built — AST symbol index unavailable (run: caipira install with cargo on PATH)');
   }
+  if (fs.existsSync(path.join(EXPLORE_DIST, 'index.html'))) ok(`explore UI at ${EXPLORE_DIST}`);
+  else warn('explore UI not built — caipira explore serves the API only (run: caipira install)');
 
   try {
     const { openMaster } = require('./workspace');
@@ -662,6 +724,7 @@ function install() {
   log('\nInstalling Caipira\n');
   installDependencies();
   buildAstEngine();
+  buildExploreUi();
   ensureDirectories();
   registerMcpServer();
   registerHooks();
@@ -679,11 +742,16 @@ const commands = {
   doctor,
   prune,
   status,
-  mode: () => setMode(process.argv[3] || currentMode())
+  mode: () => setMode(process.argv[3] || currentMode()),
+  // caipira.sh starts explore-server.js directly; this serves caipira.cmd.
+  explore: () => require('./explore-server').main(process.argv.slice(3)).catch(error => {
+    fail(`caipira explore — ${error.message}`);
+    process.exitCode = 1;
+  })
 };
 
 if (!commands[command]) {
-  log(`Usage: caipira <install|uninstall|doctor|prune [--apply]|status|mode <lite|full|ultra>>`);
+  log(`Usage: caipira <install|uninstall|doctor|prune [--apply]|status|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
   process.exitCode = 1;
 } else {
   commands[command]();

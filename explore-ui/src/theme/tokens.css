@@ -1,0 +1,135 @@
+/* Caipira Explore design tokens: dark gray surfaces, dark red accents. */
+:root {
+  /* Backgrounds */
+  --bg-canvas: #0d0e11;
+  --bg-panel: #14161b;
+  --bg-elevated: #1c1f26;
+  --bg-hover: #252932;
+
+  /* Borders */
+  --border-subtle: #262a34;
+  --border-crimson: #5c191d;
+
+  /* Dark red / crimson accents */
+  --accent-red-dark: #7f1d1d;
+  --accent-red-primary: #b91c1c;
+  --accent-red-bright: #dc2626;
+  --accent-red-glow: rgba(220, 38, 38, 0.28);
+  --accent-red-soft: #fca5a5;
+
+  /* Text */
+  --text-primary: #f3f4f6;
+  --text-secondary: #9ca3af;
+  --text-muted: #6b7280;
+
+  /* Supporting scale */
+  --slate-node: #334155;
+  --slate-edge: #3f4654;
+  --success-soft: #86efac;
+  --warning-soft: #fcd34d;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --shadow-panel: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --glow-crimson: 0 0 0 1px var(--border-crimson), 0 0 18px var(--accent-red-glow);
+  --focus-ring: 0 0 0 2px var(--bg-canvas), 0 0 0 4px var(--accent-red-bright);
+
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-mono);
+}
+
+a {
+  color: var(--accent-red-soft);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+::selection {
+  background: var(--accent-red-dark);
+  color: var(--text-primary);
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-crimson) var(--bg-panel);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-panel);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg-hover);
+  border: 2px solid var(--bg-panel);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-crimson);
+}
+
+/* Crimson glow used by drift alerts and the focused node. */
+@keyframes crimson-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--accent-red-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 6px var(--accent-red-glow);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

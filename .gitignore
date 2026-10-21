@@ -4,3 +4,4 @@ node22
 models/*
 experiments/*
 *.db*
+explore-ui/dist/

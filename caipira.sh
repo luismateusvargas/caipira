@@ -7,4 +7,10 @@ if [ ! -x "$CAIPIRA_NODE" ]; then
   echo "[caipira] bundled Node 22 runtime not found at \"$CAIPIRA_NODE\"." >&2
   exit 1
 fi
+case "$1" in
+  explore)
+    shift
+    exec "$CAIPIRA_NODE" "$CAIPIRA_DIR/explore-server.js" "$@"
+    ;;
+esac
 exec "$CAIPIRA_NODE" "$CAIPIRA_DIR/install.js" "$@"
