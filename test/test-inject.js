@@ -139,7 +139,7 @@ console.log('\n8. prompt recall flags changed evidence without verify');
   const id = factStore.record({ kind: 'decision', title: 'Dev server port',
     body: 'The dev server listens on port 3000.', summary: 'The dev server listens on port 3000.',
     evidence: [source] });
-  fs.writeFileSync(source, 'const PORT = 8080;\n');
+  fs.writeFileSync(source, 'const PORT = 18080;\n');
   const recalled = buildInjection(db, { root: ROOT }, {
     prompt: 'which port does the dev server use?', machine: machineId(), budget: 2000
   });
