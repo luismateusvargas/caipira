@@ -678,15 +678,21 @@ function factById(db, ws, id) {
 }
 
 // Re-reads the files a fact's symbols live in, so a reaffirmed or newly
-// anchored hash is the code as it is now. A missing engine leaves the stored
-// index as the best available answer.
+// anchored hash is the code as it is now. The stored index may predate the
+// source, so when the engine cannot re-read a file the request fails before
+// any fact is written rather than certify a stale signature.
 function refreshFiles(ws, relPaths) {
-  if (!ws.root) return;
-  for (const rel of new Set(relPaths)) {
+  const files = [...new Set(relPaths)];
+  if (files.length === 0) return;
+  if (!ws.root) throw new HttpError(409, 'workspace_has_no_root', 'this workspace has no root directory to re-read symbol evidence from');
+  for (const rel of files) {
     try {
       updateFileAst(ws.root, ws.dbFile, path.join(ws.root, rel), { timeoutMs: 5000 });
     } catch (error) {
       if (!(error instanceof AstEngineError)) throw error;
+      const status = error.code === 'binary_missing' || error.code === 'timeout' ? 503 : 502;
+      throw new HttpError(status, 'evidence_unverifiable',
+        `symbol evidence in ${rel} could not be re-read (${error.code}); no fact was changed — check caipira-ast (caipira install) and retry`);
     }
   }
 }
@@ -869,6 +875,15 @@ async function getSymbol(ctx, req, url, [rawId]) {
       const hit = row.symbol ? idAt.get(row.path, row.symbol, row.symbol, row.symbol) : null;
       return { ...row, symbol_id: hit ? hit.id : null };
     };
+    // An outgoing reference the parser left unresolved is linked exactly as
+    // the graph draws it, so a member call such as `store.add` points at the
+    // one method of that name and an ambiguous one stays unlinked.
+    let index = null;
+    const resolved = row => {
+      if (row.symbol_id !== null) return row;
+      index ??= symbolIndex(db.prepare(`${SYMBOL_ROW} ORDER BY path, start_line`).all());
+      return { ...row, symbol_id: index.resolve({ ...row, source_path: found.symbol.path }) };
+    };
     const facts = [...found.facts];
     if (ws.root) {
       const attached = new Set(facts.map(fact => fact.fact_id));
@@ -884,10 +899,10 @@ async function getSymbol(ctx, req, url, [rawId]) {
       symbol: { ...found.symbol, kind: displayKind(found.symbol) },
       language: found.file ? found.file.language : null,
       callers: found.callers.map(withId),
-      callees: found.callees,
-      uses_types: found.uses_types,
+      callees: found.callees.map(resolved),
+      uses_types: found.uses_types.map(resolved),
       used_by: found.used_by.map(withId),
-      inherits: found.inherits,
+      inherits: found.inherits.map(resolved),
       inherited_by: found.inherited_by.map(withId),
       facts: facts.map(fact => ({ fact_id: fact.fact_id, kind: fact.kind, title: fact.title, summary: fact.summary,
         state: fact.state, evidence_status: fact.evidence_status })),
@@ -962,7 +977,14 @@ async function patchFact(ctx, req, url, [rawId]) {
     }
     openFact(db, id);
     if (action === 'reaffirm') {
-      refreshFiles(ws, db.prepare('SELECT path FROM fact_symbol_evidence WHERE fact_id = ?').all(id).map(row => row.path));
+      const anchors = db.prepare('SELECT path, qualified_name FROM fact_symbol_evidence WHERE fact_id = ?').all(id);
+      refreshFiles(ws, anchors.map(row => row.path));
+      // A symbol that is gone has no signature to re-baseline to.
+      const exists = db.prepare('SELECT 1 FROM ast_symbols WHERE path = ? AND qualified_name = ? LIMIT 1');
+      const removed = anchors.find(row => !exists.get(row.path, row.qualified_name));
+      if (removed) {
+        throw new HttpError(409, 'symbol_changed', `${removed.path}::${removed.qualified_name} no longer exists — supersede or archive this fact instead`);
+      }
       store.reaffirm(id);
       return { fact: factById(db, ws, id), driftCount: driftCount(db) };
     }

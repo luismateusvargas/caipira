@@ -18,7 +18,7 @@ export interface FactFormProps {
   legend: string;
   /** Label of the submit button. */
   submitLabel: string;
-  /** Values to start from, for superseding an existing fact. */
+  /** Values to start from, for editing or superseding an existing fact. */
   initial?: Partial<FactDraft> | undefined;
   /** Shown above the fields, such as what the fact will be anchored to. */
   note?: string | undefined;
@@ -27,7 +27,7 @@ export interface FactFormProps {
   onCancel: () => void;
 }
 
-/** A form for recording or superseding a fact. */
+/** A form for recording, editing or superseding a fact. */
 export function FactForm({ legend, submitLabel, initial, note, onSubmit, onCancel }: FactFormProps) {
   const id = useId();
   const [draft, setDraft] = useState<FactDraft>({

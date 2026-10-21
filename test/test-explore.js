@@ -3,7 +3,9 @@
 // inspection with bounded source, symbol search, fact creation, update,
 // supersede, archive and drift reaffirmation (checked in SQLite as well as
 // in the payloads), path confinement, the write guards, the static bundle,
-// and `caipira explore` started through caipira.sh.
+// member callees the inspector and graph resolve alike, fact writes refused
+// when symbol evidence cannot be re-read, and `caipira explore` started
+// through caipira.sh.
 //
 // Builds the crate first (debug profile) and points CAIPIRA_AST_BIN at it,
 // like test-ast, so the server indexes with the engine in this checkout.
@@ -126,10 +128,26 @@ syncWorkspaceAst(workspace.root, workspace.dbFile);
   db.close();
 }
 
-const symbolId = qualified => {
-  const db = openWorkspaceDb(workspace.dbFile);
-  try { return db.prepare('SELECT id FROM ast_symbols WHERE qualified_name = ?').get(qualified)?.id ?? null; } finally { db.close(); }
+const inDb = (ws, fn) => {
+  const db = openWorkspaceDb(ws.dbFile);
+  try { return fn(db); } finally { db.close(); }
 };
+const symbolIn = (ws, qualified) => inDb(ws, db => db.prepare('SELECT id FROM ast_symbols WHERE qualified_name = ?').get(qualified)?.id ?? null);
+const symbolId = qualified => symbolIn(workspace, qualified);
+
+// A further indexed workspace, marked explicitly so its root is the fixture
+// directory and nothing above it.
+function extraWorkspace(prefix, files) {
+  const root = tempDir(prefix);
+  fs.writeFileSync(path.join(root, '.caipira-workspace'), '');
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), text);
+  }
+  const ws = ensureWorkspace(root);
+  syncWorkspaceAst(ws.root, ws.dbFile);
+  return ws;
+}
 
 // A stand-in bundle, so static serving is tested without a vite build.
 const DIST = tempDir('explore-dist-');
@@ -438,11 +456,104 @@ async function main() {
     check('client routes fall back to the app shell', r.status === 200 && r.text.includes('explore-fixture'));
     r = await get('/assets/missing.js');
     check('a missing asset is 404', r.status === 404, r.text);
+
+    console.log('\n12. inspector callees resolve like graph edges');
+    {
+      const ws = extraWorkspace('explore-member-', {
+        'src/store.ts': 'export class Store { add(value: number): number { return value; } }\n'
+          + 'export function caller(store: Store, x: number): number { return store.add(x); }\n'
+      });
+      const q = `workspace=${ws.id}`;
+      const add = symbolIn(ws, 'Store.add');
+      const caller = symbolIn(ws, 'caller');
+      const callsFromCaller = graph => graph.edges.filter(e => e.kind === 'calls' && e.source === `symbol:${caller}`).map(e => e.target);
+      r = await get(`/api/graph?${q}`);
+      check('graph: store.add() calls the unique Store.add', r.status === 200 && callsFromCaller(r.json).join() === `symbol:${add}`, r.json && r.json.edges);
+      r = await get(`/api/symbol/${caller}?${q}`);
+      let callee = r.json && r.json.callees.find(c => c.target_symbol === 'store.add');
+      check('inspector: the same callee carries Store.add\'s id', r.status === 200 && callee && callee.target_path === null
+        && callee.symbol_id === add, r.json && r.json.callees);
+
+      // A second add() makes the member call ambiguous; neither view guesses.
+      fs.writeFileSync(path.join(ws.root, 'src/other.ts'), 'export class Other { add(value: string): string { return value; } }\n');
+      syncWorkspaceAst(ws.root, ws.dbFile);
+      r = await get(`/api/graph?${q}`);
+      check('graph: an ambiguous store.add() draws no call edge', r.status === 200 && callsFromCaller(r.json).length === 0, r.json && r.json.edges);
+      r = await get(`/api/symbol/${caller}?${q}`);
+      callee = r.json && r.json.callees.find(c => c.target_symbol === 'store.add');
+      check('inspector: an ambiguous callee stays unlinked', r.status === 200 && callee && callee.symbol_id === null, r.json && r.json.callees);
+    }
+
+    console.log('\n13. symbol evidence the engine cannot re-read is never certified');
+    {
+      const v1 = 'export class Store {\n  add(value: number): number {\n    return value;\n  }\n}\n';
+      const ws = extraWorkspace('explore-refresh-', { 'src/store.ts': v1 });
+      const q = `workspace=${ws.id}`;
+      const file = path.join(ws.root, 'src/store.ts');
+      const add = symbolIn(ws, 'Store.add');
+      const snapshot = id => inDb(ws, db => ({
+        fact: db.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(id),
+        files: db.prepare('SELECT path, sha256, size, mtime FROM fact_evidence WHERE fact_id = ? ORDER BY path').all(id),
+        anchors: db.prepare('SELECT path, qualified_name, signature_hash FROM fact_symbol_evidence WHERE fact_id = ?').all(id),
+        facts: db.prepare('SELECT id, state FROM facts ORDER BY id').all()
+      }));
+      const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+      r = await send('POST', `/api/facts?${q}`, { kind: 'constraint', title: 'add is an identity', body: 'add returns its argument.', evidenceSymbols: [add] });
+      const factId = r.json && r.json.fact.id;
+      check('a fact anchored to Store.add', r.status === 201 && r.json.fact.symbols[0].current === true, r.text);
+      fs.writeFileSync(file, v1.replace('add(value: number): number', 'add(value: string, extra: boolean = true): string'));
+      r = await get(`/api/facts?refresh=1&${q}`);
+      check('a changed signature needs review', r.json && r.json.facts.find(f => f.id === factId)?.state === 'needs_review', r.text);
+      const reindexed = symbolIn(ws, 'Store.add');
+
+      // The source changes again while the engine is gone: the index still
+      // holds the first change, so nothing may be certified against it.
+      fs.writeFileSync(file, v1.replace('add(value: number): number', 'add(value: boolean, extra: string = "changed"): boolean'));
+      const before = snapshot(factId);
+      const engine = process.env.CAIPIRA_AST_BIN;
+      process.env.CAIPIRA_AST_BIN = path.join(ws.root, 'no-such-caipira-ast');
+      try {
+        r = await send('PATCH', `/api/facts/${factId}?${q}`, { action: 'reaffirm' });
+        check('reaffirm without the engine is a recoverable 503', r.status === 503 && r.json.error.code === 'evidence_unverifiable', r.text);
+        check('SQLite: state, verified_at and evidence hashes untouched', same(snapshot(factId), before), { before, after: snapshot(factId) });
+        r = await send('POST', `/api/facts?${q}`, { kind: 'gotcha', title: 'add takes booleans', body: 'add takes a boolean now.', evidenceSymbols: [reindexed] });
+        check('creating a symbol fact without the engine is 503', r.status === 503 && r.json.error.code === 'evidence_unverifiable', r.text);
+        r = await send('PATCH', `/api/facts/${factId}?${q}`, { action: 'supersede', kind: 'constraint', title: 'add is generic', body: 'add returns what it is given.' });
+        check('superseding with inherited symbol evidence without the engine is 503', r.status === 503
+          && r.json.error.code === 'evidence_unverifiable', r.text);
+        check('SQLite: no fact recorded, the predecessor still needs review', same(snapshot(factId), before), snapshot(factId).facts);
+        r = await get(`/api/graph?${q}`);
+        const inspected = await get(`/api/symbol/${reindexed}?${q}`);
+        check('reading the graph and inspector still works without the engine', r.status === 200 && inspected.status === 200, inspected.text);
+      } finally {
+        process.env.CAIPIRA_AST_BIN = engine;
+      }
+
+      r = await send('PATCH', `/api/facts/${factId}?${q}`, { action: 'reaffirm' });
+      check('with the engine back, reaffirm certifies the current source', r.status === 200 && r.json.fact.state === 'active'
+        && r.json.fact.symbols[0].current === true, r.text);
+      inDb(ws, db => {
+        const indexed = db.prepare("SELECT signature_text, signature_hash FROM ast_symbols WHERE path = 'src/store.ts' AND qualified_name = 'Store.add'").get();
+        const anchor = db.prepare('SELECT signature_hash FROM fact_symbol_evidence WHERE fact_id = ?').get(factId);
+        const evidence = db.prepare('SELECT sha256 FROM fact_evidence WHERE fact_id = ? AND path = ?').get(factId, file);
+        check('SQLite: index, anchor and file hash describe the boolean signature', /value: boolean/.test(indexed.signature_text)
+          && anchor.signature_hash === indexed.signature_hash && evidence.sha256 === sha256(file), { indexed, anchor, evidence });
+      });
+
+      fs.writeFileSync(file, 'export class Store {\n  size(): number {\n    return 0;\n  }\n}\n');
+      r = await get(`/api/facts?refresh=1&${q}`);
+      check('removing the anchored symbol needs review', r.json && r.json.facts.find(f => f.id === factId)?.state === 'needs_review', r.text);
+      const gone = snapshot(factId);
+      r = await send('PATCH', `/api/facts/${factId}?${q}`, { action: 'reaffirm' });
+      check('reaffirming a removed symbol is 409', r.status === 409 && r.json.error.code === 'symbol_changed', r.text);
+      check('SQLite: the fact stays in review and unverified', same(snapshot(factId), gone), { gone, after: snapshot(factId) });
+    }
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
 
-  console.log('\n12. without a built UI the API still answers');
+  console.log('\n14. without a built UI the API still answers');
   {
     const bare = createExploreServer({ defaultWorkspace: WS, distDir: path.join(tempDir('explore-nodist-'), 'dist') });
     const port = await listen(bare);
@@ -472,7 +583,7 @@ async function main() {
     console.log('  skip explore-ui/dist not built (npm --prefix explore-ui run build)');
   }
 
-  console.log('\n13. command line');
+  console.log('\n15. command line');
   check('defaults: port 4777, host 127.0.0.1, browser opens', (() => {
     const opts = parseArgs([]);
     return opts.port === 4777 && opts.host === '127.0.0.1' && opts.open === true;

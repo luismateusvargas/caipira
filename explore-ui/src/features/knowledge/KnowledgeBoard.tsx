@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Archive, CircleCheck, GitBranchPlus, Plus, RefreshCw } from 'lucide-react';
+import { Archive, CircleCheck, GitBranchPlus, Pencil, Plus, RefreshCw } from 'lucide-react';
 import type { ExploreApi, FactAction } from '../../api/client';
 import { toApiError } from '../../api/client';
 import { FACT_CATEGORIES, isFactCategory } from '../../api/schemas';
@@ -27,7 +27,10 @@ export interface KnowledgeBoardProps {
   anchor: FactAnchor | null;
   /** Selects a node (`file:…`, `symbol:…`, `fact:…`) in the graph. */
   onJumpTo: (nodeId: string) => void;
-  /** Called after any fact was created, reaffirmed, superseded or archived. */
+  /**
+   * Called after any fact was created, edited, reaffirmed, superseded or
+   * archived, and after an explicit drift re-check, which rewrites drift state.
+   */
   onFactsChanged: () => void;
 }
 
@@ -57,6 +60,7 @@ export function KnowledgeBoard({ api, workspaceId, revision, highlightFactId, an
   const [text, setText] = useState('');
   const [creating, setCreating] = useState(false);
   const [anchorNew, setAnchorNew] = useState(true);
+  const [editing, setEditing] = useState<number | null>(null);
   const [superseding, setSuperseding] = useState<number | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<number | null>(null);
   const [mutation, setMutation] = useState<Mutation>({ status: 'idle' });
@@ -64,14 +68,24 @@ export function KnowledgeBoard({ api, workspaceId, revision, highlightFactId, an
 
   const { state, refreshing, reload } = useRequest(
     `facts:${workspaceId}:${category}:${stateFilter}`,
-    signal => {
+    async signal => {
       const refresh = recheckRef.current;
       recheckRef.current = false;
-      return api.listFacts({
-        workspaceId, refresh,
-        category: category === 'all' ? undefined : category,
-        state: stateFilter
-      }, signal);
+      try {
+        const data = await api.listFacts({
+          workspaceId, refresh,
+          category: category === 'all' ? undefined : category,
+          state: stateFilter
+        }, signal);
+        // Only the explicit re-check tells the app: the reload that follows
+        // is an ordinary one, so the two cannot keep triggering each other.
+        if (refresh) onFactsChanged();
+        return data;
+      } catch (error) {
+        // A re-check that did not finish runs again on the next load, Retry included.
+        if (refresh) recheckRef.current = true;
+        throw error;
+      }
     },
     { revision }
   );
@@ -94,6 +108,7 @@ export function KnowledgeBoard({ api, workspaceId, revision, highlightFactId, an
     try {
       await api.updateFact(workspaceId, fact.id, change);
       setMutation({ status: 'idle' });
+      setEditing(null);
       setSuperseding(null);
       setConfirmArchive(null);
       reload();
@@ -196,11 +211,17 @@ export function KnowledgeBoard({ api, workspaceId, revision, highlightFactId, an
               highlighted={fact.id === highlightFactId}
               busy={mutation.status === 'pending' && mutation.factId === fact.id}
               error={mutation.status === 'error' && mutation.factId === fact.id ? mutation.message : null}
+              editing={editing === fact.id}
               superseding={superseding === fact.id}
               confirmingArchive={confirmArchive === fact.id}
               onJumpTo={onJumpTo}
               onReaffirm={() => void mutate(fact, { action: 'reaffirm' }).catch(() => undefined)}
-              onStartSupersede={() => setSuperseding(fact.id)}
+              onStartEdit={() => { setSuperseding(null); setEditing(fact.id); }}
+              onCancelEdit={() => setEditing(null)}
+              onEdit={draft => mutate(fact, {
+                action: 'update', kind: draft.kind, title: draft.title, body: draft.body, summary: draft.summary || draft.title
+              })}
+              onStartSupersede={() => { setEditing(null); setSuperseding(fact.id); }}
               onCancelSupersede={() => setSuperseding(null)}
               onSupersede={draft => mutate(fact, {
                 action: 'supersede', kind: draft.kind, title: draft.title, body: draft.body, summary: draft.summary || undefined
@@ -223,18 +244,26 @@ interface FactCardProps {
   highlighted: boolean;
   busy: boolean;
   error: string | null;
+  editing: boolean;
   superseding: boolean;
   confirmingArchive: boolean;
   onJumpTo: (nodeId: string) => void;
   onReaffirm: () => void;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onEdit: (draft: FactDraft) => Promise<void>;
   onStartSupersede: () => void;
   onCancelSupersede: () => void;
   onSupersede: (draft: FactDraft) => Promise<void>;
   onArchive: () => void;
 }
 
-function FactCard({ domId, fact, highlighted, busy, error, superseding, confirmingArchive, onJumpTo, onReaffirm, onStartSupersede, onCancelSupersede, onSupersede, onArchive }: FactCardProps) {
+function FactCard({
+  domId, fact, highlighted, busy, error, editing, superseding, confirmingArchive,
+  onJumpTo, onReaffirm, onStartEdit, onCancelEdit, onEdit, onStartSupersede, onCancelSupersede, onSupersede, onArchive
+}: FactCardProps) {
   const open = fact.state === 'active' || fact.state === 'needs_review' || fact.state === 'proposed';
+  const initial = { kind: fact.kind, title: fact.title, body: fact.body, summary: fact.summary === fact.title ? '' : fact.summary };
   const trust = Math.round(fact.trust * 100);
   const classes = ['fact-card', fact.drifted ? 'fact-card--drifted' : '', highlighted ? 'fact-card--highlighted' : '', open ? '' : 'fact-card--closed'];
   return (
@@ -300,7 +329,12 @@ function FactCard({ domId, fact, highlighted, busy, error, superseding, confirmi
               <CircleCheck size={13} aria-hidden="true" /> Reaffirm<span className="visually-hidden"> {fact.title}</span>
             </button>
           )}
-          {open && !superseding && (
+          {open && !editing && !superseding && (
+            <button type="button" className="button button--small button--ghost" disabled={busy} onClick={onStartEdit}>
+              <Pencil size={13} aria-hidden="true" /> Edit<span className="visually-hidden"> {fact.title}</span>
+            </button>
+          )}
+          {open && !editing && !superseding && (
             <button type="button" className="button button--small button--ghost" disabled={busy} onClick={onStartSupersede}>
               <GitBranchPlus size={13} aria-hidden="true" /> Supersede<span className="visually-hidden"> {fact.title}</span>
             </button>
@@ -313,12 +347,22 @@ function FactCard({ domId, fact, highlighted, busy, error, superseding, confirmi
           )}
         </div>
 
+        {editing && (
+          <FactForm
+            legend={`Edit fact ${fact.id}`}
+            submitLabel="Save changes"
+            note="Corrects this fact in place; its evidence, state and history stay as they are."
+            initial={initial}
+            onSubmit={onEdit}
+            onCancel={onCancelEdit}
+          />
+        )}
         {superseding && (
           <FactForm
             legend={`Supersede fact ${fact.id}`}
             submitLabel="Record replacement"
             note="The replacement keeps this fact's evidence; this fact is kept as history and marked superseded."
-            initial={{ kind: fact.kind, title: fact.title, body: fact.body, summary: fact.summary === fact.title ? '' : fact.summary }}
+            initial={initial}
             onSubmit={onSupersede}
             onCancel={onCancelSupersede}
           />

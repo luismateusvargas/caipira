@@ -77,6 +77,25 @@ describe('SymbolInspectorDrawer', () => {
     expect(within(receives).queryByRole('button', { name: 'boolean' })).toBeNull();
   });
 
+  it('links a member callee the server resolved and leaves an ambiguous one static', async () => {
+    const raw = {
+      ...RAW_SYMBOL_DETAIL,
+      callees: [
+        { target_path: null, target_symbol: 'store.add', edge_kind: 'calls', line: 2, symbol_id: 11 },
+        { target_path: null, target_symbol: 'other.remove', edge_kind: 'calls', line: 3, symbol_id: null }
+      ]
+    };
+    const api = fakeApi({ getSymbol: vi.fn(async () => symbolDetailSchema.parse(raw)) });
+    const props = renderDrawer(api);
+
+    const callees = await screen.findByRole('list', { name: 'Callees' });
+    fireEvent.click(within(callees).getByRole('button', { name: 'store.add' }));
+
+    expect(props.onSelectSymbol.mock.calls).toEqual([[11]]);
+    expect(within(callees).getByText('other.remove')).toBeTruthy();
+    expect(within(callees).queryByRole('button', { name: 'other.remove' })).toBeNull();
+  });
+
   it('toggles the blast radius focus', async () => {
     const api = fakeApi();
     const props = renderDrawer(api);

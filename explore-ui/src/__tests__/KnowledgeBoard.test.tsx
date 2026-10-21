@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { KnowledgeBoard } from '../features/knowledge/KnowledgeBoard';
 import type { KnowledgeBoardProps } from '../features/knowledge/KnowledgeBoard';
+import { ApiError } from '../api/client';
 import type { ExploreApi } from '../api/client';
-import { fakeApi } from './fixtures';
+import { factListSchema } from '../api/schemas';
+import { RAW_FACTS, fakeApi } from './fixtures';
 
 afterEach(cleanup);
 
@@ -84,6 +86,75 @@ describe('KnowledgeBoard', () => {
     await waitFor(() => expect(api.updateFact).toHaveBeenCalledWith(1, 42, {
       action: 'supersede', kind: 'decision', title: 'Users live in SQLite', body: 'No database for users yet.', summary: undefined
     }));
+  });
+
+  it('edits a fact in place with a prefilled form', async () => {
+    const before = factListSchema.parse(RAW_FACTS);
+    const after = { ...before, facts: before.facts.map(fact => (fact.id === 42 ? { ...fact, title: 'Users live in SQLite', summary: 'Users live in SQLite' } : fact)) };
+    const listFacts = vi.fn<ExploreApi['listFacts']>().mockResolvedValueOnce(before).mockResolvedValue(after);
+    const api = fakeApi({ listFacts });
+    const props = renderBoard(api);
+
+    const fact = await card('Users live in memory');
+    fireEvent.click(within(fact).getByRole('button', { name: /^Edit/ }));
+    const form = within(fact).getByRole('form', { name: 'Edit fact 42' });
+    expect(within(form).getByLabelText<HTMLSelectElement>('Kind').value).toBe('decision');
+    expect(within(form).getByLabelText<HTMLInputElement>('Title').value).toBe('Users live in memory');
+    expect(within(form).getByLabelText<HTMLTextAreaElement>('Body').value).toBe('No database for users yet.');
+    expect(within(fact).queryByRole('button', { name: /Supersede/ })).toBeNull();
+    fireEvent.change(within(form).getByLabelText('Title'), { target: { value: 'Users live in SQLite' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => expect(props.onFactsChanged).toHaveBeenCalledTimes(1));
+    expect(api.updateFact).toHaveBeenCalledTimes(1);
+    expect(api.updateFact).toHaveBeenCalledWith(1, 42, {
+      action: 'update', kind: 'decision', title: 'Users live in SQLite', body: 'No database for users yet.', summary: 'Users live in SQLite'
+    });
+    expect(api.createFact).not.toHaveBeenCalled();
+    const edited = await card('Users live in SQLite');
+    expect(within(edited).getByRole('button', { name: 'Show fact 42 in the graph' })).toBeTruthy();
+    expect(within(edited).queryByRole('form')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Users live in memory' })).toBeNull();
+  });
+
+  it('cancels an edit without saving it', async () => {
+    const api = fakeApi();
+    const props = renderBoard(api);
+
+    const fact = await card('Users live in memory');
+    fireEvent.click(within(fact).getByRole('button', { name: /^Edit/ }));
+    let form = within(fact).getByRole('form', { name: 'Edit fact 42' });
+    fireEvent.change(within(form).getByLabelText('Title'), { target: { value: 'Discard me' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Cancel' }));
+
+    expect(within(fact).queryByRole('form')).toBeNull();
+    expect(within(fact).getByRole('heading', { name: 'Users live in memory' })).toBeTruthy();
+    expect(api.updateFact).not.toHaveBeenCalled();
+    expect(props.onFactsChanged).not.toHaveBeenCalled();
+    fireEvent.click(within(fact).getByRole('button', { name: /^Edit/ }));
+    form = within(fact).getByRole('form', { name: 'Edit fact 42' });
+    expect(within(form).getByLabelText<HTMLInputElement>('Title').value).toBe('Users live in memory');
+  });
+
+  it('keeps the entered text when an edit fails', async () => {
+    const updateFact = vi.fn<ExploreApi['updateFact']>()
+      .mockRejectedValue(new ApiError('http', 'the workspace database is busy — retry shortly', 503, 'database_busy'));
+    const api = fakeApi({ updateFact });
+    const props = renderBoard(api);
+
+    const fact = await card('Users live in memory');
+    fireEvent.click(within(fact).getByRole('button', { name: /^Edit/ }));
+    const form = within(fact).getByRole('form', { name: 'Edit fact 42' });
+    fireEvent.change(within(form).getByLabelText('Title'), { target: { value: 'Users live in SQLite' } });
+    fireEvent.change(within(form).getByLabelText('Body'), { target: { value: 'Moved to SQLite.' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Save changes' }));
+
+    expect((await within(form).findByRole('alert')).textContent).toContain('the workspace database is busy');
+    expect(within(form).getByLabelText<HTMLInputElement>('Title').value).toBe('Users live in SQLite');
+    expect(within(form).getByLabelText<HTMLTextAreaElement>('Body').value).toBe('Moved to SQLite.');
+    expect(updateFact).toHaveBeenCalledWith(1, 42, expect.objectContaining({ action: 'update' }));
+    expect(props.onFactsChanged).not.toHaveBeenCalled();
+    expect(api.listFacts).toHaveBeenCalledTimes(1);
   });
 
   it('anchors a new fact to the graph selection', async () => {
