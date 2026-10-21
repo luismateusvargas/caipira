@@ -203,17 +203,92 @@ function buildStandingInjection(db, opts = {}) {
   }
 }
 
+// Plain code-unit order, as SQLite's default BINARY collation sorts paths, so
+// the map is byte-identical whatever locale the hook runs under.
+function compareText(a, b) {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+const symbolPlace = (a, b) => compareText(a.path, b.path) || a.start - b.start || compareText(a.qualified, b.qualified);
+
 /**
- * Builds bounded standing or prompt-specific recall with local evidence,
- * recent session digests, and a small symbol map.
+ * Renders the workspace's public symbol map within `room` characters.
+ *
+ * Session start pays for the map once, so prompt turns never repeat it and
+ * the conversation prefix stays cacheable. When the map outgrows its room,
+ * what survives is what the agent most likely needs: the active subpath,
+ * then the most depended-on symbols, then the shallowest files. Every kept
+ * symbol outranks every omitted one, and the kept lines are printed in
+ * (subpath, path, line) order so the same index always renders the same text.
+ * @param {object} db Open workspace database.
+ * @param {string} subpath Workspace-relative directory the session runs in, or ''.
+ * @param {number} room Characters available for the whole block.
+ * @returns {string|null} null when there are no public symbols or none fits.
+ */
+function selectWorkspaceSymbols(db, subpath, room) {
+  const rows = db.prepare(`SELECT path, name, qualified_name, kind, start_line, end_line
+    FROM ast_symbols WHERE is_public = 1`).all();
+  if (rows.length === 0) return null;
+
+  // Only resolved edges count: an unresolved target names a symbol without
+  // saying which file it lives in. Calls, type uses and inheritance point at
+  // a symbol; an import points at the whole file it loads.
+  const symbolFanIn = new Map();
+  for (const edge of db.prepare(`SELECT target_path, target_symbol, COUNT(*) AS n FROM ast_edges
+    WHERE target_path IS NOT NULL AND edge_kind != 'imports' GROUP BY target_path, target_symbol`).all()) {
+    symbolFanIn.set(`${edge.target_path}\0${edge.target_symbol}`, edge.n);
+  }
+  const fileFanIn = new Map(db.prepare(`SELECT target_path, COUNT(*) AS n FROM ast_edges
+    WHERE target_path IS NOT NULL AND edge_kind = 'imports' GROUP BY target_path`).all()
+    .map(edge => [edge.target_path, edge.n]));
+
+  const symbols = rows.map(row => ({
+    line: `- ${row.path}::${row.qualified_name} (${row.kind} L${row.start_line}-${row.end_line})`,
+    path: row.path,
+    start: row.start_line,
+    qualified: row.qualified_name,
+    local: subpath && (row.path === subpath || row.path.startsWith(`${subpath}/`)) ? 1 : 0,
+    fanIn: (symbolFanIn.get(`${row.path}\0${row.qualified_name}`) || 0)
+      + (row.name !== row.qualified_name ? symbolFanIn.get(`${row.path}\0${row.name}`) || 0 : 0)
+      + (fileFanIn.get(row.path) || 0),
+    depth: row.path.split('/').length - 1
+  }));
+  symbols.sort((a, b) => b.local - a.local || b.fanIn - a.fanIn || a.depth - b.depth || symbolPlace(a, b));
+
+  const header = 'Workspace symbols:';
+  const footer = omitted => `(... ${omitted} more public symbols omitted to fit budget; use workspace_symbols or inspect_symbol)`;
+  const whole = symbols.reduce((length, symbol) => length + 1 + symbol.line.length, header.length);
+  // No footer can be longer than the one omitting every symbol, so reserving
+  // its length keeps the real footer inside the room.
+  const limit = whole <= room ? room : room - 1 - footer(symbols.length).length;
+  const kept = [];
+  let used = header.length;
+  for (const symbol of symbols) {
+    if (used + 1 + symbol.line.length > limit) break;
+    used += 1 + symbol.line.length;
+    kept.push(symbol);
+  }
+  if (kept.length === 0) return null;
+
+  kept.sort((a, b) => b.local - a.local || symbolPlace(a, b));
+  const lines = [header, ...kept.map(symbol => symbol.line)];
+  if (kept.length < symbols.length) lines.push(footer(symbols.length - kept.length));
+  return lines.join('\n');
+}
+
+/**
+ * Builds bounded recall. Without a prompt (session start) it carries standing
+ * facts, recent session digests, and the public symbol map; with one it
+ * carries only the facts the prompt recalls, or nothing.
  * @param {object} db Open workspace database.
  * @param {{root: string}} workspace Resolved workspace.
  * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string}} [opts]
+ *   budget defaults to 2400 characters and is capped at 64000.
  * @returns {string|null}
  */
 function buildInjection(db, workspace, opts = {}) {
   try {
-    const budget = Math.max(0, Math.min(12000, Number.isInteger(opts.budget) ? opts.budget : 2400));
+    const budget = Math.max(0, Math.min(64000, Number.isInteger(opts.budget) ? opts.budget : 2400));
     if (!budget) return null;
     const relative = workspace && workspace.root && opts.cwd
       ? path.relative(workspace.root, opts.cwd).split(path.sep).join('/') : '';
@@ -222,6 +297,9 @@ function buildInjection(db, workspace, opts = {}) {
     if (opts.prompt) {
       facts = selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root })
         .map(row => ({ ...row.fact, score: row.score, stale: row.stale }));
+      // A prompt turn carries what the prompt recalled or nothing: repeating
+      // session context here would only break the cached prefix.
+      if (facts.length === 0) return null;
     } else {
       facts = db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
         ORDER BY updated_at DESC LIMIT 40`).all();
@@ -259,16 +337,14 @@ function buildInjection(db, workspace, opts = {}) {
         add(`- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`);
       }
     }
-    const sessions = db.prepare(`SELECT summary FROM sessions WHERE summary IS NOT NULL AND trim(summary) != ''
-      ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 2`).all();
-    if (sessions.length && add('Recent sessions:')) {
-      for (const session of sessions) add(`- ${session.summary}`);
-    }
-    const symbols = db.prepare(`SELECT path, qualified_name FROM ast_symbols WHERE is_public = 1
-      ORDER BY CASE WHEN ? != '' AND (path = ? OR path LIKE ?) THEN 0 ELSE 1 END,
-      path, start_line LIMIT 5`).all(subpath, subpath, `${subpath}/%`);
-    if (symbols.length && add('Workspace symbols:')) {
-      for (const symbol of symbols) add(`- ${symbol.path}::${symbol.qualified_name}`);
+    if (!opts.prompt) {
+      const sessions = db.prepare(`SELECT summary FROM sessions WHERE summary IS NOT NULL AND trim(summary) != ''
+        ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 2`).all();
+      if (sessions.length && add('Recent sessions:')) {
+        for (const session of sessions) add(`- ${session.summary}`);
+      }
+      const symbols = selectWorkspaceSymbols(db, subpath, budget - used - (blocks.length ? 1 : 0));
+      if (symbols) add(symbols);
     }
     return blocks.length ? blocks.join('\n') : null;
   } catch {
@@ -306,5 +382,5 @@ function buildDriftNotice(db, opts = {}) {
 
 module.exports = {
   buildPromptInjection, buildStandingInjection, buildInjection, buildDriftNotice, selectFacts, renderInjection,
-  coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS
+  selectWorkspaceSymbols, coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS
 };

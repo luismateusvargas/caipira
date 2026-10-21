@@ -20,6 +20,14 @@ function run(client, event, payload) {
   return JSON.parse(out.trim().split('\n').pop());
 }
 
+// Like run, with extra environment and the hook's stderr returned too.
+function runWith(client, event, payload, env) {
+  const child = require('child_process').spawnSync(NODE, [HOOK, '--client', client, '--event', event], {
+    input: JSON.stringify(payload), encoding: 'utf8', env: { ...process.env, ...env }
+  });
+  return { result: JSON.parse(child.stdout.trim().split('\n').pop()), stderr: child.stderr, status: child.status };
+}
+
 // Injection has nothing to recall in an isolated CAIPIRA_HOME, so the facts
 // these assertions expect are seeded rather than borrowed from live history.
 require('./fixtures').seedFacts(WS).db.close();
@@ -43,6 +51,10 @@ check('instructs acting on facts, not reconfirming them',
   /do not re-read/i.test(ctx) && ctx.includes('NEEDS REVIEW'));
 check('no blanket re-verification instruction', !/verify current source/i.test(ctx));
 check('adds standing facts', ctx.includes('Caipira standing facts'));
+check('adds the workspace symbol map', /^Workspace symbols:$/m.test(ctx) &&
+  /^- \S+::\S+ \(\w+ L\d+-\d+\)$/m.test(ctx), ctx.slice(-300));
+check('explains the session-start symbol map', ctx.includes('path::qualified_name (kind Lstart-end)') &&
+  /workspace_symbols only to search for private symbols/.test(ctx));
 
 console.log('\n2. Claude Code — UserPromptSubmit recalls on a relevant prompt');
 r = run('claude-code', 'UserPromptSubmit', {
@@ -53,6 +65,7 @@ ctx = r.hookSpecificOutput && r.hookSpecificOutput.additionalContext;
 check('injects recalled facts', Boolean(ctx) && ctx.includes('Caipira recalled'), JSON.stringify(r).slice(0, 140));
 check('names the codex decision', ctx.includes('cavemem'));
 check('does NOT repeat startup boilerplate', !ctx.includes('Madar is the global local AST'));
+check('does NOT repeat the symbol map or session digests', !ctx.includes('Workspace symbols:') && !ctx.includes('Recent sessions:'));
 
 console.log('\n3. Claude Code — UserPromptSubmit keeps unrelated facts out');
 r = run('claude-code', 'UserPromptSubmit', {
@@ -368,6 +381,144 @@ console.log('\n14. each Stop refreshes the digest and SessionEnd is idempotent')
   run('claude-code', 'SessionEnd', { session_id: 'hook-multiturn', cwd: dir });
   run('claude-code', 'SessionEnd', { session_id: 'hook-multiturn', cwd: dir });
   check('repeated SessionEnd leaves identical digest', sessionRow(info.dbFile, 'hook-multiturn').summary === finalDigest);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+function symbolWorkspace(prefix, names) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  fs.mkdirSync(path.join(dir, 'src'));
+  for (const name of names) {
+    fs.writeFileSync(path.join(dir, 'src', `${name}.js`),
+      `export function ${name}(value) { return value; }\nfunction hidden_${name}() { return 0; }\n`);
+  }
+  return dir;
+}
+
+function symbolCount(dbFile) {
+  const db = openWorkspaceDb(dbFile);
+  try { return db.prepare('SELECT COUNT(*) AS n FROM ast_symbols').get().n; }
+  finally { db.close(); }
+}
+
+const SYMBOL_LINE = /^- src\/\w+\.js::\w+ \(function L\d+-\d+\)$/gm;
+
+console.log('\n15. session start indexes the workspace and maps its symbols once');
+{
+  const names = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta'];
+  const dir = symbolWorkspace('hook-symbols-', names);
+  const info = ensureWorkspace(dir);
+  check('a fresh workspace starts unindexed', symbolCount(info.dbFile) === 0);
+
+  r = run('claude-code', 'SessionStart', { session_id: 'hook-symbols-1', cwd: dir });
+  ctx = r.hookSpecificOutput?.additionalContext || '';
+  check('SessionStart indexed the workspace', symbolCount(info.dbFile) >= names.length, symbolCount(info.dbFile));
+  check('SessionStart injects every public symbol with kind and span', (ctx.match(SYMBOL_LINE) || []).length === names.length &&
+    names.every(name => ctx.includes(`- src/${name}.js::${name} (function L1-1)`)), ctx.slice(-500));
+  check('private symbols stay out of the map', !ctx.includes('hidden_'));
+
+  // An edit made between sessions, with no PostToolUse to see it.
+  fs.writeFileSync(path.join(dir, 'src', 'omega.js'), 'export function omega(value) {\n  return value;\n}\n');
+  r = run('codex', 'SessionStart', { session_id: 'hook-symbols-2', cwd: dir });
+  ctx = r.hookSpecificOutput?.additionalContext || '';
+  check('the next SessionStart maps an externally added file', ctx.includes('- src/omega.js::omega (function L1-3)'), ctx.slice(-300));
+
+  run('claude-code', 'PostToolUse', { session_id: 'hook-symbols-1', cwd: dir,
+    tool_name: 'Read', tool_input: { file_path: path.join(dir, 'src', 'alpha.js') } });
+  run('claude-code', 'Stop', { session_id: 'hook-symbols-1', cwd: dir });
+  r = run('antigravity', 'pre-invocation', { conversationId: 'hook-symbols-agy', workspacePaths: [dir], invocationNum: 0 });
+  const opening = (r.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+  check('Antigravity first step carries the digest and the map', opening.includes('Recent sessions:') &&
+    opening.includes('Workspace symbols:') && opening.includes('src/omega.js::omega'), opening.slice(-300));
+
+  const unrelatedPrompt = 'add a dark mode toggle to the settings page';
+  r = run('claude-code', 'UserPromptSubmit', { session_id: 'hook-symbols-1', cwd: dir, prompt: unrelatedPrompt });
+  check('Claude Code unrelated prompt on an indexed workspace returns continue', JSON.stringify(r) === '{"continue":true}', JSON.stringify(r).slice(0, 200));
+  r = run('codex', 'UserPromptSubmit', { session_id: 'hook-symbols-2', cwd: dir, prompt: unrelatedPrompt });
+  check('Codex unrelated prompt returns {}', JSON.stringify(r) === '{}', JSON.stringify(r).slice(0, 200));
+  r = run('antigravity', 'pre-invocation', { conversationId: 'hook-symbols-agy', workspacePaths: [dir],
+    invocationNum: 1, prompt: unrelatedPrompt });
+  check('Antigravity later step with an unrelated prompt returns {}', JSON.stringify(r) === '{}', JSON.stringify(r).slice(0, 200));
+  r = run('claude-code', 'UserPromptSubmit', { session_id: 'hook-symbols-1', cwd: dir });
+  check('a prompt turn without a prompt injects nothing', JSON.stringify(r) === '{"continue":true}', JSON.stringify(r).slice(0, 200));
+
+  const db = openWorkspaceDb(info.dbFile);
+  new FactStore(db, { machine: machineId(), agent: 'test', root: dir }).record({
+    kind: 'decision', title: 'Webhook retry payloads',
+    summary: 'Webhook retry payloads are normalized by omega before delivery.',
+    body: 'omega normalizes webhook retry payloads before delivery.', evidence: [path.join(dir, 'package.json')]
+  });
+  db.close();
+  const relevantPrompt = 'how are webhook retry payloads normalized?';
+  r = run('claude-code', 'UserPromptSubmit', { session_id: 'hook-symbols-1', cwd: dir, prompt: relevantPrompt });
+  ctx = r.hookSpecificOutput?.additionalContext || '';
+  check('Claude Code relevant prompt recalls only the fact', ctx.includes('Caipira recalled facts:') && ctx.includes('Webhook retry') &&
+    !ctx.includes('Workspace symbols:') && !ctx.includes('Recent sessions:'), ctx.slice(0, 300));
+  r = run('antigravity', 'pre-invocation', { conversationId: 'hook-symbols-agy', workspacePaths: [dir],
+    invocationNum: 2, userPrompt: relevantPrompt });
+  const later = (r.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+  check('Antigravity later step recalls only the fact', later.includes('Caipira recalled facts:') &&
+    !later.includes('Workspace symbols:') && !later.includes('Recent sessions:') && !later.includes('standing facts'), later.slice(0, 300));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n16. Antigravity\'s first step adds prompt recall beyond the standing facts');
+{
+  const dir = symbolWorkspace('hook-first-step-', ['alpha']);
+  const info = ensureWorkspace(dir);
+  const db = openWorkspaceDb(info.dbFile);
+  const store = new FactStore(db, { machine: machineId(), agent: 'test', root: dir });
+  const evidence = [path.join(dir, 'package.json')];
+  // Recorded first and ranked last by kind, so the eight status facts fill
+  // the standing list and this one is left for the prompt to recall.
+  const hiddenId = store.record({ kind: 'decision', title: 'Webhook retry payloads',
+    summary: 'Webhook retry payloads are normalized before delivery.',
+    body: 'Webhook retry payloads are normalized before delivery.', evidence });
+  for (let i = 1; i <= 8; i++) {
+    store.record({ kind: 'status', title: `Release checklist item ${i}`,
+      summary: `Release checklist item ${i} is complete.`, body: `Release checklist item ${i} is complete.`, evidence });
+  }
+  db.close();
+  const tag = `[decision#${hiddenId}]`;
+  r = run('antigravity', 'pre-invocation', { conversationId: 'hook-first-step', workspacePaths: [dir],
+    invocationNum: 0, prompt: 'how are webhook retry payloads normalized?' });
+  let text = (r.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+  check('standing facts and the map open the conversation', text.includes('Caipira standing facts') &&
+    text.includes('Workspace symbols:'), text.slice(0, 200));
+  check('a fact only the prompt recalls is appended once', text.includes('Caipira recalled these established facts') &&
+    text.split(tag).length === 2, text.slice(-400));
+  r = run('antigravity', 'pre-invocation', { conversationId: 'hook-first-step', workspacePaths: [dir],
+    invocationNum: 0, prompt: 'is release checklist item 3 complete?' });
+  text = (r.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+  check('facts already standing are not repeated', !text.includes('Caipira recalled these established facts') &&
+    text.split('Release checklist item 3 ').length === 2, text.slice(-400));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n17. a missing, failing or slow caipira-ast never blocks session start');
+{
+  const dir = symbolWorkspace('hook-ast-down-', ['alpha']);
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-fake-ast-'));
+  const failing = path.join(fake, 'failing-ast');
+  fs.writeFileSync(failing, '#!/bin/sh\necho boom >&2\nexit 1\n', { mode: 0o755 });
+  const slow = path.join(fake, 'slow-ast');
+  fs.writeFileSync(slow, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  const cases = [
+    ['missing', path.join(fake, 'does-not-exist'), 'AST sync skipped: CAIPIRA_AST_BIN does not point at an executable'],
+    ['failing', failing, 'AST sync skipped: boom'],
+    ['timed out', slow, 'AST sync skipped: caipira-ast timed out']
+  ];
+  for (const [label, bin, message] of cases) {
+    const started = Date.now();
+    const { result, stderr, status } = runWith('claude-code', 'SessionStart',
+      { session_id: `hook-ast-down-${label}`, cwd: dir }, { CAIPIRA_AST_BIN: bin });
+    const text = result.hookSpecificOutput?.additionalContext || '';
+    check(`${label} caipira-ast: SessionStart still answers`, status === 0 &&
+      text.includes('shared local-first cross-agent memory') && text.includes('workspace_symbols'), JSON.stringify(result).slice(0, 160));
+    check(`${label} caipira-ast: logged to stderr`, stderr.includes(message), stderr);
+    if (label === 'timed out') check('the sync gives up after its 5 s timeout', Date.now() - started < 15000, Date.now() - started);
+  }
+  fs.rmSync(fake, { recursive: true, force: true });
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

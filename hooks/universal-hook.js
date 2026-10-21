@@ -6,9 +6,9 @@
 const path = require('path');
 const { MemoryStore } = require('../store');
 const { ensureWorkspace, machineId } = require('../workspace');
-const { buildInjection, buildDriftNotice } = require('../inject');
+const { buildInjection, buildDriftNotice, selectFacts, renderInjection } = require('../inject');
 const { FactStore } = require('../facts');
-const { updateFileAst } = require('../ast');
+const { syncWorkspaceAst, updateFileAst } = require('../ast');
 
 const EVENT_ALIASES = new Map([
   ['session-start', 'session-start'],
@@ -47,7 +47,11 @@ const CAIPIRA_STARTUP_INSTRUCTION = [
   'Do not end a session leaving something you had to work out sitting only in the transcript.'
 ].join(' ');
 
-const AST_STARTUP_INSTRUCTION = 'For code symbols, signatures, callers, and type connections, use Caipira workspace_symbols and inspect_symbol. Inspect cited source before editing.';
+const AST_STARTUP_INSTRUCTION = [
+  'The workspace\'s public symbol map is provided once at session start as `path::qualified_name (kind Lstart-end)` lines: use those line spans for direct ranged reads and pass the entries to inspect_symbol for signatures, callers, and type connections.',
+  'Use workspace_symbols only to search for private symbols or entries the map omitted.',
+  'Inspect cited source before editing.'
+].join(' ');
 
 function readArgument(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -147,42 +151,65 @@ function writeResult(result) {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
+// The symbol map injected at session start must describe the files as they
+// are now, including edits made outside any session. The sync is incremental,
+// but a missing, slow or failing parser only costs the map its freshness.
+function syncSessionAst(workspace) {
+  if (!workspace) return;
+  try {
+    syncWorkspaceAst(workspace.root, workspace.dbFile, { timeoutMs: 5000 });
+  } catch (error) {
+    process.stderr.write(`[caipira-hook] AST sync skipped: ${error.message}\n`);
+  }
+}
+
+// Antigravity's first step can carry the user's prompt as well. Only facts it
+// recalls beyond the standing ones already shown are worth a second block.
+function recallBeyondStanding(db, prompt, opts, standing) {
+  try {
+    return renderInjection(selectFacts(db, prompt, opts)
+      .filter(({ fact }) => !(standing || '').includes(`[${fact.kind}#${fact.id}]`)));
+  } catch {
+    return null;
+  }
+}
+
 // Recall the facts worth putting in front of the model for this event. Never
 // allowed to throw or to be slow: memory is an accelerant, and a hook that
 // fails must cost nothing but the recall it would have provided.
 function recallContext(db, event, payload, workspace) {
   if (!db) return null;
+  const starting = event === 'session-start' || (event === 'pre-invocation' && isFirstInvocation(payload));
+  if (!starting && event !== 'user-prompt-submit' && event !== 'pre-invocation') return null;
   try {
     const opts = { machine: machineId() };
-    const starting = event === 'session-start' || (event === 'pre-invocation' && isFirstInvocation(payload));
 
     // A git pull or another editor can move evidence between sessions with no
-    // PostToolUse to notice, so a new session re-checks every fact before
-    // anything is injected as settled.
-    if (starting) new FactStore(db, { ...opts, agent: 'hook', root: workspace?.root }).verify();
+    // PostToolUse to notice, so a new session re-indexes the workspace and
+    // re-checks every fact before anything is injected as settled.
+    if (starting) {
+      syncSessionAst(workspace);
+      new FactStore(db, { ...opts, agent: 'hook', root: workspace?.root }).verify();
+    }
 
     // Drift rides along with whatever else is being injected. It is appended
     // rather than gated on relevance: the fact that its evidence moved is
     // established, so the agent is told even when the prompt is unrelated.
     const drift = buildDriftNotice(db, opts);
     const prompt = payload.prompt || payload.userPrompt || '';
-    const recalled = buildInjection(db, workspace, {
-      ...opts, cwd: resolveWorkspace(payload) || workspace?.root,
-      budget: 2400, prompt: event === 'session-start' ? '' : prompt
-    });
+    const cwd = resolveWorkspace(payload) || workspace?.root;
 
-    if (event === 'user-prompt-submit') {
-      return [recalled, drift].filter(Boolean).join('\n\n') || null;
+    // Session context (standing facts, digests, the symbol map) opens the
+    // conversation once. Later turns carry only what their prompt recalls, so
+    // the cached conversation prefix stays put and an unrelated prompt adds
+    // nothing at all.
+    if (starting) {
+      const recalled = buildInjection(db, workspace, { ...opts, cwd, budget: 24000, prompt: '' });
+      const extra = prompt ? recallBeyondStanding(db, prompt, { ...opts, root: workspace?.root }, recalled) : null;
+      return [recalled, extra, drift].filter(Boolean).join('\n\n') || null;
     }
-    if (event === 'session-start') {
-      return [recalled, drift].filter(Boolean).join('\n\n') || null;
-    }
-    // Standing facts open the conversation; repeating them before every step
-    // would bury whatever the step actually recalled.
-    if (event === 'pre-invocation') {
-      return [starting ? recalled : prompt ? recalled : null, drift].filter(Boolean).join('\n\n') || null;
-    }
-    return null;
+    const recalled = prompt ? buildInjection(db, workspace, { ...opts, cwd, budget: 2400, prompt }) : null;
+    return [recalled, drift].filter(Boolean).join('\n\n') || null;
   } catch (error) {
     process.stderr.write(`[caipira-hook] recall skipped: ${error.message}\n`);
     return null;

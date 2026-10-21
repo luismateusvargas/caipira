@@ -124,7 +124,8 @@ db.prepare(`INSERT INTO ast_symbols (path, name, qualified_name, kind, is_public
 const recall = buildInjection(db, { root: ROOT }, { cwd: ROOT + '/test', budget: 900 });
 check('local evidence ranks before newer global evidence', recall.indexOf(`#${localId}]`) < recall.indexOf(`#${globalId}]`), recall);
 check('recent digest is included', recall.includes('Recent sessions:') && recall.includes('Edited source'), recall);
-check('compact symbol map is included', recall.includes('Workspace symbols:') && recall.includes('test/sample.js::inspect'), recall);
+check('symbol map is included with kind and line span', recall.includes('Workspace symbols:') &&
+  recall.includes('- test/sample.js::inspect (function L1-2)'), recall);
 for (const budget of [0, 24, 70, 500]) {
   const text = buildInjection(db, { root: ROOT }, { cwd: ROOT + '/test', budget });
   check(`strict ${budget}-character budget`, !text || text.length <= budget, text?.length);
@@ -147,6 +148,124 @@ console.log('\n8. prompt recall flags changed evidence without verify');
     recalled.includes(`NEEDS REVIEW — changed since recorded: ${source}`), recalled);
   check('prompt recall does not silently change fact state', db.prepare('SELECT state FROM facts WHERE id = ?').get(id).state === 'active');
   db.prepare('DELETE FROM facts WHERE id = ?').run(id);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n9. prompt turns never repeat session context');
+{
+  // This database holds facts, a session digest and a public symbol by now.
+  const unrelatedPrompt = buildInjection(db, { root: ROOT }, {
+    prompt: 'add a dark mode toggle to the settings page', machine: machineId(), budget: 2400
+  });
+  check('unrelated prompt injects nothing', unrelatedPrompt === null, unrelatedPrompt);
+  const relevantPrompt = buildInjection(db, { root: ROOT }, {
+    prompt: 'how do I wire codex over to caipira and get rid of cavemem?', machine: machineId(), budget: 2400
+  });
+  check('relevant prompt recalls facts', relevantPrompt?.startsWith('Caipira recalled facts:') &&
+    relevantPrompt.includes('cavemem'), relevantPrompt);
+  check('relevant prompt omits symbols and session digests', relevantPrompt &&
+    !relevantPrompt.includes('Workspace symbols:') && !relevantPrompt.includes('Recent sessions:'), relevantPrompt);
+}
+
+console.log('\n10. session-start symbol map ranking, packing and budget');
+{
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const { openWorkspaceDb } = require(ROOT + '/workspace.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-symbols-'));
+  // No facts and no sessions, so the injection is the symbol block alone.
+  const sdb = openWorkspaceDb(path.join(dir, 'symbols.db'));
+  const ws = { root: dir };
+  const addSymbol = (file, qualified, kind, start, end, isPublic = 1) => sdb.prepare(`INSERT INTO ast_symbols
+    (path, name, qualified_name, kind, is_public, start_line, end_line, params_json, signature_text, signature_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)`).run(file, qualified.split('.').pop(), qualified, kind, isPublic, start, end, qualified, qualified);
+  const addEdge = (source, targetPath, targetSymbol, kind) => sdb.prepare(`INSERT INTO ast_edges
+    (source_path, source_symbol, target_path, target_symbol, edge_kind, line) VALUES (?, NULL, ?, ?, ?, 1)`)
+    .run(source, targetPath, targetSymbol, kind);
+
+  addSymbol('z.js', 'zeta', 'function', 1, 1);
+  addSymbol('lib/deep/util.js', 'helper', 'function', 2, 4);
+  addSymbol('lib/deep/util.js', 'Shape', 'interface', 6, 9);
+  addSymbol('a.js', 'Beta.run', 'method', 6, 10);
+  addSymbol('a.js', 'Beta', 'class', 5, 20);
+  addSymbol('a.js', 'alpha', 'function', 1, 3);
+  addSymbol('a.js', 'secret', 'function', 22, 25, 0);
+  addSymbol('lib/core.js', 'core', 'function', 1, 40);
+  addSymbol('feature/view.js', 'View', 'class', 32, 50);
+  addSymbol('feature/view.js', 'render', 'function', 3, 30);
+  // Fan-in: core 3 calls, zeta 2 file imports, Beta.run 1 call by its simple
+  // name, Shape 1 type use. Unresolved calls name helper but must not count.
+  for (const source of ['a.js', 'z.js', 'feature/view.js']) addEdge(source, 'lib/core.js', 'core', 'calls');
+  for (const source of ['a.js', 'lib/core.js']) addEdge(source, 'z.js', './z', 'imports');
+  addEdge('lib/core.js', 'a.js', 'run', 'calls');
+  addEdge('a.js', 'lib/deep/util.js', 'Shape', 'uses_type');
+  for (let i = 0; i < 5; i++) addEdge('a.js', null, 'helper', 'calls');
+
+  const full = buildInjection(sdb, ws, { budget: 24000 });
+  check('standing map lists every public symbol in (path, line) order', full === [
+    'Workspace symbols:',
+    '- a.js::alpha (function L1-3)',
+    '- a.js::Beta (class L5-20)',
+    '- a.js::Beta.run (method L6-10)',
+    '- feature/view.js::render (function L3-30)',
+    '- feature/view.js::View (class L32-50)',
+    '- lib/core.js::core (function L1-40)',
+    '- lib/deep/util.js::helper (function L2-4)',
+    '- lib/deep/util.js::Shape (interface L6-9)',
+    '- z.js::zeta (function L1-1)'
+  ].join('\n'), full);
+  check('more than 5 symbols, each with kind and line span',
+    (full?.match(/^- \S+::\S+ \(\w+ L\d+-\d+\)$/gm) || []).length === 9, full);
+  check('private symbols are left out', full && !full.includes('secret'), full);
+  check('a map that fits carries no omission notice', full && !full.includes('omitted'), full);
+
+  const footer = n => `(... ${n} more public symbols omitted to fit budget; use workspace_symbols or inspect_symbol)`;
+  const local = [
+    'Workspace symbols:',
+    '- feature/view.js::render (function L3-30)',
+    '- feature/view.js::View (class L32-50)',
+    '- lib/core.js::core (function L1-40)',
+    '- z.js::zeta (function L1-1)',
+    footer(5)
+  ].join('\n');
+  const localMap = buildInjection(sdb, ws, { cwd: path.join(dir, 'feature'), budget: local.length });
+  check('tight budget keeps the subpath first, then fan-in, and counts the rest', localMap === local, localMap);
+
+  const global = [
+    'Workspace symbols:',
+    '- a.js::Beta.run (method L6-10)',
+    '- lib/core.js::core (function L1-40)',
+    '- z.js::zeta (function L1-1)',
+    footer(6)
+  ].join('\n');
+  const globalMap = buildInjection(sdb, ws, { budget: global.length });
+  check('without a subpath, fan-in then shallower path decide; unresolved edges do not count',
+    globalMap === global, globalMap);
+
+  for (const budget of [0, 20, 60, 110, 150, 250, 400]) {
+    const text = buildInjection(sdb, ws, { cwd: path.join(dir, 'feature'), budget });
+    check(`symbol map within a strict ${budget}-character budget`, !text || text.length <= budget, text?.length);
+  }
+  sdb.close();
+
+  const mdb = openWorkspaceDb(path.join(dir, 'many.db'));
+  const insert = mdb.prepare(`INSERT INTO ast_symbols
+    (path, name, qualified_name, kind, is_public, start_line, end_line, params_json, signature_text, signature_hash)
+    VALUES (?, ?, ?, 'function', 1, 1, 2, '[]', '', '')`);
+  mdb.transaction(() => {
+    for (let i = 0; i < 2000; i++) {
+      const n = String(i).padStart(4, '0');
+      insert.run(`pkg/module_${n}.js`, `exportedFunction${n}`, `exportedFunction${n}`);
+    }
+  })();
+  const huge = buildInjection(mdb, { root: dir }, { budget: 100000 });
+  const kept = (huge?.match(/^- /gm) || []).length;
+  check('budget above 64000 is capped at 64000', huge && huge.length <= 64000 && huge.length > 12000, huge?.length);
+  check('omission notice counts exactly the symbols left out',
+    huge?.endsWith(footer(2000 - kept)) && kept > 0 && kept < 2000, `${kept} kept`);
+  const startup = buildInjection(mdb, { root: dir }, { budget: 24000 });
+  check('startup budget of 24000 is respected', startup && startup.length <= 24000 && startup.includes('omitted'), startup?.length);
+  check('the same index renders byte-identical text', startup === buildInjection(mdb, { root: dir }, { budget: 24000 }));
+  mdb.close();
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
