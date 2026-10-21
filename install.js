@@ -107,6 +107,44 @@ function installDependencies() {
   ok('dependencies installed');
 }
 
+// The AST symbol index is optional: without cargo, or when the build fails,
+// memory and facts keep working and the hooks skip symbol updates.
+function buildAstEngine() {
+  const { CRATE_DIR, INSTALLED_BIN } = require('./ast');
+  const manifest = path.join(CRATE_DIR, 'Cargo.toml');
+  if (!fs.existsSync(manifest)) {
+    warn('rust/caipira-ast not found — AST symbol index unavailable');
+    return;
+  }
+  try {
+    execFileSync('cargo', ['--version'], { stdio: 'ignore' });
+  } catch {
+    warn('cargo not found — install Rust (https://rustup.rs) and re-run install to enable the AST symbol index');
+    return;
+  }
+  log('  building caipira-ast (cargo build --release)...');
+  try {
+    execFileSync('cargo', ['build', '--release', '--manifest-path', manifest], { cwd: ROOT, stdio: 'inherit' });
+  } catch (error) {
+    warn(`caipira-ast build failed — ${error.message}`);
+    return;
+  }
+  const built = path.join(CRATE_DIR, 'target', 'release', path.basename(INSTALLED_BIN));
+  // Copy then rename, so a hook running the old binary never sees a half-written file.
+  fs.mkdirSync(path.dirname(INSTALLED_BIN), { recursive: true });
+  const tmp = `${INSTALLED_BIN}.caipira-tmp`;
+  try {
+    fs.copyFileSync(built, tmp);
+    fs.chmodSync(tmp, 0o755);
+    fs.renameSync(tmp, INSTALLED_BIN);
+  } catch (error) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    warn(`caipira-ast could not be installed at ${INSTALLED_BIN} — ${error.message}`);
+    return;
+  }
+  ok(`caipira-ast installed at ${INSTALLED_BIN}`);
+}
+
 function ensureDirectories() {
   for (const dir of ['logs']) {
     fs.mkdirSync(path.join(ROOT, dir), { recursive: true });
@@ -461,6 +499,11 @@ function doctor() {
   check(`bundled Node 22 at ${NODE_BIN}`, fs.existsSync(NODE_BIN), 'reinstall the node22 folder');
   check('dependencies installed', fs.existsSync(path.join(ROOT, 'node_modules', 'better-sqlite3')), 'run: caipira install');
   check('embedding model present', fs.existsSync(path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx')));
+  try {
+    ok(`AST engine at ${require('./ast').resolveBinary()}`);
+  } catch {
+    warn('caipira-ast not built — AST symbol index unavailable (run: caipira install with cargo on PATH)');
+  }
 
   try {
     const { openMaster } = require('./workspace');
@@ -618,6 +661,7 @@ function status() {
 function install() {
   log('\nInstalling Caipira\n');
   installDependencies();
+  buildAstEngine();
   ensureDirectories();
   registerMcpServer();
   registerHooks();

@@ -92,4 +92,8 @@ Outside scope: MCP tool definitions (`mcp.js`), hook event handlers (`hooks/univ
 
 ## Open decisions and sources
 
-- None. Reference implementation inspected at `/home/htxzz77/Projects/sota/crates/sota_domain/src/ast.rs` and `/home/htxzz77/Projects/sota/crates/sota_walker/src/walker.rs`.
+- Reference implementation inspected at `/home/htxzz77/Projects/sota/crates/sota_domain/src/ast.rs` and `/home/htxzz77/Projects/sota/crates/sota_walker/src/walker.rs`.
+- Resolved with the project owner on 2026-10-20, where the plan above did not match the code:
+  - `fact_symbol_evidence` lives in `<workspace>.db` (workspace migration v3), not `master.db`: `facts` and `fact_evidence` are per-workspace tables, so `REFERENCES facts(id)` only resolves there. `master.db` stays at version 1.
+  - There is no `SCHEMA_VERSION` constant or `initSchema()` class; migrations are the versioned `MASTER_MIGRATIONS` / `WORKSPACE_MIGRATIONS` arrays. Criterion 6 is met by workspace migration v3 plus `migrateAll({ caipiraDir })` in `migrate.js`, which upgrades `master.db`, every registered workspace database, and the legacy `data.db` in place.
+  - The existing assertions that pinned schema version 2 in `test/test-workspace.js` and `test/test-facts.js` move to 3, `test/test-ast.js` joins `test/run-all.js`, and the migration checks live in `test/test-ast.js` (there is no `test/test-migrate.js`).

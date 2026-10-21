@@ -216,7 +216,160 @@ const WORKSPACE_MIGRATIONS = [
         END;
       `);
     }
+  },
+
+  // v3 — the code layer.
+  //
+  // rust/caipira-ast keeps ast_files, ast_symbols and ast_edges in step with
+  // the workspace's source files, and creates these same tables itself when it
+  // meets a database first, so this DDL and SCHEMA in
+  // rust/caipira-ast/src/store.rs must stay identical (test-ast compares them).
+  // ast_symbols_fts uses the trigram tokenizer: identifiers like
+  // addObservation are one token to unicode61, and symbol search needs
+  // substrings.
+  //
+  // fact_symbol_evidence sits beside fact_evidence: a fact anchored to a
+  // symbol's signature_hash survives edits elsewhere in the same file, where a
+  // whole-file sha256 would flag it. Its paths are workspace-relative, so
+  // unlike fact_evidence it needs no machine column.
+  {
+    version: 3,
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ast_files (
+          path TEXT PRIMARY KEY,
+          language TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          mtime_ms INTEGER NOT NULL,
+          content_sha256 TEXT NOT NULL,
+          indexed_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ast_symbols (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          path TEXT NOT NULL,
+          name TEXT NOT NULL,
+          qualified_name TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          is_public INTEGER NOT NULL DEFAULT 0,
+          start_line INTEGER NOT NULL,
+          end_line INTEGER NOT NULL,
+          params_json TEXT NOT NULL DEFAULT '[]',
+          return_type TEXT,
+          doc_summary TEXT,
+          signature_text TEXT NOT NULL,
+          signature_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ast_symbols_path ON ast_symbols(path);
+        CREATE INDEX IF NOT EXISTS ast_symbols_name ON ast_symbols(name);
+        CREATE INDEX IF NOT EXISTS ast_symbols_qualified ON ast_symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS ast_symbols_kind ON ast_symbols(kind);
+
+        CREATE TABLE IF NOT EXISTS ast_edges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_path TEXT NOT NULL,
+          source_symbol TEXT,
+          target_path TEXT,
+          target_symbol TEXT NOT NULL,
+          edge_kind TEXT NOT NULL,
+          line INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ast_edges_source ON ast_edges(source_path, source_symbol);
+        CREATE INDEX IF NOT EXISTS ast_edges_target ON ast_edges(target_symbol);
+        CREATE INDEX IF NOT EXISTS ast_edges_target_path ON ast_edges(target_path);
+        CREATE INDEX IF NOT EXISTS ast_edges_kind ON ast_edges(edge_kind);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS ast_symbols_fts USING fts5(
+          name, qualified_name, signature_text, doc_summary, path,
+          content='ast_symbols',
+          content_rowid='id',
+          tokenize='trigram'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS ast_symbols_ai AFTER INSERT ON ast_symbols BEGIN
+          INSERT INTO ast_symbols_fts(rowid, name, qualified_name, signature_text, doc_summary, path)
+          VALUES (new.id, new.name, new.qualified_name, new.signature_text, new.doc_summary, new.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS ast_symbols_ad AFTER DELETE ON ast_symbols BEGIN
+          INSERT INTO ast_symbols_fts(ast_symbols_fts, rowid, name, qualified_name, signature_text, doc_summary, path)
+          VALUES ('delete', old.id, old.name, old.qualified_name, old.signature_text, old.doc_summary, old.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS ast_symbols_au AFTER UPDATE ON ast_symbols BEGIN
+          INSERT INTO ast_symbols_fts(ast_symbols_fts, rowid, name, qualified_name, signature_text, doc_summary, path)
+          VALUES ('delete', old.id, old.name, old.qualified_name, old.signature_text, old.doc_summary, old.path);
+          INSERT INTO ast_symbols_fts(rowid, name, qualified_name, signature_text, doc_summary, path)
+          VALUES (new.id, new.name, new.qualified_name, new.signature_text, new.doc_summary, new.path);
+        END;
+
+        CREATE TABLE IF NOT EXISTS fact_symbol_evidence (
+          fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+          path TEXT NOT NULL,
+          qualified_name TEXT NOT NULL,
+          signature_hash TEXT NOT NULL,
+          PRIMARY KEY (fact_id, path, qualified_name)
+        );
+        CREATE INDEX IF NOT EXISTS symbol_evidence_symbol ON fact_symbol_evidence(path, qualified_name);
+      `);
+    }
   }
 ];
 
-module.exports = { migrate, currentVersion, MASTER_MIGRATIONS, WORKSPACE_MIGRATIONS };
+// ── every database under a Caipira directory ──
+
+/**
+ * Upgrades master.db, every registered workspace database that exists, and
+ * the legacy data.db in place. Each file migrates in its own transactions,
+ * so one unreadable database is reported without blocking the rest; files
+ * that are not there are skipped, never created.
+ * @param {{caipiraDir?: string}} [opts] Defaults to CAIPIRA_HOME, else ~/.caipira.
+ * @returns {{master: object|null, workspaces: object[], failed: {dbFile: string, error: string}[]}}
+ *   `master` and each workspace entry are `{dbFile, from, to, applied}`.
+ */
+function migrateAll(opts = {}) {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const Database = require('better-sqlite3');
+
+  const caipiraDir = path.resolve(opts.caipiraDir || process.env.CAIPIRA_HOME || path.join(os.homedir(), '.caipira'));
+  const masterFile = path.join(caipiraDir, 'database', 'master.db');
+  const legacyFile = path.join(caipiraDir, 'data.db');
+  const report = { master: null, workspaces: [], failed: [] };
+
+  const upgrade = (dbFile, migrations, read) => {
+    const db = new Database(dbFile, { fileMustExist: true });
+    try {
+      db.pragma('journal_mode = WAL');
+      db.pragma('foreign_keys = ON');
+      const result = { dbFile, ...migrate(db, migrations) };
+      if (read) read(db);
+      return result;
+    } finally {
+      db.close();
+    }
+  };
+
+  const workspaceFiles = new Set();
+  if (fs.existsSync(masterFile)) {
+    try {
+      report.master = upgrade(masterFile, MASTER_MIGRATIONS, db => {
+        for (const row of db.prepare('SELECT db_file FROM workspaces').all()) workspaceFiles.add(row.db_file);
+      });
+    } catch (error) {
+      report.failed.push({ dbFile: masterFile, error: error.message });
+    }
+  }
+  if (fs.existsSync(legacyFile)) workspaceFiles.add(legacyFile);
+
+  for (const dbFile of workspaceFiles) {
+    if (!fs.existsSync(dbFile)) continue;
+    try {
+      report.workspaces.push(upgrade(dbFile, WORKSPACE_MIGRATIONS));
+    } catch (error) {
+      report.failed.push({ dbFile, error: error.message });
+    }
+  }
+  return report;
+}
+
+module.exports = { migrate, migrateAll, currentVersion, MASTER_MIGRATIONS, WORKSPACE_MIGRATIONS };

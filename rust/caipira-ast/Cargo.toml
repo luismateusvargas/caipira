@@ -1,0 +1,46 @@
+[package]
+name = "caipira-ast"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-only"
+description = "Incremental polyglot tree-sitter symbol indexer for Caipira workspace databases"
+publish = false
+
+[lib]
+name = "caipira_ast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "caipira-ast"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+derive_setters = "0.1.9"
+hex = "0.4.3"
+ignore = "0.4.23"
+rayon = "1.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.143"
+sha2 = "0.11"
+thiserror = "2.0.18"
+tree-sitter = "0.26"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+
+[dev-dependencies]
+anyhow = "1.0.102"
+pretty_assertions = "1.4.1"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
