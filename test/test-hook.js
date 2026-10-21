@@ -680,6 +680,60 @@ console.log('\n21. a failed recall block is diagnosed once at the hook');
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+console.log('\n22. symbol evidence a missing parser cannot check is flagged in every recall block');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-unchecked-'));
+  fs.writeFileSync(path.join(dir, '.caipira-workspace'), '');
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value) { return value; }\n');
+  const info = ensureWorkspace(dir);
+  const ast = require(ROOT + '/ast.js');
+  ast.syncWorkspaceAst(dir, info.dbFile);
+  let db = openWorkspaceDb(info.dbFile);
+  const store = new FactStore(db, { machine: machineId(), agent: 'test', root: dir });
+  const id = store.record({ kind: 'constraint', title: 'Api argument count', summary: 'Api takes one argument.',
+    body: 'The api function takes one argument.', evidenceSymbols: [{ path: 'api.js', qualifiedName: 'api',
+      signatureHash: ast.inspectSymbol(db, 'api.js::api').symbol.signature_hash }] });
+  store.update(id, { evidence: [] });
+  const DAY_AGO = Date.now() - 86400000;
+  db.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, id);
+  db.close();
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value, extra) { return value + extra; }\n');
+
+  const missing = { CAIPIRA_AST_BIN: path.join(dir, 'no-parser') };
+  const warned = `- [constraint#${id}] Api takes one argument. (NEEDS REVIEW — symbol evidence could not be checked)`;
+  const linesFor = text => (text || '').split('\n').filter(line => line.startsWith(`- [constraint#${id}]`));
+  const prompt = 'api argument count?';
+  let outcome = runWith('codex', 'SessionStart', { session_id: 'hook-unchecked-1', cwd: dir }, missing);
+  let text = outcome.result.hookSpecificOutput?.additionalContext || '';
+  check('SessionStart warns on it among the standing facts', outcome.status === 0 &&
+    JSON.stringify(linesFor(text)) === JSON.stringify([warned]), text.slice(text.indexOf('Caipira standing'), text.indexOf('Workspace symbols')));
+  outcome = runWith('claude-code', 'UserPromptSubmit', { session_id: 'hook-unchecked-1', cwd: dir, prompt }, missing);
+  text = outcome.result.hookSpecificOutput?.additionalContext || '';
+  check('a prompt turn warns on it', JSON.stringify(linesFor(text)) === JSON.stringify([warned]), text);
+
+  // Eight status facts fill the standing list, so Antigravity's first step
+  // can only bring this one in through its prompt.
+  db = openWorkspaceDb(info.dbFile);
+  for (let i = 1; i <= 8; i++) {
+    new FactStore(db, { machine: machineId(), agent: 'test', root: dir }).record({ kind: 'status',
+      title: `Release checklist item ${i}`, summary: `Release checklist item ${i} is complete.`, body: 'Done.' });
+  }
+  db.close();
+  outcome = runWith('antigravity', 'pre-invocation', { conversationId: 'hook-unchecked-agy', workspacePaths: [dir],
+    invocationNum: 0, prompt }, missing);
+  text = (outcome.result.injectSteps || []).map(step => step.ephemeralMessage).join('\n\n');
+  const extra = text.slice(text.indexOf('Caipira recalled these established facts'));
+  check('Antigravity\'s first step warns on it in the recall beyond the standing facts',
+    text.includes('Caipira recalled these established facts') && JSON.stringify(linesFor(text)) === JSON.stringify([warned]) &&
+    linesFor(extra).length === 1, text.slice(-500));
+
+  db = openWorkspaceDb(info.dbFile);
+  const stored = db.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(id);
+  db.close();
+  check('no run marked it verified or broken', stored.state === 'active' && stored.last_verified_at === DAY_AGO, JSON.stringify(stored));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 for (const probe of probes) fs.rmSync(probe.dir, { recursive: true, force: true });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

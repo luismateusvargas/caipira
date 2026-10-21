@@ -387,6 +387,116 @@ console.log('\n15. named budgets keep their specified values');
 check('prompt, startup and maximum budgets', PROMPT_BUDGET_CHARS === 2400 && STARTUP_BUDGET_CHARS === 24000 &&
   MAX_BUDGET_CHARS === 64000);
 
+console.log('\n16. symbol evidence that could not be checked is never shown as settled');
+{
+  const ast = require(ROOT + '/ast.js');
+  const { FactStore, AstRefreshScope } = require(ROOT + '/facts.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-unchecked-'));
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-unchecked-db-'));
+  fs.writeFileSync(path.join(dir, '.caipira-workspace'), '');
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value) { return value; }\n');
+  const dbFile = path.join(dbDir, 'unchecked.db');
+  ast.syncWorkspaceAst(dir, dbFile);
+  const udb = openWorkspaceDb(dbFile);
+  const machine = machineId();
+  const ustore = new FactStore(udb, { machine, agent: 'test', root: dir });
+  const id = ustore.record({ kind: 'constraint', title: 'Api argument count', summary: 'Api takes one argument.',
+    body: 'The api function takes one argument.', evidenceSymbols: [{ path: 'api.js', qualifiedName: 'api',
+      signatureHash: ast.inspectSymbol(udb, 'api.js::api').symbol.signature_hash }] });
+  // The supported update drops this machine's file fingerprints and keeps the anchor.
+  ustore.update(id, { evidence: [] });
+  const DAY_AGO = Date.now() - 86400000;
+  udb.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, id);
+  fs.writeFileSync(path.join(dir, 'api.js'), 'export function api(value, extra) { return value + extra; }\n');
+
+  const calls = [];
+  const down = new AstRefreshScope({ updateFile: (root, file) => {
+    calls.push(file);
+    throw Object.assign(new Error('caipira-ast is missing'), { code: 'binary_missing' });
+  } });
+  const outcomes = ustore.verify([id], down);
+  check('verification leaves the anchor unchecked, not drifted', outcomes.length === 1 && outcomes[0].unchecked === 1 &&
+    outcomes[0].changed === 0 && !outcomes[0].drifted, JSON.stringify(outcomes));
+
+  const warned = `- [constraint#${id}] Api takes one argument. (NEEDS REVIEW — symbol evidence could not be checked)`;
+  const factLines = text => JSON.stringify((text || '').split('\n').filter(line => line.startsWith('- [constraint#')));
+  const uncheckedFacts = new Set(outcomes.filter(outcome => outcome.unchecked > 0).map(outcome => outcome.id));
+  const standing = buildInjection(udb, { root: dir }, { budget: 2400, uncheckedFacts });
+  check('standing recall warns on it', factLines(standing) === JSON.stringify([warned]), standing);
+  const prompt = 'api argument count?';
+  const recalled = buildInjection(udb, { root: dir }, { prompt, machine, astScope: down, budget: 2400 });
+  check('prompt recall warns on it', factLines(recalled) === JSON.stringify([warned]), recalled);
+  // What Antigravity's first step adds beyond the standing facts.
+  const extra = buildPromptInjection(udb, prompt, { machine, root: dir, astScope: down });
+  check('the prompt recall added at startup warns on it', factLines(extra) === JSON.stringify([warned]), extra);
+  const stored = udb.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(id);
+  check('nothing marks it verified or broken', stored.state === 'active' && stored.last_verified_at === DAY_AGO,
+    JSON.stringify(stored));
+  check('the missing parser was tried once for all of it', calls.length === 1, JSON.stringify(calls));
+
+  const [healthy] = ustore.verify([id], new AstRefreshScope());
+  check('a working parser still finds the real signature change', healthy.drifted && healthy.unchecked === 0 &&
+    JSON.stringify(healthy.broken) === JSON.stringify([{ path: 'api.js', symbol: 'api', reason: 'symbol_signature_changed' }]) &&
+    udb.prepare('SELECT state FROM facts WHERE id = ?').get(id).state === 'needs_review', JSON.stringify(healthy));
+  udb.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dbDir, { recursive: true, force: true });
+}
+
+console.log('\n17. file evidence recorded through another alias of the root keeps its locality');
+{
+  const { FactStore } = require(ROOT + '/facts.js');
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-aliases-'));
+  for (const file of ['z/api.js', 'zz/api.js', 'package.json']) {
+    fs.mkdirSync(path.dirname(path.join(real, file)), { recursive: true });
+    fs.writeFileSync(path.join(real, file), '{}\n');
+  }
+  const sibling = `${real}-sibling`;
+  fs.mkdirSync(path.join(sibling, 'z'), { recursive: true });
+  fs.writeFileSync(path.join(sibling, 'z', 'api.js'), '{}\n');
+  const aliasA = `${real}-a`, aliasB = `${real}-b`;
+  fs.symlinkSync(real, aliasA, 'dir');
+  fs.symlinkSync(real, aliasB, 'dir');
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-aliases-db-'));
+  const adb = openWorkspaceDb(path.join(dbDir, 'aliases.db'));
+  const astore = new FactStore(adb, { machine: machineId(), agent: 'test', root: aliasA });
+  // Equal kinds and fixed timestamps, so only locality can reorder them.
+  const recordAt = (title, file, updatedAt) => {
+    const factId = astore.record({ kind: 'decision', title, summary: `${title}.`, body: `${title}.`, evidence: [file] });
+    adb.prepare('UPDATE facts SET updated_at = ? WHERE id = ?').run(updatedAt, factId);
+    return title;
+  };
+  recordAt('Local policy', path.join(aliasB, 'z', 'api.js'), 1);
+  recordAt('Deleted local policy', path.join(aliasA, 'z', 'gone.js'), 2);
+  recordAt('Global policy', path.join(real, 'package.json'), 10);
+  recordAt('Sibling directory policy', path.join(real, 'zz', 'api.js'), 5);
+  recordAt('Sibling root policy', path.join(sibling, 'z', 'api.js'), 4);
+  const order = cwd => (buildInjection(adb, { root: aliasA }, { cwd, budget: 2400 }) || '').split('\n')
+    .filter(line => line.startsWith('- [decision#')).map(line => line.replace(/^- \[decision#\d+\] /, ''));
+  const expected = JSON.stringify(['Deleted local policy.', 'Local policy.', 'Global policy.',
+    'Sibling directory policy.', 'Sibling root policy.']);
+  check('evidence through a second alias ranks local from that alias', JSON.stringify(order(path.join(aliasB, 'z'))) === expected,
+    JSON.stringify(order(path.join(aliasB, 'z'))));
+  check('and from the real directory', JSON.stringify(order(path.join(real, 'z'))) === expected,
+    JSON.stringify(order(path.join(real, 'z'))));
+  check('and from the registered alias', JSON.stringify(order(path.join(aliasA, 'z'))) === expected,
+    JSON.stringify(order(path.join(aliasA, 'z'))));
+  check('at the root nothing is local, so newest leads', JSON.stringify(order(aliasB)) === JSON.stringify(['Global policy.',
+    'Sibling directory policy.', 'Sibling root policy.', 'Deleted local policy.', 'Local policy.']), JSON.stringify(order(aliasB)));
+
+  const { isLocalEvidence } = require(ROOT + '/inject.js');
+  const win = { pathApi: path.win32, realpath: () => null };
+  const place = locateSession('C:\\Work\\Repo', 'c:\\work\\repo\\Src', win);
+  check('Windows evidence comparison ignores drive-letter and directory case',
+    isLocalEvidence(place, 'c:\\WORK\\Repo\\src\\a.js', win) && isLocalEvidence(place, 'C:\\Work\\Repo\\Src\\Deep\\b.js', win));
+  check('another Windows drive, a sibling root, and the root itself are not local',
+    !isLocalEvidence(place, 'D:\\Work\\Repo\\Src\\a.js', win) && !isLocalEvidence(place, 'C:\\Work\\RepoX\\Src\\a.js', win) &&
+    !isLocalEvidence(place, 'C:\\Work\\Repo\\a.js', win) && !isLocalEvidence(place, 'C:\\Work\\Repo\\Srcs\\a.js', win));
+  adb.close();
+  for (const target of [aliasA, aliasB]) fs.rmSync(target, { force: true });
+  for (const target of [real, sibling, dbDir]) fs.rmSync(target, { recursive: true, force: true });
+}
+
 db.close();
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

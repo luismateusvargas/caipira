@@ -329,11 +329,16 @@ function recallContext(db, input, workspace, deadlineAtMs) {
     // A git pull or another editor can move evidence between sessions with no
     // PostToolUse to notice, so a new session re-indexes the workspace and
     // re-checks every fact before anything is injected as settled. One
-    // refresh scope carries the deadline through all of it.
+    // refresh scope carries the deadline through all of it, and facts whose
+    // symbol evidence it could not check are flagged rather than shown as
+    // settled.
     let astScope = new AstRefreshScope({ deadlineAtMs });
+    let uncheckedFacts = new Set();
     if (starting) {
       astScope = syncSessionAst(workspace, deadlineAtMs);
-      new FactStore(db, { machine: opts.machine, agent: 'hook', root: workspace?.root }).verify(undefined, astScope);
+      const outcomes = new FactStore(db, { machine: opts.machine, agent: 'hook', root: workspace?.root })
+        .verify(undefined, astScope);
+      uncheckedFacts = new Set(outcomes.filter(outcome => outcome.unchecked > 0).map(outcome => outcome.id));
     }
 
     // Drift rides along with whatever else is being injected. It is appended
@@ -347,7 +352,8 @@ function recallContext(db, input, workspace, deadlineAtMs) {
     // the cached conversation prefix stays put and an unrelated prompt adds
     // nothing at all.
     if (starting) {
-      const recalled = buildInjection(db, workspace, { ...opts, cwd, budget: STARTUP_BUDGET_CHARS, prompt: '' });
+      const recalled = buildInjection(db, workspace,
+        { ...opts, cwd, budget: STARTUP_BUDGET_CHARS, prompt: '', uncheckedFacts });
       const extra = prompt
         ? recallBeyondStanding(db, prompt, { machine: opts.machine, root: workspace?.root, astScope }, recalled)
         : null;

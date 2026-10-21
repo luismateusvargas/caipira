@@ -10,7 +10,7 @@
 // plants a premise the model then reasons from. So the gate returns nothing
 // unless it is reasonably sure, and never returns a ranked-best-of-N.
 
-const { FactStore, AstRefreshScope, trustScore } = require('./facts');
+const { FactStore, AstRefreshScope, trustScore, FACT_RANK_SQL, FACT_RANK_PARAMS } = require('./facts');
 const { compress, expand, termForms, buildOrMatch } = require('./compress');
 const fs = require('fs');
 const path = require('path');
@@ -59,7 +59,10 @@ const PROMPT_STOPWORDS = new Set([
   'nor', 'yet', 'our', 'out', 'off', 'own', 'same', 'too'
 ]);
 
-/** @typedef {{fact: object, coverage: number, trust: number, score: number, stale: string[]}} InjectionCandidate */
+/**
+ * @typedef {{fact: object, coverage: number, trust: number, score: number, stale: string[], unchecked: boolean}} InjectionCandidate
+ * `unchecked` is true when some of the fact's symbol evidence could not be re-checked.
+ */
 
 // Function words are poison here. Explicit search can afford to keep them
 // (AND still requires the real terms to match); coverage cannot, because
@@ -135,11 +138,11 @@ function selectFacts(db, prompt, opts = {}) {
 
   const match = buildOrMatch(groups);
   const rows = db.prepare(`
-    SELECT f.*, bm25(facts_fts, 10.0, 6.0, 1.0) AS bm25
+    SELECT f.*, ${FACT_RANK_SQL} AS bm25
     FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
     WHERE facts_fts MATCH ? AND f.state IN ('active','needs_review')
     ORDER BY bm25 ASC LIMIT ?
-  `).all(match, MAX_CANDIDATES);
+  `).all(...FACT_RANK_PARAMS, match, MAX_CANDIDATES);
   if (rows.length === 0) return [];
 
   const store = new FactStore(db, { machine, root: opts.root });
@@ -155,7 +158,7 @@ function selectFacts(db, prompt, opts = {}) {
     if (trust < MIN_TRUST) continue;
     const score = coverage * trust;
 
-    scored.push({ fact, coverage, trust, score, stale: evidence.changedPaths });
+    scored.push({ fact, coverage, trust, score, stale: evidence.changedPaths, unchecked: evidence.unchecked > 0 });
   }
 
   return scored.sort((a, b) => b.score - a.score).slice(0, MAX_FACTS);
@@ -183,10 +186,20 @@ function reportFailure(onFailure, operation, error) {
 // One review rule for every rendered fact. A stale fact is still worth
 // injecting, but it must say so rather than present itself as current: the
 // needs_review state alone earns the flag, and changed paths make it specific.
-/** @param {{kind: string, id: number, summary: string, state?: string}} fact @param {string[]} [stale] @returns {string} */
-function factLine(fact, stale = []) {
-  const flag = stale.length
-    ? ` (NEEDS REVIEW — changed since recorded: ${stale.join(', ')})`
+// Symbol evidence the parser could not re-check this run is neither drift nor
+// confirmation, so it earns the flag too, saying only that.
+/**
+ * @param {{kind: string, id: number, summary: string, state?: string}} fact
+ * @param {string[]} [stale] Evidence paths that changed since the fact was recorded.
+ * @param {boolean} [unchecked] Whether some of its symbol evidence could not be checked.
+ * @returns {string}
+ */
+function factLine(fact, stale = [], unchecked = false) {
+  const reasons = [];
+  if (stale.length) reasons.push(`changed since recorded: ${stale.join(', ')}`);
+  if (unchecked) reasons.push('symbol evidence could not be checked');
+  const flag = reasons.length
+    ? ` (NEEDS REVIEW — ${reasons.join('; ')})`
     : fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
   return `- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`;
 }
@@ -200,8 +213,8 @@ function renderInjection(selected) {
   const lines = ['Caipira recalled these established facts for this workspace:'];
   let budget = MAX_CHARS;
 
-  for (const { fact, stale } of selected) {
-    const line = factLine(fact, stale);
+  for (const { fact, stale, unchecked } of selected) {
+    const line = factLine(fact, stale, unchecked);
     if (line.length > budget) continue;
     budget -= line.length;
     lines.push(line);
@@ -305,26 +318,54 @@ function realpathOrNull(target) {
  * @param {string|undefined} cwd Directory the session reports.
  * @param {{pathApi?: typeof path, realpath?: (target: string) => string|null}} [adapters]
  *   Path rules (path.win32 for Windows comparison) and resolver; the host's by default.
- * @returns {{subpath: string, roots: string[]}} subpath is '' at the root or outside it;
- *   roots are the spellings of the root that recorded evidence paths may start with.
+ * @returns {{subpath: string, roots: string[], realRoot: string|null}} subpath is '' at the root or
+ *   outside it; roots are the spellings of the root that recorded evidence paths may start with,
+ *   and realRoot the resolved one, when it resolves.
  */
 function locateSession(root, cwd, adapters = {}) {
   const pathApi = adapters.pathApi || path;
   const realpath = adapters.realpath || realpathOrNull;
-  if (typeof root !== 'string' || !root) return { subpath: '', roots: [] };
+  if (typeof root !== 'string' || !root) return { subpath: '', roots: [], realRoot: null };
   const lexicalRoot = pathApi.resolve(root);
-  if (typeof cwd !== 'string' || !cwd) return { subpath: '', roots: [lexicalRoot] };
+  if (typeof cwd !== 'string' || !cwd) return { subpath: '', roots: [lexicalRoot], realRoot: null };
   const realRoot = realpath(root);
   const realCwd = realpath(cwd);
   const subpath = (realRoot && realCwd
     ? relativeInside(pathApi, realRoot, realCwd)
     : relativeInside(pathApi, lexicalRoot, pathApi.resolve(cwd))) || '';
-  return { subpath, roots: [...new Set([lexicalRoot, realRoot].filter(Boolean))] };
+  return { subpath, roots: [...new Set([lexicalRoot, realRoot].filter(Boolean))], realRoot: realRoot || null };
 }
 
 /** @param {string} subpath @param {string|null} relPath @returns {boolean} */
 function withinSubpath(subpath, relPath) {
   return Boolean(subpath && relPath) && (relPath === subpath || relPath.startsWith(`${subpath}/`));
+}
+
+/**
+ * Whether a recorded evidence file lies in the session's subdirectory.
+ *
+ * Evidence keeps whichever spelling of the root was current when it was
+ * recorded, so it is placed by the same rules as the session itself: by real
+ * paths when the file and the root both resolve, so a file recorded through
+ * another alias of the root still counts; as written, against each spelling of
+ * the root, when the file is gone, so deleted evidence keeps the place it was
+ * recorded under. The path rules decide case and drive, as for the cwd.
+ * @param {{subpath: string, roots: string[], realRoot: string|null}} place From locateSession.
+ * @param {string} file Absolute evidence path as recorded.
+ * @param {{pathApi?: typeof path, realpath?: (target: string) => string|null}} [adapters]
+ *   The same path rules and resolver place was located with; the host's by default.
+ * @returns {boolean}
+ */
+function isLocalEvidence(place, file, adapters = {}) {
+  if (!place.subpath) return false;
+  const pathApi = adapters.pathApi || path;
+  const realpath = adapters.realpath || realpathOrNull;
+  const realFile = place.realRoot ? realpath(file) : null;
+  const spellings = realFile ? [[place.realRoot, realFile]] : place.roots.map(root => [root, pathApi.resolve(file)]);
+  return spellings.some(([root, target]) => {
+    const dir = pathApi.join(root, ...place.subpath.split('/'));
+    return pathApi.relative(dir, target) === '' || relativeInside(pathApi, dir, target) !== null;
+  });
 }
 
 /**
@@ -400,19 +441,23 @@ function selectWorkspaceSymbols(db, subpath, room) {
 
 // The facts a block of recall carries, ranked: prompt score first, then
 // kind, then locality to the session's subdirectory, newest breaking ties.
+// A prompt's selection checks evidence itself; standing facts take what the
+// caller's verification could not check.
 /**
  * @param {object} db
  * @param {{root: string}|null|undefined} workspace
- * @param {{prompt?: string, machine?: string, astScope?: AstRefreshScope}} opts
- * @param {{subpath: string, roots: string[]}} place
+ * @param {{prompt?: string, machine?: string, astScope?: AstRefreshScope, uncheckedFacts?: ReadonlySet<number>}} opts
+ * @param {{subpath: string, roots: string[], realRoot: string|null}} place
  * @returns {object[]}
  */
 function rankedFacts(db, workspace, opts, place) {
+  const unchecked = opts.uncheckedFacts || new Set();
   const facts = opts.prompt
     ? selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root, astScope: opts.astScope })
-      .map(row => ({ ...row.fact, score: row.score, stale: row.stale }))
+      .map(row => ({ ...row.fact, score: row.score, stale: row.stale, unchecked: row.unchecked }))
     : db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
-        ORDER BY updated_at DESC LIMIT ?`).all(STANDING_CANDIDATES);
+        ORDER BY updated_at DESC LIMIT ?`).all(STANDING_CANDIDATES)
+      .map(fact => ({ ...fact, unchecked: unchecked.has(fact.id) }));
   if (facts.length === 0) return facts;
 
   // Evidence files are recorded as absolute paths under whichever spelling of
@@ -420,8 +465,9 @@ function rankedFacts(db, workspace, opts, place) {
   // are judged by the same subpath.
   const locality = new Set();
   if (place.subpath) {
+    const candidates = new Set(facts.map(fact => fact.id));
     for (const row of db.prepare(`SELECT fact_id, path FROM fact_evidence`).all()) {
-      if (place.roots.some(root => withinSubpath(place.subpath, relativeInside(path, root, row.path)))) {
+      if (candidates.has(row.fact_id) && !locality.has(row.fact_id) && isLocalEvidence(place, row.path)) {
         locality.add(row.fact_id);
       }
     }
@@ -443,9 +489,10 @@ function rankedFacts(db, workspace, opts, place) {
  * did build are kept. A prompt turn whose facts cannot be read returns null.
  * @param {object} db Open workspace database.
  * @param {{root: string}} workspace Resolved workspace.
- * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string,
- *   astScope?: AstRefreshScope, onFailure?: RecallFailureHandler}} [opts]
- *   budget defaults to PROMPT_BUDGET_CHARS and is capped at MAX_BUDGET_CHARS.
+ * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string, astScope?: AstRefreshScope,
+ *   uncheckedFacts?: ReadonlySet<number>, onFailure?: RecallFailureHandler}} [opts]
+ *   budget defaults to PROMPT_BUDGET_CHARS and is capped at MAX_BUDGET_CHARS. uncheckedFacts are the
+ *   facts the caller's verification left with unchecked evidence; standing facts among them are flagged.
  * @returns {string|null} null when there is nothing to say.
  */
 function buildInjection(db, workspace, opts = {}) {
@@ -479,7 +526,7 @@ function buildInjection(db, workspace, opts = {}) {
   };
   if (facts.length) {
     add(opts.prompt ? 'Caipira recalled facts:' : 'Caipira standing facts for this workspace:');
-    for (const fact of facts.slice(0, MAX_STANDING_FACTS)) add(factLine(fact, fact.stale));
+    for (const fact of facts.slice(0, MAX_STANDING_FACTS)) add(factLine(fact, fact.stale, fact.unchecked));
   }
   if (!opts.prompt) {
     const sessions = attempt('session digests', () => db.prepare(`SELECT summary FROM sessions
@@ -530,6 +577,6 @@ function buildDriftNotice(db, opts = {}) {
 
 module.exports = {
   buildPromptInjection, buildStandingInjection, buildInjection, buildDriftNotice, selectFacts, renderInjection,
-  selectWorkspaceSymbols, locateSession, coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS,
+  selectWorkspaceSymbols, locateSession, isLocalEvidence, coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS,
   PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS, MAX_BUDGET_CHARS
 };

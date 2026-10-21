@@ -22,6 +22,14 @@ const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'propos
 // Facts that are worth re-checking on a clock, not just on file changes.
 const DEFAULT_TTL_DAYS = { status: 14, decision: null, constraint: null, preference: null, gotcha: null };
 
+// How much a query term counts in each facts_fts column when facts are ranked
+// with bm25: a title match says the most about what a fact is about, a body
+// match the least. Explicit search and prompt recall share them so the two
+// rank alike; FACT_RANK_SQL binds them in the table's column order.
+const FACT_FIELD_WEIGHTS = Object.freeze({ title: 10, summary: 6, body: 1 });
+const FACT_RANK_SQL = 'bm25(facts_fts, ?, ?, ?)';
+const FACT_RANK_PARAMS = Object.freeze([FACT_FIELD_WEIGHTS.title, FACT_FIELD_WEIGHTS.summary, FACT_FIELD_WEIGHTS.body]);
+
 // The longest one evidence check may wait for the parser to re-index a file.
 const EVIDENCE_REFRESH_TIMEOUT_MS = 2000;
 
@@ -548,11 +556,11 @@ class FactStore {
     if (match) {
       try {
         rows = this.db.prepare(`
-          SELECT f.*, bm25(facts_fts, 10.0, 6.0, 1.0) AS bm25
+          SELECT f.*, ${FACT_RANK_SQL} AS bm25
           FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid
           WHERE facts_fts MATCH ? AND f.state IN (${placeholders})
           ORDER BY bm25 ASC LIMIT ?
-        `).all(match, ...states, limit * 3);
+        `).all(...FACT_RANK_PARAMS, match, ...states, limit * 3);
       } catch { rows = []; }
     }
 
@@ -639,5 +647,5 @@ function searchWorkspaces(query, opts = {}) {
 
 module.exports = {
   FactStore, AstRefreshScope, fingerprint, hashFile, trustScore, buildMatch, termForms,
-  searchWorkspaces, RRF_K, VALID_KINDS, VALID_STATES, EVIDENCE_REFRESH_TIMEOUT_MS
+  searchWorkspaces, RRF_K, VALID_KINDS, VALID_STATES, EVIDENCE_REFRESH_TIMEOUT_MS, FACT_RANK_SQL, FACT_RANK_PARAMS
 };
