@@ -394,6 +394,11 @@ async function handle(msg) {
                 body: { type: 'string', description: 'The full statement, including the reasoning. Stored verbatim.' },
                 summary: { type: 'string', description: 'One line. This is what gets injected into future sessions, so make it self-contained.' },
                 evidence: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files this fact was derived from' },
+                evidence_ranges: { type: 'array', items: { type: 'object', properties: {
+                  path: { type: 'string', description: 'Absolute source file path' },
+                  start_line: { type: 'integer', minimum: 1 }, end_line: { type: 'integer', minimum: 1 }
+                }, required: ['path', 'start_line', 'end_line'] },
+                description: 'Inclusive source line ranges linked to a fact' },
                 evidence_symbols: { type: 'array', items: { type: 'string' }, description: 'Workspace-relative path::qualified_name or path:line selectors' },
                 scope: { type: 'string', description: 'Optional sub-path this fact applies to' },
                 confidence: { type: 'number', description: '0..1, default 1.0' },
@@ -509,9 +514,18 @@ function invalidArguments(name, args) {
     case 'update_fact':
       return Number.isInteger(args.id) ? null : 'id must be an integer fact id';
     case 'record_fact':
-      return args.evidence_symbols === undefined ||
-        (Array.isArray(args.evidence_symbols) && args.evidence_symbols.every(nonEmptyString))
-        ? null : 'evidence_symbols must be an array of symbol selectors';
+      if (args.evidence_symbols !== undefined &&
+          (!Array.isArray(args.evidence_symbols) || !args.evidence_symbols.every(nonEmptyString))) {
+        return 'evidence_symbols must be an array of symbol selectors';
+      }
+      if (args.evidence_ranges !== undefined &&
+          (!Array.isArray(args.evidence_ranges) || args.evidence_ranges.some(range =>
+            !isPlainObject(range) || !nonEmptyString(range.path) || !path.isAbsolute(range.path) ||
+            !Number.isSafeInteger(range.start_line) || !Number.isSafeInteger(range.end_line) ||
+            range.start_line < 1 || range.end_line < range.start_line))) {
+        return 'evidence_ranges must contain absolute paths and valid inclusive line ranges';
+      }
+      return null;
     case 'inspect_symbol':
       return (nonEmptyString(args.symbol) || Number.isInteger(args.symbol)) &&
         (args.path === undefined || nonEmptyString(args.path))
@@ -577,6 +591,8 @@ async function handleToolCall(id, params) {
         result = { content: [{ type: 'text', text: JSON.stringify({
           id: factId, workspace: workspace.root, db: workspace.dbFile,
           state: saved.state, evidence: saved.evidence.map(e => e.path),
+          evidence_ranges: saved.evidence.filter(e => e.start_line !== null)
+            .map(e => ({ path: e.path, start_line: e.start_line, end_line: e.end_line })),
           evidence_symbols: saved.symbol_evidence.map(e => `${e.path}::${e.qualified_name}`)
         }) }] };
         break;
@@ -654,7 +670,7 @@ async function handleToolCall(id, params) {
         ensureAstIndex(workspace, facts.db);
         const selector = args.path && typeof args.symbol === 'string'
           ? { path: args.path, name: args.symbol } : args.symbol;
-        const detail = inspectSymbol(facts.db, selector);
+        const detail = inspectSymbol(facts.db, selector, { workspaceRoot: workspace.root });
         if (detail && args.path && detail.symbol.path !== args.path) {
           throw new Error('symbol id does not belong to the requested path');
         }

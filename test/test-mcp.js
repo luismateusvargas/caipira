@@ -146,6 +146,15 @@ const { call, tool } = server;
   check('line evidence resolves to the enclosing symbol', lineAnchored.evidence_symbols?.includes('symbols.js::greet'), JSON.stringify(lineAnchored));
   const attached = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
   check('inspect_symbol links the active fact', attached.facts.some(f => f.fact_id === anchored.id), JSON.stringify(attached.facts));
+  const ranged = await tool('record_fact', { kind: 'decision', title: 'greet implementation line',
+    body: 'The first line defines greet.', evidence_ranges: [{ path: source, start_line: 1, end_line: 1 }], cwd: tmp });
+  const rangeDetail = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
+  check('inspect_symbol links overlapping file line evidence', ranged.evidence_ranges?.length === 1 &&
+    rangeDetail.facts.some(f => f.fact_id === ranged.id && f.evidence_status === 'file_range'), JSON.stringify(rangeDetail.facts));
+  const callerRange = await tool('record_fact', { kind: 'decision', title: 'caller line',
+    body: 'The second line calls greet.', evidence_ranges: [{ path: source, start_line: 2, end_line: 2 }], cwd: tmp });
+  const isolatedRange = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
+  check('a different function line is not attached', !isolatedRange.facts.some(f => f.fact_id === callerRange.id), JSON.stringify(isolatedRange.facts));
   fs.writeFileSync(source, 'function greet(name) { return name; }\nfunction caller() { return greet("Ada"); }\nfunction other(x, y) { return x + y; }\nmodule.exports = { greet };\n');
   const unrelated = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
   check('unrelated function edit leaves anchored fact clean', unrelated.drifted.length === 0, JSON.stringify(unrelated));

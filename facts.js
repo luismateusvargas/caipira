@@ -23,7 +23,7 @@ const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'propos
 const DEFAULT_TTL_DAYS = { status: 14, decision: null, constraint: null, preference: null, gotcha: null };
 
 /** @typedef {{checked: number, unchanged: number, changed: number, missing: number, unverified: number, foreign: number, changedPaths: string[]}} EvidenceStatus */
-/** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], evidenceSymbols?: {path: string, qualifiedName: string, signatureHash: string}[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
+/** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], evidence_ranges?: {path: string, start_line: number, end_line: number}[], evidenceSymbols?: {path: string, qualifiedName: string, signatureHash: string}[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
 /** @typedef {Partial<FactInput>} FactChanges */
 
 /** @param {unknown} value @returns {boolean} */
@@ -100,7 +100,7 @@ class FactStore {
   // ── writes ──
 
   /** @param {FactInput} input @returns {number} New fact ID. */
-  record({ kind, title, body, summary, scope, evidence, evidenceSymbols = [], confidence, ttl_days, session_id, supersedes, state }) {
+  record({ kind, title, body, summary, scope, evidence, evidence_ranges = [], evidenceSymbols = [], confidence, ttl_days, session_id, supersedes, state }) {
     if (!VALID_KINDS.includes(kind)) throw new Error(`kind must be one of: ${VALID_KINDS.join(', ')}`);
     if (!nonEmptyText(title) || !nonEmptyText(body)) throw new Error('title and body are required');
     if (state !== undefined && !VALID_STATES.includes(state)) throw new Error(`invalid state: ${state}`);
@@ -112,6 +112,12 @@ class FactStore {
     if (!Array.isArray(evidenceSymbols) || evidenceSymbols.some(s => !s ||
         !nonEmptyText(s.path) || !nonEmptyText(s.qualifiedName) || !nonEmptyText(s.signatureHash))) {
       throw new Error('evidenceSymbols must contain resolved symbols');
+    }
+    if (!Array.isArray(evidence_ranges) || evidence_ranges.some(range => !range ||
+        !nonEmptyText(range.path) || !Number.isSafeInteger(range.start_line) ||
+        !Number.isSafeInteger(range.end_line) || range.start_line < 1 ||
+        range.end_line < range.start_line)) {
+      throw new Error('evidence_ranges must contain a path and valid inclusive line range');
     }
 
     const now = Date.now();
@@ -134,6 +140,12 @@ class FactStore {
 
       for (const file of evidence || []) {
         this.attachEvidence(factId, file);
+      }
+      for (const range of evidence_ranges) {
+        this.attachEvidence(factId, range.path);
+        this.db.prepare(`UPDATE fact_evidence SET start_line = ?, end_line = ?
+          WHERE fact_id = ? AND path = ? AND machine = ?`)
+          .run(range.start_line, range.end_line, factId, path.resolve(range.path), this.machine);
       }
       for (const symbol of evidenceSymbols) {
         this.db.prepare(`INSERT INTO fact_symbol_evidence

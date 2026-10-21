@@ -554,7 +554,7 @@ console.log('\n8. schemas v3 and v4: the Rust and JS DDL agree');
   check('same ast_* tables, indexes and triggers (' + fromJs.length + ')', fromJs.length >= 17 && diff.length === 0, diff);
 }
 
-console.log('\n9. migrateAll upgrades existing databases to v5 idempotently');
+console.log('\n9. migrateAll upgrades existing databases to v6 idempotently');
 {
   const caipiraDir = tempDir('caipira-ast-migrate-');
   const dbDir = path.join(caipiraDir, 'database');
@@ -587,13 +587,13 @@ console.log('\n9. migrateAll upgrades existing databases to v5 idempotently');
   const firstRun = migrateAll({ caipiraDir });
   const entry = file => firstRun.workspaces.find(w => w.dbFile === file);
   check('master.db visited and left at its own version', firstRun.master && firstRun.master.to === 1 && firstRun.master.applied.length === 0, firstRun.master);
-  check('v2 workspace db upgraded to v5', same(entry(v2File) && entry(v2File).applied, [3, 4, 5]) && entry(v2File).to === 5, entry(v2File));
-  check('legacy data.db upgraded from v1 to v5', same(entry(path.join(caipiraDir, 'data.db'))?.applied, [2, 3, 4, 5]), firstRun.workspaces);
+  check('v2 workspace db upgraded to v6', same(entry(v2File) && entry(v2File).applied, [3, 4, 5, 6]) && entry(v2File).to === 6, entry(v2File));
+  check('legacy data.db upgraded from v1 to v6', same(entry(path.join(caipiraDir, 'data.db'))?.applied, [2, 3, 4, 5, 6]), firstRun.workspaces);
   check('registered but missing db is skipped, not created', !fs.existsSync(goneFile) && firstRun.failed.length === 0, firstRun.failed);
 
   const upgraded = new Database(v2File);
   upgraded.pragma('foreign_keys = ON');
-  check('schema_version is 5', currentVersion(upgraded) === 5);
+  check('schema_version is 6', currentVersion(upgraded) === 6);
   const n = sql => upgraded.prepare(sql).get().n;
   check('observations, sessions and facts preserved', n('SELECT COUNT(*) n FROM observations') === 1
     && n('SELECT COUNT(*) n FROM sessions') === 1 && n('SELECT COUNT(*) n FROM facts') === 1);

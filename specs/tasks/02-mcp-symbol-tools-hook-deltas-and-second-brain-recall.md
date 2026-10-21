@@ -49,6 +49,7 @@ Outside scope: The `caipira explore` HTTP server and React UI, which belong to B
    - Register `workspace_symbols` and `inspect_symbol` in `TOOLS` and `handleTool()`.
    - Extend `record_fact` schema in `mcp.js` with optional `evidence_symbols` (`string[]` of `"rel/path::symbol"`), resolving current `signature_hash` from `<workspace>.db` (auto-indexing the file if needed).
    - Format `inspect_symbol` output clearly showing `Signature`, `Receives (params)`, `Returns`, `Doc`, `Callers`, `Callees`, `Type Dependencies`, and `Attached Facts`.
+   - Add a versioned workspace migration and optional `record_fact.evidence_ranges` so `inspect_symbol` can also link active file evidence whose line range overlaps the symbol.
 3. **Upgrade [`hooks/universal-hook.js`](file:///home/htxzz77/Projects/caipira/hooks/universal-hook.js) and [`inject.js`](file:///home/htxzz77/Projects/caipira/inject.js)**:
    - Replace the Madar startup guidance with Caipira symbol tools and use `updateFileAst(ws.root, ws.dbFile, filePath)` in the `PostToolUse` capture path for caller and fact-impact notices.
    - Add `synthesizeSessionDigest(store, sessionId)` in `universal-hook.js` called on `Stop` / `SessionEnd` so every non-trivial session stores a concise episodic digest in `sessions.summary`.

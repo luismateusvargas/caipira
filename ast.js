@@ -393,7 +393,8 @@ function symbolIdFor(db, targetPath, targetSymbol) {
  * the latter can include same-named symbols elsewhere.
  * @param {string|object} dbFile Database path or open better-sqlite3 handle.
  * @param {string|number|object} selector See findSymbols above.
- * @param {{limit?: number}} [opts] Cap on each related list (default 100).
+ * @param {{limit?: number, workspaceRoot?: string}} [opts] Cap on each related list (default 100);
+ *   workspaceRoot resolves absolute file evidence paths for line-range facts.
  * @returns {object|null} null when nothing matches.
  * @throws {AstEngineError} invalid_argument for a malformed selector.
  */
@@ -447,6 +448,19 @@ function inspectSymbol(dbFile, selector, opts = {}) {
       ORDER BY f.updated_at DESC
     `).all(symbol.path, symbol.qualified_name)
       .map(row => ({ ...row, evidence_status: row.signature_hash === symbol.signature_hash ? 'current' : 'drifted' }));
+    if (opts.workspaceRoot) {
+      const source = path.resolve(opts.workspaceRoot, symbol.path);
+      const ranged = db.prepare(`SELECT f.id AS fact_id, f.kind, f.title, f.summary, f.state,
+        e.start_line, e.end_line FROM fact_evidence e JOIN facts f ON f.id = e.fact_id
+        WHERE e.path = ? AND e.start_line IS NOT NULL AND e.end_line IS NOT NULL
+          AND e.start_line <= ? AND e.end_line >= ?
+          AND f.state IN ('active', 'needs_review') ORDER BY f.updated_at DESC`)
+        .all(source, symbol.end_line, symbol.start_line);
+      const attached = new Set(facts.map(f => f.fact_id));
+      for (const row of ranged) {
+        if (!attached.has(row.fact_id)) facts.push({ ...row, evidence_status: 'file_range' });
+      }
+    }
 
     return {
       symbol,

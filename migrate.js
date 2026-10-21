@@ -343,6 +343,13 @@ const WORKSPACE_MIGRATIONS = [
     up(db) {
       db.exec('ALTER TABLE sessions ADD COLUMN summary TEXT');
     }
+  },
+  {
+    version: 6,
+    up(db) {
+      db.exec('ALTER TABLE fact_evidence ADD COLUMN start_line INTEGER');
+      db.exec('ALTER TABLE fact_evidence ADD COLUMN end_line INTEGER');
+    }
   }
 ];
 
