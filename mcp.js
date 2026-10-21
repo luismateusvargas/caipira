@@ -6,6 +6,7 @@
 const { MemoryStore, redactPrivate } = require('./store');
 const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces } = require('./workspace');
 const { FactStore, searchWorkspaces } = require('./facts');
+const { syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -45,7 +46,7 @@ function factsFor(cwd) {
     const db = openWorkspaceDb(workspace.dbFile);
     entry = {
       db, identity: fileIdentity(workspace.dbFile),
-      store: new FactStore(db, { machine: machineId(), agent: 'mcp' })
+      store: new FactStore(db, { machine: machineId(), agent: 'mcp', root: workspace.root })
     };
     factConnections.set(workspace.dbFile, entry);
   }
@@ -93,6 +94,34 @@ function closeMemoryStores() {
 function closeAll() {
   closeMemoryStores();
   closeFactConnections();
+}
+
+function ensureAstIndex(workspace, db) {
+  if (db.prepare('SELECT 1 FROM ast_files LIMIT 1').get()) return;
+  syncWorkspaceAst(workspace.root, workspace.dbFile);
+}
+
+function resolveSymbolEvidence(workspace, db, selectors) {
+  const resolved = [];
+  for (const selector of selectors) {
+    if (!nonEmptyString(selector)) throw new Error('evidence_symbols must contain non-empty strings');
+    const split = selector.indexOf('::');
+    const line = selector.match(/^(.+):(\d+)$/);
+    const relPath = split > 0 ? selector.slice(0, split) : line ? line[1] : null;
+    if (!relPath || path.isAbsolute(relPath) || relPath.split(/[\\/]/).includes('..')) {
+      throw new Error(`evidence symbol needs a workspace-relative source path: ${selector}`);
+    }
+    const absolute = path.resolve(workspace.root, relPath);
+    updateFileAst(workspace.root, workspace.dbFile, absolute);
+    const found = inspectSymbol(db, selector);
+    if (!found || found.symbol.path !== relPath.replace(/\\/g, '/')) {
+      throw new Error(`symbol not found: ${selector}`);
+    }
+    resolved.push({ path: found.symbol.path, qualifiedName: found.symbol.qualified_name,
+      signatureHash: found.symbol.signature_hash });
+  }
+  return [...new Map(resolved.map(symbol =>
+    [`${symbol.path}::${symbol.qualifiedName}`, symbol])).values()];
 }
 
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
@@ -365,6 +394,7 @@ async function handle(msg) {
                 body: { type: 'string', description: 'The full statement, including the reasoning. Stored verbatim.' },
                 summary: { type: 'string', description: 'One line. This is what gets injected into future sessions, so make it self-contained.' },
                 evidence: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of files this fact was derived from' },
+                evidence_symbols: { type: 'array', items: { type: 'string' }, description: 'Workspace-relative path::qualified_name or path:line selectors' },
                 scope: { type: 'string', description: 'Optional sub-path this fact applies to' },
                 confidence: { type: 'number', description: '0..1, default 1.0' },
                 ttl_days: { type: 'number', description: 'Re-verify after this many days. Defaults to 14 for status, none otherwise.' },
@@ -424,6 +454,23 @@ async function handle(msg) {
             }
           },
           {
+            name: 'workspace_symbols',
+            description: 'Find indexed functions, types, and other symbols in this workspace.',
+            inputSchema: { type: 'object', properties: {
+              query: { type: 'string' }, kind: { type: 'string' }, path_prefix: { type: 'string' },
+              public_only: { type: 'boolean' }, limit: { type: 'integer', minimum: 0, maximum: 500 },
+              cwd: { type: 'string' }
+            } }
+          },
+          {
+            name: 'inspect_symbol',
+            description: 'Inspect one symbol, its signature, graph connections, imports, and attached facts.',
+            inputSchema: { type: 'object', properties: {
+              symbol: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+              path: { type: 'string' }, cwd: { type: 'string' }
+            }, required: ['symbol'] }
+          },
+          {
             name: 'list_workspaces',
             description: 'List known workspaces and the database file each one uses.',
             inputSchema: { type: 'object', properties: {} }
@@ -461,6 +508,21 @@ function invalidArguments(name, args) {
       return nonEmptyString(args.session_id) ? null : 'Missing required parameter: session_id';
     case 'update_fact':
       return Number.isInteger(args.id) ? null : 'id must be an integer fact id';
+    case 'record_fact':
+      return args.evidence_symbols === undefined ||
+        (Array.isArray(args.evidence_symbols) && args.evidence_symbols.every(nonEmptyString))
+        ? null : 'evidence_symbols must be an array of symbol selectors';
+    case 'inspect_symbol':
+      return (nonEmptyString(args.symbol) || Number.isInteger(args.symbol)) &&
+        (args.path === undefined || nonEmptyString(args.path))
+        ? null : 'symbol must be a name or integer id; path must be a non-empty string';
+    case 'workspace_symbols':
+      for (const field of ['query', 'kind', 'path_prefix']) {
+        if (args[field] !== undefined && typeof args[field] !== 'string') return `${field} must be a string`;
+      }
+      if (args.public_only !== undefined && typeof args.public_only !== 'boolean') return 'public_only must be boolean';
+      return args.limit === undefined || (Number.isInteger(args.limit) && args.limit >= 0 && args.limit <= 500)
+        ? null : 'limit must be an integer from 0 to 500';
     default:
       return null;
   }
@@ -508,11 +570,14 @@ async function handleToolCall(id, params) {
       }
       case 'record_fact': {
         const { workspace, facts } = factsFor(args.cwd);
-        const factId = facts.record(args);
+        const evidenceSymbols = args.evidence_symbols
+          ? resolveSymbolEvidence(workspace, facts.db, args.evidence_symbols) : [];
+        const factId = facts.record({ ...args, evidenceSymbols });
         const saved = facts.get(factId);
         result = { content: [{ type: 'text', text: JSON.stringify({
           id: factId, workspace: workspace.root, db: workspace.dbFile,
-          state: saved.state, evidence: saved.evidence.map(e => e.path)
+          state: saved.state, evidence: saved.evidence.map(e => e.path),
+          evidence_symbols: saved.symbol_evidence.map(e => `${e.path}::${e.qualified_name}`)
         }) }] };
         break;
       }
@@ -568,9 +633,46 @@ async function handleToolCall(id, params) {
           workspace: workspace.root,
           checked: checked.length,
           drifted: checked.filter(c => c.drifted).map(c => ({
-            id: c.id, title: c.title, files_to_reread: c.changedPaths
+            id: c.id, title: c.title,
+            fact: { id: c.id, kind: c.kind, title: c.title, summary: c.summary },
+            files_to_reread: c.changedPaths, broken: c.broken
           }))
         }) }] };
+        break;
+      }
+      case 'workspace_symbols': {
+        const { workspace, facts } = factsFor(args.cwd);
+        ensureAstIndex(workspace, facts.db);
+        result = { content: [{ type: 'text', text: JSON.stringify(queryWorkspaceSymbols(facts.db, {
+          query: args.query, kind: args.kind, path: args.path_prefix,
+          publicOnly: args.public_only, limit: args.limit
+        })) }] };
+        break;
+      }
+      case 'inspect_symbol': {
+        const { workspace, facts } = factsFor(args.cwd);
+        ensureAstIndex(workspace, facts.db);
+        const selector = args.path && typeof args.symbol === 'string'
+          ? { path: args.path, name: args.symbol } : args.symbol;
+        const detail = inspectSymbol(facts.db, selector);
+        if (detail && args.path && detail.symbol.path !== args.path) {
+          throw new Error('symbol id does not belong to the requested path');
+        }
+        const output = detail && {
+          ...detail,
+          params: detail.symbol.params,
+          return_type: detail.symbol.return_type,
+          doc_summary: detail.symbol.doc_summary,
+          signature_text: detail.symbol.signature_text,
+          path: detail.symbol.path,
+          start_line: detail.symbol.start_line,
+          end_line: detail.symbol.end_line,
+          signature_hash: detail.symbol.signature_hash,
+          callers: detail.callers.map(c => ({ ...c, source_path: c.path, source_symbol: c.symbol })),
+          type_references: [...detail.uses_types, ...detail.inherits],
+          imports: detail.file?.imports || []
+        };
+        result = { content: [{ type: 'text', text: JSON.stringify(output) }] };
         break;
       }
       case 'list_workspaces': {

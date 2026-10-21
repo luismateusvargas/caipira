@@ -337,7 +337,7 @@ const SOURCE_EXTENSION = /\.(?:[cm]?[jt]sx?|vue|pyi?|rs|go|c|cc|cpp|cxx|h|hh|hpp
 
 // Selectors: a symbol id; "path::qualified.name"; "path:line" for the
 // innermost symbol enclosing that line; a bare qualified or simple name; or
-// {id} / {path, qualified_name}. Rust and C++ names contain "::" too, so the
+// {id} / {path, qualified_name} / {path, name}. Rust and C++ names contain "::" too, so the
 // first "::" splits off a path only when what precedes it is a source file.
 function findSymbols(db, selector) {
   const select = `SELECT ${SYMBOL_COLUMNS} FROM ast_symbols s`;
@@ -348,6 +348,12 @@ function findSymbols(db, selector) {
     if (Number.isInteger(selector.id)) return db.prepare(`${select} WHERE s.id = ?`).all(selector.id);
     const qualified = selector.qualified_name ?? selector.qualifiedName;
     requireText('selector.path', selector.path);
+    if (selector.name !== undefined) {
+      const name = requireText('selector.name', selector.name);
+      return db.prepare(`${select} WHERE s.path = ? AND (s.qualified_name = ? OR s.name = ?)
+        ORDER BY (s.qualified_name = ?) DESC, s.start_line LIMIT 50`)
+        .all(selector.path, name, name, name);
+    }
     requireText('selector.qualified_name', qualified);
     return db.prepare(`${select} WHERE s.path = ? AND s.qualified_name = ? ORDER BY s.start_line`).all(selector.path, qualified);
   }

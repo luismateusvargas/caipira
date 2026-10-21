@@ -2,11 +2,11 @@
 
 Status: ready
 Project rules: specs/project.md
-Target files: mcp.js, hooks/universal-hook.js, inject.js, workspace.js, ast.js, test/test-mcp.js, test/test-hooks.js, test/test-workspace.js
+Target files: mcp.js, hooks/universal-hook.js, inject.js, facts.js, ast.js, migrate.js, test/test-mcp.js, test/test-hook.js, test/test-inject.js, test/test-facts.js, test/test-ast.js, test/test-workspace.js
 
 ## Outcome and boundary
 
-Connect the Block 1 AST symbol store (`ast.js` + `<workspace>.db`) and `fact_symbol_evidence` (`master.db`) to Caipira's machine-facing interfaces:
+Connect the Block 1 AST symbol store (`ast.js` + `<workspace>.db`) and `fact_symbol_evidence` (`<workspace>.db`) to Caipira's machine-facing interfaces:
 1. Expose `workspace_symbols` and `inspect_symbol` MCP tools in [`mcp.js`](file:///home/htxzz77/Projects/caipira/mcp.js), and extend `record_fact` and `check_drift` with symbol-level evidence (`evidence_symbols`) so facts anchored to specific functions/structs only drift when that symbol's `signature_hash` changes or the symbol is deleted.
 2. Replace the external `madar` dependency in [`hooks/universal-hook.js`](file:///home/htxzz77/Projects/caipira/hooks/universal-hook.js) (`handlePostToolUse`) with Caipira's built-in incremental single-file AST delta (`updateFileAst`), alerting the agent when a modified function's signature changes or impacts callers and symbol-anchored facts.
 3. Synthesize structured session digests at `Stop` / `SessionEnd` (`sessions.summary`) and upgrade [`inject.js`](file:///home/htxzz77/Projects/caipira/inject.js) (`buildInjection`) to deliver subpath-boosted standing facts, recent episodic session continuity, and a compact workspace symbol map on `SessionStart` / `UserPromptSubmit`.
@@ -40,9 +40,9 @@ Outside scope: The `caipira explore` HTTP server and React UI, which belong to B
 
 ## Implementation plan
 
-1. **Extend [`workspace.js`](file:///home/htxzz77/Projects/caipira/workspace.js) for symbol-anchored facts**:
-   - Update `WorkspaceRegistry.recordFact` to accept `evidenceSymbols = []` (`Array<{ path, qualifiedName, signatureHash }>`), inserting into `fact_symbol_evidence`.
-   - Update `WorkspaceRegistry.checkDrift(workspaceId)` to evaluate `fact_symbol_evidence` against `<workspace>.db`'s `ast_symbols`:
+1. **Extend [`facts.js`](file:///home/htxzz77/Projects/caipira/facts.js) for symbol-anchored facts**:
+   - Update `FactStore.record` to accept `evidenceSymbols = []` (`Array<{ path, qualifiedName, signatureHash }>`), inserting into `fact_symbol_evidence`.
+   - Update `FactStore.verify(ids)` to evaluate `fact_symbol_evidence` against `<workspace>.db`'s `ast_symbols`:
      - If a fact has symbol evidence and all referenced symbols still exist with matching `signature_hash`, treat the fact as verified even if the file's overall SHA-256 changed.
      - If a referenced symbol is missing or its `signature_hash` changed, include `{ path, symbol: qualified_name, reason: 'symbol_missing' | 'symbol_signature_changed' }` in `broken`.
 2. **Add `workspace_symbols` and `inspect_symbol` tools in [`mcp.js`](file:///home/htxzz77/Projects/caipira/mcp.js)**:
@@ -50,10 +50,10 @@ Outside scope: The `caipira explore` HTTP server and React UI, which belong to B
    - Extend `record_fact` schema in `mcp.js` with optional `evidence_symbols` (`string[]` of `"rel/path::symbol"`), resolving current `signature_hash` from `<workspace>.db` (auto-indexing the file if needed).
    - Format `inspect_symbol` output clearly showing `Signature`, `Receives (params)`, `Returns`, `Doc`, `Callers`, `Callees`, `Type Dependencies`, and `Attached Facts`.
 3. **Upgrade [`hooks/universal-hook.js`](file:///home/htxzz77/Projects/caipira/hooks/universal-hook.js) and [`inject.js`](file:///home/htxzz77/Projects/caipira/inject.js)**:
-   - Remove the external `madar` child-process spawn in `handlePostToolUse` (`universal-hook.js` lines 161–187) and replace it with `updateFileAst(ws.root, ws.dbFile, filePath)` + caller & fact-impact lookup.
+   - Replace the Madar startup guidance with Caipira symbol tools and use `updateFileAst(ws.root, ws.dbFile, filePath)` in the `PostToolUse` capture path for caller and fact-impact notices.
    - Add `synthesizeSessionDigest(store, sessionId)` in `universal-hook.js` called on `Stop` / `SessionEnd` so every non-trivial session stores a concise episodic digest in `sessions.summary`.
-   - Update `buildInjection(registry, ws, opts)` in `inject.js` to accept `{ budget, cwd, store, astSummary }`, applying a subpath relevance boost (`+0.25` sort weight when a fact's evidence path shares the active `cwd` subpath) and appending recent session digests when budget allows.
-4. **Update and expand tests in [`test/test-mcp.js`](file:///home/htxzz77/Projects/caipira/test/test-mcp.js), [`test/test-hooks.js`](file:///home/htxzz77/Projects/caipira/test/test-hooks.js), and [`test/test-workspace.js`](file:///home/htxzz77/Projects/caipira/test/test-workspace.js)**:
+   - Add `buildInjection(db, ws, opts)` in `inject.js` with `{ budget, cwd, prompt, machine }`, applying a subpath relevance boost (`+0.25` sort weight when a fact's evidence path shares the active `cwd` subpath) and appending recent session digests when budget allows.
+4. **Update and expand tests in [`test/test-mcp.js`](file:///home/htxzz77/Projects/caipira/test/test-mcp.js), [`test/test-hook.js`](file:///home/htxzz77/Projects/caipira/test/test-hook.js), and [`test/test-inject.js`](file:///home/htxzz77/Projects/caipira/test/test-inject.js)**:
    - Test `workspace_symbols` and `inspect_symbol` over MCP stdio.
    - Test symbol-level drift immunity (unrelated edit in same file does not drift symbol-anchored fact) and symbol-level drift trigger (changing function parameter/return type marks fact drifted).
    - Test `PostToolUse` hook `<system-reminder>` emission on breaking signature change without `madar`.
@@ -62,8 +62,8 @@ Outside scope: The `caipira explore` HTTP server and React UI, which belong to B
 ## Verification
 
 - `~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-mcp.js` — passes all existing + new `workspace_symbols`, `inspect_symbol`, and `evidence_symbols` tests.
-- `~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-hooks.js` — passes `PostToolUse` AST delta warning and `SessionEnd` digest synthesis tests within timeout budgets.
-- `~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-workspace.js` — passes symbol-level `checkDrift` and subpath injection tests.
+- `~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-hook.js` — passes `PostToolUse` AST delta warning and `SessionEnd` digest synthesis tests within timeout budgets.
+- `~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/test-workspace.js` — passes workspace and schema migration tests; `test/test-mcp.js` covers symbol drift and `test/test-inject.js` covers subpath injection.
 
 ## Open decisions and sources
 

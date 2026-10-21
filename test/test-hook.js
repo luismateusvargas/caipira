@@ -30,8 +30,8 @@ let ctx = r.hookSpecificOutput && r.hookSpecificOutput.additionalContext;
 check('uses hookSpecificOutput', Boolean(ctx), JSON.stringify(r).slice(0, 120));
 check('hookEventName correct', r.hookSpecificOutput.hookEventName === 'SessionStart');
 check('keeps caipira startup instruction', ctx.includes('shared local-first cross-agent memory'));
-check('keeps madar instruction', ctx.includes('Madar'));
-check('madar graph path is portable', ctx.includes('<project-root>/out/graph.json'));
+check('advertises built-in symbol tools', ctx.includes('workspace_symbols') && ctx.includes('inspect_symbol'));
+check('does not advertise Madar', !ctx.includes('Madar'));
 
 // The write half of the contract. Nothing used to name these, so memory only
 // grew when the user asked for it — a fact the agent is never told to record
@@ -54,13 +54,14 @@ check('injects recalled facts', Boolean(ctx) && ctx.includes('Caipira recalled')
 check('names the codex decision', ctx.includes('cavemem'));
 check('does NOT repeat startup boilerplate', !ctx.includes('Madar is the global local AST'));
 
-console.log('\n3. Claude Code — UserPromptSubmit stays silent on an unrelated prompt');
+console.log('\n3. Claude Code — UserPromptSubmit keeps unrelated facts out');
 r = run('claude-code', 'UserPromptSubmit', {
   session_id: 'hooktest-1', cwd: WS,
   prompt: 'add a dark mode toggle to the settings page'
 });
-check('no injection', !r.hookSpecificOutput, JSON.stringify(r));
-check('still returns a valid continue', r.continue === true, JSON.stringify(r));
+const unrelated = r.hookSpecificOutput?.additionalContext || '';
+check('unrelated facts are not injected', !unrelated.includes('Caipira recalled facts:'), JSON.stringify(r));
+check('returns a valid hook response', r.continue === true || r.hookSpecificOutput?.hookEventName === 'UserPromptSubmit', JSON.stringify(r));
 
 console.log('\n4. Codex — same shape, confirmed against the binary');
 r = run('codex', 'UserPromptSubmit', {
@@ -295,6 +296,35 @@ check('SessionEnd alias closes the session', Boolean(row && row.ended_at), JSON.
 run('codex', 'PostToolUse', { session_id: 'hooktest-midstream', cwd: WS, tool_name: 'Read', tool_input: { file_path: 'x' } });
 row = sessionRow(wsInfo.dbFile, 'hooktest-midstream');
 check('a session first seen mid-stream records client and cwd', row && row.ide === 'codex' && row.cwd === WS, JSON.stringify(row));
+
+console.log('\n13. AST delta reminder and session digest');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-ast-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const source = path.join(dir, 'api.js');
+  fs.writeFileSync(source, 'function api(value) { return value; }\nfunction caller() { return api(1); }\nmodule.exports = { api };\n');
+  const info = ensureWorkspace(dir);
+  const ast = require(ROOT + '/ast.js');
+  ast.updateFileAst(dir, info.dbFile, source);
+  const db = openWorkspaceDb(info.dbFile);
+  const symbol = ast.inspectSymbol(db, 'api.js::api').symbol;
+  const id = new FactStore(db, { machine: machineId(), agent: 'test', root: dir }).record({
+    kind: 'constraint', title: 'api signature', body: 'api takes one argument',
+    evidenceSymbols: [{ path: 'api.js', qualifiedName: 'api', signatureHash: symbol.signature_hash }]
+  });
+  db.close();
+  fs.writeFileSync(source, 'function api(value, extra) { return value + extra; }\nfunction caller() { return api(1); }\nmodule.exports = { api };\n');
+  const notice = run('codex', 'PostToolUse', { session_id: 'hook-ast-session', cwd: dir,
+    tool_name: 'Edit', tool_input: { file_path: source } });
+  check('public signature change emits system reminder', notice.systemMessage?.includes('<system-reminder>') && notice.systemMessage.includes('api.js::api'), JSON.stringify(notice));
+  check('reminder names caller and impacted fact', notice.systemMessage?.includes('caller') && notice.systemMessage.includes(`[constraint#${id}]`), JSON.stringify(notice));
+  run('codex', 'SessionEnd', { session_id: 'hook-ast-session', cwd: dir });
+  const ended = sessionRow(info.dbFile, 'hook-ast-session');
+  check('SessionEnd stores deterministic tool/file/symbol digest', ended.summary?.includes('Tools: Edit') && ended.summary.includes('Files:') && ended.summary.includes('Symbols: api.js::api'), JSON.stringify(ended));
+  const prompt = run('codex', 'SessionStart', { session_id: 'hook-ast-next', cwd: dir });
+  check('next session recalls the digest', prompt.hookSpecificOutput?.additionalContext?.includes('Recent sessions:'), JSON.stringify(prompt));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
 
 for (const probe of probes) fs.rmSync(probe.dir, { recursive: true, force: true });
 

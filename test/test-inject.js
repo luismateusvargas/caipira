@@ -3,7 +3,7 @@
 require('./fixtures').ensureIsolatedHome();
 const ROOT = require('path').join(__dirname, '..');
 const { machineId } = require(ROOT + '/workspace.js');
-const { buildPromptInjection, buildStandingInjection, selectFacts, renderInjection, termGroups } = require(ROOT + '/inject.js');
+const { buildPromptInjection, buildStandingInjection, buildInjection, selectFacts, renderInjection, termGroups } = require(ROOT + '/inject.js');
 const { buildOrMatch, termForms, ftsQuote } = require(ROOT + '/compress.js');
 
 const { db } = require('./fixtures').seedFacts(ROOT);
@@ -108,6 +108,27 @@ check('instructs update_fact', notice && notice.includes('update_fact'));
 check('offers supersedes for a fact the change invalidated', notice && notice.includes('supersedes'));
 db.prepare("UPDATE facts SET state = 'active' WHERE id = 2").run();
 console.log('\n--- drift notice ---\n' + notice);
+
+console.log('\n7. bounded episodic and subpath recall');
+const { FactStore } = require(ROOT + '/facts.js');
+const factStore = new FactStore(db, { machine: machineId(), agent: 'test', root: ROOT });
+const localId = factStore.record({ kind: 'decision', title: 'local recall', body: 'The local rule.',
+  evidence: [ROOT + '/test/test-inject.js'] });
+const globalId = factStore.record({ kind: 'decision', title: 'global recall', body: 'The global rule.',
+  evidence: [ROOT + '/package.json'] });
+db.prepare(`INSERT INTO sessions (id, ide, started_at, ended_at, summary)
+  VALUES ('digest-probe', 'test', 1, 2, 'Edited source and checked callers')`).run();
+db.prepare(`INSERT INTO ast_symbols (path, name, qualified_name, kind, is_public, start_line,
+  end_line, params_json, signature_text, signature_hash)
+  VALUES ('test/sample.js', 'inspect', 'inspect', 'function', 1, 1, 2, '[]', 'inspect()', 'abc')`).run();
+const recall = buildInjection(db, { root: ROOT }, { cwd: ROOT + '/test', budget: 900 });
+check('local evidence ranks before newer global evidence', recall.indexOf(`#${localId}]`) < recall.indexOf(`#${globalId}]`), recall);
+check('recent digest is included', recall.includes('Recent sessions:') && recall.includes('Edited source'), recall);
+check('compact symbol map is included', recall.includes('Workspace symbols:') && recall.includes('test/sample.js::inspect'), recall);
+for (const budget of [0, 24, 70, 500]) {
+  const text = buildInjection(db, { root: ROOT }, { cwd: ROOT + '/test', budget });
+  check(`strict ${budget}-character budget`, !text || text.length <= budget, text?.length);
+}
 
 db.close();
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

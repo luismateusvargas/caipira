@@ -12,6 +12,7 @@
 
 const { FactStore, trustScore } = require('./facts');
 const { compress, expand, termForms, buildOrMatch } = require('./compress');
+const path = require('path');
 
 // Injecting the top N of anything guarantees noise on an unrelated prompt.
 // These gates are on absolute properties of the match, not on rank.
@@ -117,7 +118,7 @@ function selectFacts(db, prompt, opts = {}) {
   }
   if (rows.length === 0) return [];
 
-  const store = new FactStore(db, { machine });
+  const store = new FactStore(db, { machine, root: opts.root });
   const scored = [];
   for (const fact of rows) {
     const haystack = `${fact.title}\n${fact.summary}\n${fact.body}`.toLowerCase();
@@ -202,6 +203,77 @@ function buildStandingInjection(db, opts = {}) {
   }
 }
 
+/**
+ * Builds bounded standing or prompt-specific recall with local evidence,
+ * recent session digests, and a small symbol map.
+ * @param {object} db Open workspace database.
+ * @param {{root: string}} workspace Resolved workspace.
+ * @param {{cwd?: string, budget?: number, prompt?: string, machine?: string}} [opts]
+ * @returns {string|null}
+ */
+function buildInjection(db, workspace, opts = {}) {
+  try {
+    const budget = Math.max(0, Math.min(12000, Number.isInteger(opts.budget) ? opts.budget : 2400));
+    if (!budget) return null;
+    const relative = workspace && workspace.root && opts.cwd
+      ? path.relative(workspace.root, opts.cwd).split(path.sep).join('/') : '';
+    const subpath = relative && relative !== '.' && !relative.startsWith('..') ? relative : '';
+    let facts;
+    if (opts.prompt) {
+      facts = selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root })
+        .map(row => ({ ...row.fact, score: row.score }));
+    } else {
+      facts = db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
+        ORDER BY updated_at DESC LIMIT 40`).all();
+    }
+    const locality = new Set();
+    if (subpath) {
+      const prefix = `${subpath}/`;
+      const absolute = path.join(workspace.root, prefix);
+      for (const row of db.prepare(`SELECT fact_id, path FROM fact_evidence`).all()) {
+        if (row.path.startsWith(absolute)) locality.add(row.fact_id);
+      }
+      for (const row of db.prepare(`SELECT fact_id, path FROM fact_symbol_evidence`).all()) {
+        if (row.path.startsWith(prefix)) locality.add(row.fact_id);
+      }
+    }
+    const kindWeight = { status: 0.5, gotcha: 0.4, constraint: 0.3, preference: 0.2, decision: 0.1 };
+    facts.sort((a, b) => (b.score + (kindWeight[b.kind] || 0) + (locality.has(b.id) ? 0.25 : 0)) -
+      (a.score + (kindWeight[a.kind] || 0) + (locality.has(a.id) ? 0.25 : 0)) || b.updated_at - a.updated_at);
+
+    const blocks = [];
+    let used = 0;
+    const add = line => {
+      const candidate = blocks.length ? `\n${line}` : line;
+      if (used + candidate.length > budget) return false;
+      blocks.push(line);
+      used += candidate.length;
+      return true;
+    };
+    if (facts.length) {
+      add(opts.prompt ? 'Caipira recalled facts:' : 'Caipira standing facts for this workspace:');
+      for (const fact of facts.slice(0, 8)) {
+        const flag = fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
+        add(`- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`);
+      }
+    }
+    const sessions = db.prepare(`SELECT summary FROM sessions WHERE summary IS NOT NULL AND trim(summary) != ''
+      ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 2`).all();
+    if (sessions.length && add('Recent sessions:')) {
+      for (const session of sessions) add(`- ${session.summary}`);
+    }
+    const symbols = db.prepare(`SELECT path, qualified_name FROM ast_symbols WHERE is_public = 1
+      ORDER BY CASE WHEN ? != '' AND (path = ? OR path LIKE ?) THEN 0 ELSE 1 END,
+      path, start_line LIMIT 5`).all(subpath, subpath, `${subpath}/%`);
+    if (symbols.length && add('Workspace symbols:')) {
+      for (const symbol of symbols) add(`- ${symbol.path}::${symbol.qualified_name}`);
+    }
+    return blocks.length ? blocks.join('\n') : null;
+  } catch {
+    return null;
+  }
+}
+
 // Facts whose evidence files have moved. Unlike prompt injection this is not
 // a relevance judgement and needs no threshold: the fingerprints already prove
 // the ground truth changed, so the only question is whether the fact survived
@@ -231,6 +303,6 @@ function buildDriftNotice(db, opts = {}) {
 }
 
 module.exports = {
-  buildPromptInjection, buildStandingInjection, buildDriftNotice, selectFacts, renderInjection,
+  buildPromptInjection, buildStandingInjection, buildInjection, buildDriftNotice, selectFacts, renderInjection,
   coverageOf, termGroups, MIN_COVERAGE, MIN_TRUST, MAX_FACTS
 };

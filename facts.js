@@ -23,7 +23,7 @@ const VALID_STATES = ['active', 'needs_review', 'superseded', 'revoked', 'propos
 const DEFAULT_TTL_DAYS = { status: 14, decision: null, constraint: null, preference: null, gotcha: null };
 
 /** @typedef {{checked: number, unchanged: number, changed: number, missing: number, unverified: number, foreign: number, changedPaths: string[]}} EvidenceStatus */
-/** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
+/** @typedef {{kind: string, title: string, body: string, summary?: string, scope?: string, evidence?: string[], evidenceSymbols?: {path: string, qualifiedName: string, signatureHash: string}[], confidence?: number, ttl_days?: number, session_id?: string, supersedes?: number, state?: string}} FactInput */
 /** @typedef {Partial<FactInput>} FactChanges */
 
 /** @param {unknown} value @returns {boolean} */
@@ -89,17 +89,18 @@ function trustScore(fact, evidenceStatus) {
 
 /** Stores and verifies durable facts in one workspace database. */
 class FactStore {
-  /** @param {import('better-sqlite3').Database} db @param {{machine?: string, agent?: string}} [opts] */
+  /** @param {import('better-sqlite3').Database} db @param {{machine?: string, agent?: string, root?: string}} [opts] */
   constructor(db, opts = {}) {
     this.db = db;
     this.machine = opts.machine || 'unknown';
     this.agent = opts.agent || 'unknown';
+    this.root = opts.root || null;
   }
 
   // ── writes ──
 
   /** @param {FactInput} input @returns {number} New fact ID. */
-  record({ kind, title, body, summary, scope, evidence, confidence, ttl_days, session_id, supersedes, state }) {
+  record({ kind, title, body, summary, scope, evidence, evidenceSymbols = [], confidence, ttl_days, session_id, supersedes, state }) {
     if (!VALID_KINDS.includes(kind)) throw new Error(`kind must be one of: ${VALID_KINDS.join(', ')}`);
     if (!nonEmptyText(title) || !nonEmptyText(body)) throw new Error('title and body are required');
     if (state !== undefined && !VALID_STATES.includes(state)) throw new Error(`invalid state: ${state}`);
@@ -107,6 +108,10 @@ class FactStore {
     if (supersedes !== undefined && supersedes !== null &&
         (!Number.isSafeInteger(supersedes) || !this.db.prepare('SELECT id FROM facts WHERE id = ?').get(supersedes))) {
       throw new Error(`no fact to supersede with id ${supersedes}`);
+    }
+    if (!Array.isArray(evidenceSymbols) || evidenceSymbols.some(s => !s ||
+        !nonEmptyText(s.path) || !nonEmptyText(s.qualifiedName) || !nonEmptyText(s.signatureHash))) {
+      throw new Error('evidenceSymbols must contain resolved symbols');
     }
 
     const now = Date.now();
@@ -129,6 +134,12 @@ class FactStore {
 
       for (const file of evidence || []) {
         this.attachEvidence(factId, file);
+      }
+      for (const symbol of evidenceSymbols) {
+        this.db.prepare(`INSERT INTO fact_symbol_evidence
+          (fact_id, path, qualified_name, signature_hash) VALUES (?, ?, ?, ?)`)
+          .run(factId, symbol.path, symbol.qualifiedName, symbol.signatureHash);
+        if (this.root) this.attachEvidence(factId, path.join(this.root, symbol.path));
       }
 
       // Superseding is a state transition on the old fact, never a delete:
@@ -218,6 +229,12 @@ class FactStore {
       'SELECT path FROM fact_evidence WHERE fact_id = ? AND machine = ?'
     ).all(id, this.machine);
     for (const row of rows) this.attachEvidence(id, row.path);
+    this.db.prepare(`UPDATE fact_symbol_evidence SET signature_hash =
+      (SELECT signature_hash FROM ast_symbols WHERE path = fact_symbol_evidence.path
+       AND qualified_name = fact_symbol_evidence.qualified_name ORDER BY start_line LIMIT 1)
+      WHERE fact_id = ? AND EXISTS
+      (SELECT 1 FROM ast_symbols WHERE path = fact_symbol_evidence.path
+       AND qualified_name = fact_symbol_evidence.qualified_name)`).run(id);
 
     const now = Date.now();
     this.db.prepare(
@@ -236,6 +253,7 @@ class FactStore {
     const fact = this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id);
     if (!fact) return null;
     fact.evidence = this.db.prepare('SELECT * FROM fact_evidence WHERE fact_id = ?').all(id);
+    fact.symbol_evidence = this.db.prepare('SELECT * FROM fact_symbol_evidence WHERE fact_id = ?').all(id);
     return fact;
   }
 
@@ -243,7 +261,28 @@ class FactStore {
   /** @param {number} factId @returns {EvidenceStatus} */
   checkEvidence(factId) {
     const rows = this.db.prepare('SELECT * FROM fact_evidence WHERE fact_id = ?').all(factId);
-    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, unverified: 0, foreign: 0, changedPaths: [] };
+    const symbols = this.db.prepare('SELECT * FROM fact_symbol_evidence WHERE fact_id = ?').all(factId);
+    const status = { checked: 0, unchanged: 0, changed: 0, missing: 0, unverified: 0, foreign: 0, changedPaths: [], broken: [] };
+    const symbolsByPath = new Map();
+    for (const symbol of symbols) {
+      const group = symbolsByPath.get(symbol.path) || [];
+      group.push(symbol);
+      symbolsByPath.set(symbol.path, group);
+    }
+    const refreshed = new Set();
+    const unavailable = new Set();
+    const refreshAst = relPath => {
+      if (!this.root || refreshed.has(relPath)) return;
+      refreshed.add(relPath);
+      const indexed = this.db.prepare('SELECT size, mtime_ms FROM ast_files WHERE path = ?').get(relPath);
+      let stat;
+      try { stat = fs.statSync(path.join(this.root, relPath)); } catch { /* deletion needs an AST update */ }
+      if (stat && indexed && indexed.size === stat.size && indexed.mtime_ms === Math.floor(stat.mtimeMs)) return;
+      try {
+        const { updateFileAst } = require('./ast');
+        updateFileAst(this.root, this.db.name, path.join(this.root, relPath), { timeoutMs: 2000 });
+      } catch { unavailable.add(relPath); }
+    };
 
     for (const row of rows) {
       // Evidence recorded on another machine cannot be verified here; treating
@@ -282,10 +321,42 @@ class FactStore {
           .run(stat.size, Math.floor(stat.mtimeMs), row.id);
         status.unchanged++;
       } else {
+        const relPath = this.root ? path.relative(this.root, row.path).split(path.sep).join('/') : null;
+        const anchored = relPath && symbolsByPath.has(relPath);
+        if (anchored) {
+          refreshAst(relPath);
+          const allCurrent = symbolsByPath.get(relPath).every(symbol => {
+            const current = this.db.prepare(`SELECT signature_hash FROM ast_symbols
+              WHERE path = ? AND qualified_name = ? ORDER BY start_line LIMIT 1`)
+              .get(relPath, symbol.qualified_name);
+            return !unavailable.has(relPath) && current && current.signature_hash === symbol.signature_hash;
+          });
+          if (allCurrent) {
+            this.db.prepare('UPDATE fact_evidence SET sha256 = ?, size = ?, mtime = ? WHERE id = ?')
+              .run(digest, stat.size, Math.floor(stat.mtimeMs), row.id);
+            status.unchanged++;
+            continue;
+          }
+        }
         status.changed++;
         status.changedPaths.push(row.path);
       }
     }
+    for (const symbol of symbols) {
+      refreshAst(symbol.path);
+      const exists = !this.root || fs.existsSync(path.join(this.root, symbol.path));
+      const current = exists && this.db.prepare(`SELECT signature_hash FROM ast_symbols
+        WHERE path = ? AND qualified_name = ? ORDER BY start_line LIMIT 1`)
+        .get(symbol.path, symbol.qualified_name);
+      if (unavailable.has(symbol.path) && exists) continue;
+      if (!current || current.signature_hash !== symbol.signature_hash) {
+        status.broken.push({ path: symbol.path, symbol: symbol.qualified_name,
+          reason: current ? 'symbol_signature_changed' : 'symbol_missing' });
+        const absolute = this.root ? path.join(this.root, symbol.path) : symbol.path;
+        if (!status.changedPaths.includes(absolute)) status.changedPaths.push(absolute);
+      }
+    }
+    if (status.broken.length && status.changed === 0 && status.missing === 0) status.changed = status.broken.length;
     return status;
   }
 
@@ -319,7 +390,8 @@ class FactStore {
       } else {
         this.db.prepare('UPDATE facts SET last_checked_at = ? WHERE id = ?').run(now, id);
       }
-      results.push({ id, title: fact.title, ...status, drifted, ttlExpired });
+      results.push({ id, kind: fact.kind, title: fact.title, summary: fact.summary,
+        ...status, drifted, ttlExpired });
     }
     return results;
   }
@@ -337,6 +409,12 @@ class FactStore {
       FROM fact_evidence e JOIN facts f ON f.id = e.fact_id
       WHERE f.state IN ('active','needs_review') AND e.machine = ?
     `).all(this.machine);
+    if (this.root) {
+      for (const row of this.db.prepare(`SELECT e.fact_id AS id, e.path FROM fact_symbol_evidence e
+        JOIN facts f ON f.id = e.fact_id WHERE f.state IN ('active','needs_review')`).all()) {
+        rows.push({ id: row.id, path: path.join(this.root, row.path) });
+      }
+    }
     const hits = new Set();
     for (const row of rows) {
       if (wanted.has(canonicalKey(row.path))) hits.add(row.id);
@@ -435,7 +513,7 @@ function searchWorkspaces(query, opts = {}) {
     let db = null;
     try {
       db = openWorkspaceDb(row.db_file);
-      const store = new FactStore(db, { machine, agent: opts.agent || 'search' });
+      const store = new FactStore(db, { machine, agent: opts.agent || 'search', root: row.root_path });
       const hits = store.search(query, { limit: perWorkspace, states: opts.states });
       hits.forEach((fact, index) => {
         fused.push({

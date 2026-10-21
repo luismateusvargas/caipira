@@ -107,7 +107,7 @@ const { call, tool } = server;
   console.log('\n1. tools are advertised');
   const list = await call('tools/list', {});
   const names = list.result.tools.map(t => t.name);
-  for (const n of ['search', 'record_fact', 'search_facts', 'update_fact', 'check_drift', 'list_workspaces']) {
+  for (const n of ['search', 'record_fact', 'search_facts', 'update_fact', 'check_drift', 'list_workspaces', 'workspace_symbols', 'inspect_symbol']) {
     check('exposes ' + n, names.includes(n));
   }
   const updateSchema = list.result.tools.find(t => t.name === 'update_fact').inputSchema.properties;
@@ -128,6 +128,37 @@ const { call, tool } = server;
   check('got its own db file', rec.db && rec.db.includes('database'), rec.db);
   check('evidence attached', rec.evidence.length === 1);
 
+  console.log('\n2a. symbol tools and anchored fact drift');
+  const source = path.join(tmp, 'symbols.js');
+  fs.writeFileSync(source, 'function greet(name) { return name; }\nfunction caller() { return greet("Ada"); }\nfunction other(x) { return x; }\nmodule.exports = { greet };\n');
+  const symbols = await tool('workspace_symbols', { query: 'greet', cwd: tmp });
+  check('workspace_symbols finds the indexed function', Array.isArray(symbols) && symbols.some(s => s.name === 'greet'), JSON.stringify(symbols));
+  const inspected = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
+  check('inspect_symbol returns signature and callers', inspected?.symbol?.signature_hash && inspected.callers.some(c => c.symbol === 'caller'), JSON.stringify(inspected));
+  check('inspect_symbol exposes inputs, output, and source connections', inspected.params?.[0]?.name === 'name' &&
+    'return_type' in inspected && inspected.callers.some(c => c.source_path === 'symbols.js') &&
+    Array.isArray(inspected.type_references) && Array.isArray(inspected.imports), JSON.stringify(inspected));
+  const anchored = await tool('record_fact', { kind: 'constraint', title: 'greet API', body: 'greet takes a name.',
+    evidence_symbols: ['symbols.js::greet'], cwd: tmp });
+  check('record_fact stores symbol evidence', anchored.evidence_symbols?.includes('symbols.js::greet'), JSON.stringify(anchored));
+  const lineAnchored = await tool('record_fact', { kind: 'decision', title: 'greet line', body: 'The first line defines greet.',
+    evidence_symbols: ['symbols.js:1'], cwd: tmp });
+  check('line evidence resolves to the enclosing symbol', lineAnchored.evidence_symbols?.includes('symbols.js::greet'), JSON.stringify(lineAnchored));
+  const attached = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
+  check('inspect_symbol links the active fact', attached.facts.some(f => f.fact_id === anchored.id), JSON.stringify(attached.facts));
+  fs.writeFileSync(source, 'function greet(name) { return name; }\nfunction caller() { return greet("Ada"); }\nfunction other(x, y) { return x + y; }\nmodule.exports = { greet };\n');
+  const unrelated = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
+  check('unrelated function edit leaves anchored fact clean', unrelated.drifted.length === 0, JSON.stringify(unrelated));
+  fs.writeFileSync(source, 'function greet(name, suffix) { return name + suffix; }\nfunction caller() { return greet("Ada"); }\nfunction other(x, y) { return x + y; }\nmodule.exports = { greet };\n');
+  const changed = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
+  check('changed signature reports the broken symbol', changed.drifted[0]?.broken?.[0]?.reason === 'symbol_signature_changed', JSON.stringify(changed));
+  const reaffirmed = await tool('update_fact', { id: anchored.id, state: 'active', cwd: tmp });
+  const baseline = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
+  check('explicit reaffirmation refreshes symbol evidence', reaffirmed.state === 'active' && baseline.drifted.length === 0, JSON.stringify({ reaffirmed, baseline }));
+  fs.writeFileSync(source, 'function caller() { return "Ada"; }\nfunction other(x, y) { return x + y; }\nmodule.exports = { caller };\n');
+  const deleted = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
+  check('deleted symbol reports symbol_missing', deleted.drifted[0]?.broken?.[0]?.reason === 'symbol_missing', JSON.stringify(deleted));
+
   console.log('\n3. search_facts finds it, in compressed and verbatim form');
   const verbatim = await tool('search_facts', { query: 'development server configuration' });
   check('verbatim query hits', verbatim.facts.some(f => f.id === rec.id), JSON.stringify(verbatim.facts.map(f => f.title)));
@@ -142,12 +173,12 @@ const { call, tool } = server;
   check('trust reported', typeof verbatim.facts[0].trust === 'number' && verbatim.facts[0].trust > 0.9, verbatim.facts[0].trust);
 
   console.log('\n4. no drift while the file is untouched');
-  let drift = await tool('check_drift', {});
+  let drift = await tool('check_drift', { ids: [rec.id] });
   check('nothing drifted', drift.drifted.length === 0, JSON.stringify(drift));
 
   console.log('\n5. editing the evidence file produces a precise re-read list');
   fs.writeFileSync(evidence, 'const PORT = 8080;\n');
-  drift = await tool('check_drift', {});
+  drift = await tool('check_drift', { ids: [rec.id] });
   check('drift detected', drift.drifted.length === 1, JSON.stringify(drift));
   check('names the exact file', drift.drifted[0].files_to_reread[0] === path.resolve(evidence), JSON.stringify(drift.drifted[0]));
 

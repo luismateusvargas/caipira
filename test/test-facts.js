@@ -20,7 +20,7 @@ const mig = migrate(db, WORKSPACE_MIGRATIONS);
 const store = new FactStore(db, { machine: 'testbox', agent: 'claude-code' });
 
 console.log('\n1. migration v2');
-check('applied v1 through v4 on a fresh db', mig.applied.join(',') === '1,2,3,4', JSON.stringify(mig.applied));
+check('applied v1 through v5 on a fresh db', mig.applied.join(',') === '1,2,3,4,5', JSON.stringify(mig.applied));
 check('re-running is a no-op', migrate(db, WORKSPACE_MIGRATIONS).applied.length === 0);
 
 console.log('\n2. recording a decision');

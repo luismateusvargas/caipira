@@ -337,6 +337,12 @@ const WORKSPACE_MIGRATIONS = [
         UPDATE ast_files SET size = -1, content_sha256 = '';
       `);
     }
+  },
+  {
+    version: 5,
+    up(db) {
+      db.exec('ALTER TABLE sessions ADD COLUMN summary TEXT');
+    }
   }
 ];
 
