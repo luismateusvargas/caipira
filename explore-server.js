@@ -330,11 +330,28 @@ function withWorkspace(ws, fn) {
 }
 
 // Drift is re-checked once per workspace per server process, then on
-// request (`refresh=1`) and after every reindex.
+// request (`refresh=1`) and after every reindex. Each check's count of
+// symbol evidence it could not re-read is kept per database and fact id
+// until the next check, so later reads can still say so.
 function ensureVerified(ctx, ws, store, force = false) {
-  if (!force && ctx.verified.has(ws.dbFile)) return;
-  store.verify();
-  ctx.verified.add(ws.dbFile);
+  const known = ctx.verified.get(ws.dbFile);
+  if (known && !force) return known;
+  const outcomes = new Map(store.verify().map(outcome => [outcome.id, outcome.unchecked]));
+  ctx.verified.set(ws.dbFile, outcomes);
+  return outcomes;
+}
+
+// The outcomes a fact DTO is rendered with when this request ran no check.
+function verifiedOutcomes(ctx, ws) {
+  return ctx.verified.get(ws.dbFile) || new Map();
+}
+
+// A write that just re-read every symbol anchor of a fact (refreshFiles) left
+// none of them unchecked.
+function anchorsRead(ctx, ws, id) {
+  const outcomes = ctx.verified.get(ws.dbFile);
+  if (outcomes) outcomes.set(id, 0);
+  return outcomes || new Map([[id, 0]]);
 }
 
 function driftCount(db) {
@@ -619,8 +636,18 @@ function capNodes(nodeList, edgeList, limit, focusId) {
 
 // ── facts ──
 
+// How many of a fact's symbol anchors could not be re-read from source: from
+// this read's own evidence check when it made one (a text search does), else
+// from the last verification, else null — unknown, never an assumed 0.
+function uncheckedSymbols(fact, outcomes) {
+  if (fact.evidence_status) return fact.evidence_status.unchecked;
+  return outcomes.has(fact.id) ? outcomes.get(fact.id) : null;
+}
+
 // Evidence and anchors for many facts in two queries rather than two per fact.
-function factDtos(db, ws, rows) {
+// A symbol's `current` compares its anchor with the indexed signature, which
+// is the source as it is now only when uncheckedSymbols is 0.
+function factDtos(db, ws, rows, outcomes) {
   if (rows.length === 0) return [];
   const ids = rows.map(row => row.id);
   const marks = ids.map(() => '?').join(',');
@@ -648,6 +675,7 @@ function factDtos(db, ws, rows) {
     confidence: fact.confidence,
     trust: Number((fact.trust ?? trustScore(fact)).toFixed(3)),
     drifted: fact.state === 'needs_review',
+    uncheckedSymbols: uncheckedSymbols(fact, outcomes),
     supersedes: fact.supersedes,
     supersededBy: supersededBy.get(fact.id) ?? null,
     createdAt: fact.created_at,
@@ -671,10 +699,10 @@ function factDtos(db, ws, rows) {
   }));
 }
 
-function factById(db, ws, id) {
+function factById(db, ws, id, outcomes) {
   const row = db.prepare('SELECT * FROM facts WHERE id = ?').get(id);
   if (!row) throw new HttpError(404, 'fact_not_found', `no fact with id ${id}`);
-  return factDtos(db, ws, [row])[0];
+  return factDtos(db, ws, [row], outcomes)[0];
 }
 
 // Re-reads the files a fact's symbols live in, so a reaffirmed or newly
@@ -921,7 +949,7 @@ function getFacts(ctx, req, url) {
   const refresh = url.searchParams.get('refresh') === '1';
   const states = state === 'open' ? OPEN_STATES : state === 'all' ? FACT_STATES.filter(s => s !== 'revoked') : [state];
   return withWorkspace(ws, (db, store) => {
-    ensureVerified(ctx, ws, store, refresh);
+    const outcomes = ensureVerified(ctx, ws, store, refresh);
     let rows;
     if (query) {
       rows = store.search(query, { limit, states }).filter(fact => !category || fact.kind === category);
@@ -932,7 +960,7 @@ function getFacts(ctx, req, url) {
       rows = db.prepare(`SELECT * FROM facts WHERE ${where.join(' AND ')}
         ORDER BY (state = 'needs_review') DESC, updated_at DESC, id DESC LIMIT ?`).all(...args, limit);
     }
-    return { workspaceId: ws.id, facts: factDtos(db, ws, rows), driftCount: driftCount(db) };
+    return { workspaceId: ws.id, facts: factDtos(db, ws, rows, outcomes), driftCount: driftCount(db) };
   });
 }
 
@@ -947,7 +975,7 @@ async function postFact(ctx, req, url) {
   return withWorkspace(ws, (db, store) => {
     if (supersedes !== undefined) openFact(db, supersedes);
     const id = recordFact(store, { ...factInput(db, ws, body), supersedes });
-    return { status: 201, body: { fact: factById(db, ws, id), driftCount: driftCount(db) } };
+    return { status: 201, body: { fact: factById(db, ws, id, anchorsRead(ctx, ws, id)), driftCount: driftCount(db) } };
   });
 }
 
@@ -973,7 +1001,7 @@ async function patchFact(ctx, req, url, [rawId]) {
       if (!row) throw new HttpError(404, 'fact_not_found', `no fact with id ${id}`);
       if (row.state === 'revoked') throw new HttpError(409, 'fact_closed', `fact ${id} is already archived`);
       store.update(id, { state: 'revoked' });
-      return { fact: factById(db, ws, id), driftCount: driftCount(db) };
+      return { fact: factById(db, ws, id, verifiedOutcomes(ctx, ws)), driftCount: driftCount(db) };
     }
     openFact(db, id);
     if (action === 'reaffirm') {
@@ -986,13 +1014,16 @@ async function patchFact(ctx, req, url, [rawId]) {
         throw new HttpError(409, 'symbol_changed', `${removed.path}::${removed.qualified_name} no longer exists — supersede or archive this fact instead`);
       }
       store.reaffirm(id);
-      return { fact: factById(db, ws, id), driftCount: driftCount(db) };
+      return { fact: factById(db, ws, id, anchorsRead(ctx, ws, id)), driftCount: driftCount(db) };
     }
     if (action === 'supersede') {
       const input = factInput(db, ws, body);
       if (body.evidenceFiles === undefined && body.evidenceSymbols === undefined) Object.assign(input, inheritedEvidence(db, ws, id));
       const replacement = recordFact(store, { ...input, supersedes: id });
-      return { status: 201, body: { fact: factById(db, ws, replacement), superseded: factById(db, ws, id), driftCount: driftCount(db) } };
+      const outcomes = anchorsRead(ctx, ws, replacement);
+      return { status: 201, body: {
+        fact: factById(db, ws, replacement, outcomes), superseded: factById(db, ws, id, outcomes), driftCount: driftCount(db)
+      } };
     }
     const changes = {
       title: optionalText(body, 'title', 200),
@@ -1005,7 +1036,7 @@ async function patchFact(ctx, req, url, [rawId]) {
       changes.kind = body.kind;
     }
     store.update(id, changes);
-    return { fact: factById(db, ws, id), driftCount: driftCount(db) };
+    return { fact: factById(db, ws, id, verifiedOutcomes(ctx, ws)), driftCount: driftCount(db) };
   });
 }
 
@@ -1106,7 +1137,7 @@ function createExploreServer(opts = {}) {
     defaultWorkspaceId: workspace.id,
     distDir: path.resolve(opts.distDir || path.join(caipiraDir, 'explore-ui', 'dist')),
     loopbackOnly: LOOPBACK_HOSTS.has(host),
-    verified: new Set()
+    verified: new Map()
   };
   return http.createServer((req, res) => {
     let url;

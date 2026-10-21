@@ -4,8 +4,9 @@
 // supersede, archive and drift reaffirmation (checked in SQLite as well as
 // in the payloads), path confinement, the write guards, the static bundle,
 // member callees the inspector and graph resolve alike, fact writes refused
-// when symbol evidence cannot be re-read, and `caipira explore` started
-// through caipira.sh.
+// when symbol evidence cannot be re-read, `caipira explore` started
+// through caipira.sh, and fact DTOs that keep saying when symbol evidence
+// could not be re-read, per workspace database.
 //
 // Builds the crate first (debug profile) and points CAIPIRA_AST_BIN at it,
 // like test-ast, so the server indexes with the engine in this checkout.
@@ -634,6 +635,83 @@ async function main() {
     const exited = new Promise(resolve => child.on('exit', code => resolve(code)));
     child.kill('SIGTERM');
     check('stops cleanly on SIGTERM', await Promise.race([exited, sleep(10000).then(() => 'timeout')]) === 0);
+  }
+
+  console.log('\n16. symbol evidence the parser cannot re-read is never reported as current');
+  {
+    const v1 = 'export function api(value: number): number {\n  return value;\n}\n';
+    const blind = extraWorkspace('explore-unchecked-', { 'src/api.ts': v1 });
+    const sighted = extraWorkspace('explore-checked-', { 'src/api.ts': v1 });
+    const DAY_AGO = Date.now() - 86400000;
+    // The same fact id in both databases, vouched for only by its symbol anchor.
+    const seed = ws => inDb(ws, db => {
+      const store = new FactStore(db, { machine: machineId(), agent: 'test', root: ws.root });
+      const signatureHash = db.prepare("SELECT signature_hash FROM ast_symbols WHERE path = 'src/api.ts' AND qualified_name = 'api'").get().signature_hash;
+      const id = store.record({ kind: 'constraint', title: 'Api argument count', summary: 'Api takes one argument.',
+        body: 'api takes exactly one argument.', evidenceSymbols: [{ path: 'src/api.ts', qualifiedName: 'api', signatureHash }] });
+      store.update(id, { evidence: [] });
+      db.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, id);
+      return id;
+    });
+    const factId = seed(blind);
+    check('both workspaces hold the same fact id', seed(sighted) === factId, factId);
+    const stored = ws => inDb(ws, db => db.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(factId));
+    const DTO_KEYS = ['body', 'confidence', 'createdAt', 'drifted', 'evidence', 'id', 'kind', 'lastVerifiedAt', 'scope', 'state', 'summary',
+      'supersededBy', 'supersedes', 'symbols', 'title', 'trust', 'uncheckedSymbols', 'updatedAt', 'updatedBy'];
+
+    const server = createExploreServer({ defaultWorkspace: WS, distDir: DIST });
+    const port = await listen(server);
+    const get = target => request(port, 'GET', target);
+    const patch = (target, body) => request(port, 'PATCH', target, { body });
+    const factIn = r => r.json && r.json.facts && r.json.facts.find(f => f.id === factId);
+    const engine = process.env.CAIPIRA_AST_BIN;
+    try {
+      let r = await get(`/api/facts?workspace=${sighted.id}`);
+      check('a checked anchor reads uncheckedSymbols 0', r.status === 200 && factIn(r)?.uncheckedSymbols === 0, factIn(r));
+
+      fs.writeFileSync(path.join(blind.root, 'src/api.ts'), v1.replace('api(value: number)', 'api(value: number, extra: number)'));
+      process.env.CAIPIRA_AST_BIN = path.join(blind.root, 'no-such-caipira-ast');
+      r = await get(`/api/facts?workspace=${blind.id}`);
+      let fact = factIn(r);
+      check('without the parser the anchor reads unchecked, not drifted', r.status === 200 && fact && fact.uncheckedSymbols === 1
+        && fact.state === 'active' && fact.drifted === false, fact);
+      check('fact DTO fields stay the same plus uncheckedSymbols', fact && JSON.stringify(Object.keys(fact).sort()) === JSON.stringify(DTO_KEYS),
+        fact && Object.keys(fact).sort());
+      r = await get(`/api/facts?workspace=${blind.id}&q=api+argument+count&refresh=1`);
+      check('a failed refresh with a query keeps it unchecked', r.status === 200 && factIn(r)?.uncheckedSymbols === 1, factIn(r));
+      r = await get(`/api/facts?workspace=${blind.id}&refresh=1`);
+      check('a failed refresh without a query keeps it unchecked', r.status === 200 && factIn(r)?.uncheckedSymbols === 1, factIn(r));
+      r = await get(`/api/facts?workspace=${blind.id}`);
+      check('the read after a failed refresh keeps it unchecked', r.status === 200 && factIn(r)?.uncheckedSymbols === 1, factIn(r));
+      r = await get(`/api/facts?workspace=${sighted.id}`);
+      check('the other workspace\'s fact with the same id stays checked', factIn(r)?.uncheckedSymbols === 0, factIn(r));
+      r = await patch(`/api/facts/${factId}?workspace=${blind.id}`, { action: 'update', title: 'Api argument count (one)' });
+      check('an edit keeps the unchecked count', r.status === 200 && r.json.fact.uncheckedSymbols === 1, r.text);
+
+      const late = inDb(blind, db => new FactStore(db, { machine: machineId(), agent: 'test', root: blind.root })
+        .record({ kind: 'gotcha', title: 'Recorded after the check', body: 'No verification has covered this fact.' }));
+      r = await get(`/api/facts?workspace=${blind.id}`);
+      check('a fact no verification covered reads null, not 0', r.json && r.json.facts.find(f => f.id === late)?.uncheckedSymbols === null,
+        r.json && r.json.facts.find(f => f.id === late));
+      check('SQLite: still active, last_verified_at not advanced', JSON.stringify(stored(blind)) === JSON.stringify({ state: 'active', last_verified_at: DAY_AGO }),
+        stored(blind));
+
+      process.env.CAIPIRA_AST_BIN = engine;
+      r = await get(`/api/facts?workspace=${sighted.id}`);
+      check('the failure did not mark the other workspace unchecked', factIn(r)?.uncheckedSymbols === 0 && factIn(r)?.state === 'active', factIn(r));
+      r = await get(`/api/facts?workspace=${blind.id}&refresh=1`);
+      fact = factIn(r);
+      check('a healthy re-check clears it and finds the signature change', fact && fact.uncheckedSymbols === 0 && fact.state === 'needs_review'
+        && fact.drifted === true && fact.symbols[0].current === false, fact);
+      r = await patch(`/api/facts/${factId}?workspace=${blind.id}`, { action: 'reaffirm' });
+      check('reaffirm re-reads the anchor: 0 unchecked, current', r.status === 200 && r.json.fact.uncheckedSymbols === 0
+        && r.json.fact.symbols[0].current === true, r.text);
+      r = await get(`/api/facts?workspace=${blind.id}`);
+      check('and the next read agrees', factIn(r)?.uncheckedSymbols === 0 && factIn(r)?.state === 'active', factIn(r));
+    } finally {
+      process.env.CAIPIRA_AST_BIN = engine;
+      await new Promise(resolve => server.close(resolve));
+    }
   }
 }
 

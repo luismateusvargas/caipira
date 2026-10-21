@@ -5,7 +5,8 @@ import type { KnowledgeBoardProps } from '../features/knowledge/KnowledgeBoard';
 import { ApiError } from '../api/client';
 import type { ExploreApi } from '../api/client';
 import { factListSchema } from '../api/schemas';
-import { RAW_FACTS, fakeApi } from './fixtures';
+import type { FactList } from '../api/schemas';
+import { RAW_FACTS, at, fakeApi } from './fixtures';
 
 afterEach(cleanup);
 
@@ -31,6 +32,22 @@ async function card(title: string): Promise<HTMLElement> {
   return article;
 }
 
+// The idempotency fact as an active one whose anchor matches the index, with
+// the given unchecked count; undefined is a server that does not send one.
+function anchoredFact(uncheckedSymbols: number | null | undefined): FactList {
+  const raw = at(RAW_FACTS.facts, 0);
+  const fact = Object.fromEntries(Object.entries({
+    ...raw, state: 'active', drifted: false, trust: 1, uncheckedSymbols,
+    symbols: raw.symbols.map(symbol => ({ ...symbol, current: true }))
+  }).filter(([, value]) => value !== undefined));
+  return factListSchema.parse({ ...RAW_FACTS, driftCount: 0, facts: [fact] });
+}
+
+function trustOf(article: HTMLElement): { label: string | undefined; valueText: string | null | undefined } {
+  const meter = article.querySelector('meter');
+  return { label: article.querySelector('.trust > span')?.textContent ?? undefined, valueText: meter?.getAttribute('aria-valuetext') };
+}
+
 describe('KnowledgeBoard', () => {
   it('lists facts with drift, trust and evidence links', async () => {
     const api = fakeApi();
@@ -46,6 +63,57 @@ describe('KnowledgeBoard', () => {
 
     expect(props.onJumpTo).toHaveBeenNthCalledWith(1, 'symbol:7');
     expect(props.onJumpTo).toHaveBeenNthCalledWith(2, 'file:src/store.ts');
+  });
+
+  it('says when symbol evidence could not be checked instead of showing it as current', async () => {
+    const api = fakeApi({ listFacts: vi.fn(async () => anchoredFact(1)) });
+    renderBoard(api);
+
+    const fact = await card('addUser must stay idempotent');
+
+    expect(within(fact).getByText('Evidence not checked')).toBeTruthy();
+    expect(within(fact).queryByText('NEEDS REVIEW')).toBeNull();
+    expect(within(fact).getByText(/^1 symbol anchor could not be re-read from source/)).toBeTruthy();
+    expect(trustOf(fact)).toEqual({ label: 'Trust (unverified)', valueText: '100%, unverified' });
+    expect(within(fact).getByRole('button', { name: /UserStore\.addUser/ }).textContent).toBe('UserStore.addUser · not checked');
+    expect(within(fact).getByRole('button', { name: /Reaffirm/ })).toBeTruthy();
+  });
+
+  it('treats a null or missing unchecked count as unknown, not checked', async () => {
+    for (const uncheckedSymbols of [null, undefined]) {
+      const api = fakeApi({ listFacts: vi.fn(async () => anchoredFact(uncheckedSymbols)) });
+      renderBoard(api);
+
+      const fact = await card('addUser must stay idempotent');
+
+      expect(within(fact).getByText('Evidence not checked')).toBeTruthy();
+      expect(within(fact).getByText(/^Its symbol evidence has not been re-read from source/)).toBeTruthy();
+      expect(trustOf(fact)).toEqual({ label: 'Trust (unverified)', valueText: '100%, unverified' });
+      expect(within(fact).getByRole('button', { name: /UserStore\.addUser/ }).textContent).toBe('UserStore.addUser · not checked');
+      cleanup();
+    }
+  });
+
+  it('keeps checked, drifted and anchorless facts as they were', async () => {
+    const api = fakeApi({ listFacts: vi.fn(async () => anchoredFact(0)) });
+    renderBoard(api);
+
+    const checked = await card('addUser must stay idempotent');
+
+    expect(within(checked).queryByText('Evidence not checked')).toBeNull();
+    expect(trustOf(checked)).toEqual({ label: 'Trust', valueText: '100%' });
+    expect(within(checked).getByRole('button', { name: /UserStore\.addUser/ }).textContent).toBe('UserStore.addUser');
+    cleanup();
+
+    renderBoard(fakeApi());
+    const drifted = await card('addUser must stay idempotent');
+    const anchorless = await card('Users live in memory');
+
+    expect(within(drifted).getByText('NEEDS REVIEW')).toBeTruthy();
+    expect(within(drifted).queryByText('Evidence not checked')).toBeNull();
+    expect(within(drifted).getByRole('button', { name: /UserStore\.addUser/ }).textContent).toBe('UserStore.addUser · changed');
+    expect(trustOf(drifted)).toEqual({ label: 'Trust', valueText: '35%' });
+    expect(within(anchorless).queryByText('Evidence not checked')).toBeNull();
   });
 
   it('reaffirms a drifted fact and reloads', async () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, createApiClient, isAbortError } from '../api/client';
-import { graphPayloadSchema, symbolDetailSchema } from '../api/schemas';
-import { RAW_GRAPH, RAW_SYMBOL_DETAIL } from './fixtures';
+import { factSchema, graphPayloadSchema, symbolDetailSchema } from '../api/schemas';
+import { RAW_FACTS, RAW_GRAPH, RAW_SYMBOL_DETAIL, at } from './fixtures';
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -33,6 +33,17 @@ describe('response schemas', () => {
     const broken = { ...RAW_GRAPH, edges: [{ id: 'x', source: 'a', target: 'b', kind: 'teleports' }] };
 
     expect(graphPayloadSchema.safeParse(broken).success).toBe(false);
+  });
+
+  it('keeps unchecked symbol counts and reads a missing one as unknown, never 0', () => {
+    const raw = at(RAW_FACTS.facts, 0);
+    const legacy = Object.fromEntries(Object.entries(raw).filter(([key]) => key !== 'uncheckedSymbols'));
+
+    const actual = [2, 0, null].map(uncheckedSymbols => factSchema.parse({ ...raw, uncheckedSymbols }).uncheckedSymbols);
+    actual.push(factSchema.parse(legacy).uncheckedSymbols);
+
+    expect(actual).toEqual([2, 0, null, null]);
+    expect(factSchema.safeParse({ ...raw, uncheckedSymbols: -1 }).success).toBe(false);
   });
 });
 

@@ -336,7 +336,59 @@ const { call, tool } = server;
     fs.rmSync(pruned, { recursive: true, force: true });
   }
 
+  console.log('\n14. symbol evidence the parser cannot re-read is reported, not passed off as current');
+  const uncheckedWs = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-unchecked-'));
+  {
+    fs.writeFileSync(path.join(uncheckedWs, '.caipira-workspace'), '');
+    const apiFile = path.join(uncheckedWs, 'api.js');
+    fs.writeFileSync(apiFile, 'function api(value) { return value; }\nmodule.exports = { api };\n');
+    const info = require(ROOT + '/workspace.js').ensureWorkspace(uncheckedWs);
+    require(ROOT + '/ast.js').syncWorkspaceAst(uncheckedWs, info.dbFile);
+    const anchoredApi = await tool('record_fact', { kind: 'constraint', title: 'Api argument count', summary: 'Api takes one argument.',
+      body: 'api takes exactly one argument.', evidence_symbols: ['api.js::api'], cwd: uncheckedWs });
+    // Only the symbol anchor is left to vouch for the fact.
+    await tool('update_fact', { id: anchoredApi.id, evidence: [], cwd: uncheckedWs });
+    const DAY_AGO = Date.now() - 86400000;
+    const writable = new D(info.dbFile);
+    writable.prepare('UPDATE facts SET last_verified_at = ? WHERE id = ?').run(DAY_AGO, anchoredApi.id);
+    writable.close();
+    fs.writeFileSync(apiFile, 'function api(value, extra) { return value; }\nmodule.exports = { api };\n');
+
+    const blind = startServer({ CAIPIRA_AST_BIN: path.join(uncheckedWs, 'no-such-caipira-ast') });
+    try {
+      await blind.call('initialize', INITIALIZE);
+      const local = await blind.tool('search_facts', { query: 'api argument count', include_stale: false, cwd: uncheckedWs });
+      const hit = local.facts && local.facts.find(f => f.id === anchoredApi.id);
+      check('include_stale:false still returns the fact, still active', hit && hit.state === 'active', JSON.stringify(local));
+      check('evidence_status reports the unchecked anchor', hit && hit.evidence_status && hit.evidence_status.unchecked === 1
+        && hit.evidence_status.changed === 0 && hit.evidence_status.broken.length === 0, JSON.stringify(hit));
+      check('no stale file is invented and the existing fields stay', hit && Array.isArray(hit.stale_files) && hit.stale_files.length === 0
+        && typeof hit.trust === 'number' && hit.kind === 'constraint' && hit.summary === 'Api takes one argument.', JSON.stringify(hit));
+
+      const envelope = await blind.call('tools/call', { name: 'search_facts', arguments: { query: 'api argument count', scope: 'all', cwd: tmp } });
+      const text = envelope.result && envelope.result.content && envelope.result.content[0];
+      check('scope:all keeps the JSON-RPC text envelope', envelope.jsonrpc === '2.0' && !envelope.error && text && text.type === 'text',
+        JSON.stringify(envelope).slice(0, 200));
+      const all = text ? JSON.parse(text.text) : {};
+      const borrowed = all.facts && all.facts.find(f => f.id === anchoredApi.id && f.workspace === info.root);
+      check('scope:all labels the result and carries its unchecked count', borrowed && borrowed.evidence_status?.unchecked === 1
+        && borrowed.stale_files.length === 0, JSON.stringify(all).slice(0, 400));
+    } finally {
+      await blind.stop();
+    }
+    const kept = new D(info.dbFile, { readonly: true });
+    const row = kept.prepare('SELECT state, last_verified_at FROM facts WHERE id = ?').get(anchoredApi.id);
+    kept.close();
+    check('SQLite: still active, last_verified_at not advanced', row.state === 'active' && row.last_verified_at === DAY_AGO, JSON.stringify(row));
+
+    const healthy = await tool('search_facts', { query: 'api argument count', cwd: uncheckedWs });
+    const seen = healthy.facts && healthy.facts.find(f => f.id === anchoredApi.id);
+    check('with the parser available the anchor is checked and its change found', seen && seen.evidence_status?.unchecked === 0
+      && seen.evidence_status?.broken[0]?.reason === 'symbol_signature_changed' && seen.stale_files.includes(path.join(info.root, 'api.js')), JSON.stringify(seen));
+  }
+
   await server.stop();
+  try { fs.rmSync(uncheckedWs, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(partial, { recursive: true, force: true }); } catch {}
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

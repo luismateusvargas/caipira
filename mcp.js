@@ -416,7 +416,7 @@ async function handle(msg) {
           },
           {
             name: 'search_facts',
-            description: 'Search durable facts, ranked by trust (relevance x still-true). Prefer this over `search` when you need what was decided rather than what happened. Results carry evidence_status: a fact whose files changed is flagged and ranked down. Defaults to this workspace; pass scope="all" to search every registered workspace when the current one has no answer and another project likely solved the same problem.',
+            description: 'Search durable facts, ranked by trust (relevance x still-true). Prefer this over `search` when you need what was decided rather than what happened. Results carry evidence_status: a fact whose files changed is flagged and ranked down, and evidence_status.unchecked counts symbol evidence that could not be re-read just now, so such a fact is unverified rather than current. Defaults to this workspace; pass scope="all" to search every registered workspace when the current one has no answer and another project likely solved the same problem.',
             inputSchema: {
               type: 'object',
               properties: {
@@ -616,6 +616,7 @@ async function handleToolCall(id, params) {
           state: fact.state, trust: Number(fact.trust.toFixed(3)),
           updated_at: fact.updated_at, updated_by: fact.updated_by,
           stale_files: fact.evidence_status.changedPaths,
+          evidence_status: fact.evidence_status,
           ...(fact.workspace ? { workspace: fact.workspace } : {})
         });
 

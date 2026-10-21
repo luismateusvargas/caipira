@@ -313,6 +313,12 @@ export const factSchema = z.object({
   confidence: z.number(),
   trust: z.number(),
   drifted: z.boolean(),
+  /**
+   * Symbol anchors the server could not re-read from source: 0 when a check
+   * read them all, null when no check has covered the fact. A server too old
+   * to send it is unknown as well, never 0.
+   */
+  uncheckedSymbols: count.nullable().default(null),
   supersedes: id.nullable(),
   supersededBy: id.nullable(),
   createdAt: z.number(),
@@ -332,6 +338,7 @@ export const factSchema = z.object({
     qualifiedName: z.string(),
     symbolId: id.nullable(),
     nodeId: z.string().nullable(),
+    /** The anchor matches the indexed signature: the code as it is now only when `uncheckedSymbols` is 0. */
     current: z.boolean()
   }))
 });

@@ -52,14 +52,14 @@ export const RAW_FACTS = {
   facts: [
     {
       id: 41, kind: 'constraint', title: 'addUser must stay idempotent', summary: 'Retries call it twice.', body: 'Retries call it twice, so a second call must be a no-op.',
-      state: 'needs_review', scope: null, confidence: 1, trust: 0.35, drifted: true, supersedes: null, supersededBy: null,
+      state: 'needs_review', scope: null, confidence: 1, trust: 0.35, drifted: true, uncheckedSymbols: 0, supersedes: null, supersededBy: null,
       createdAt: 1, updatedAt: 2, lastVerifiedAt: 1, updatedBy: 'mcp',
       evidence: [{ path: 'src/store.ts', inWorkspace: true, startLine: null, endLine: null, nodeId: 'file:src/store.ts', indexed: true }],
       symbols: [{ path: 'src/store.ts', qualifiedName: 'UserStore.addUser', symbolId: 7, nodeId: 'symbol:7', current: false }]
     },
     {
       id: 42, kind: 'decision', title: 'Users live in memory', summary: 'Users live in memory', body: 'No database for users yet.',
-      state: 'active', scope: null, confidence: 1, trust: 1, drifted: false, supersedes: null, supersededBy: null,
+      state: 'active', scope: null, confidence: 1, trust: 1, drifted: false, uncheckedSymbols: 0, supersedes: null, supersededBy: null,
       createdAt: 1, updatedAt: 1, lastVerifiedAt: 1, updatedBy: 'explore', evidence: [], symbols: []
     }
   ]

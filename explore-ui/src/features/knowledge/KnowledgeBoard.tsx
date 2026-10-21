@@ -265,6 +265,9 @@ function FactCard({
   const open = fact.state === 'active' || fact.state === 'needs_review' || fact.state === 'proposed';
   const initial = { kind: fact.kind, title: fact.title, body: fact.body, summary: fact.summary === fact.title ? '' : fact.summary };
   const trust = Math.round(fact.trust * 100);
+  // Symbol anchors no check could re-read: trust and each anchor's `current`
+  // then describe the last index, not the code as it is now.
+  const unchecked = fact.symbols.length > 0 && fact.uncheckedSymbols !== 0;
   const classes = ['fact-card', fact.drifted ? 'fact-card--drifted' : '', highlighted ? 'fact-card--highlighted' : '', open ? '' : 'fact-card--closed'];
   return (
     <li id={domId} className={classes.filter(Boolean).join(' ')}>
@@ -272,6 +275,7 @@ function FactCard({
         <div className="fact-card__head">
           <span className={`badge badge--fact badge--${fact.kind}`}>{fact.kind}</span>
           {fact.drifted && <span className="badge badge--drift">NEEDS REVIEW</span>}
+          {unchecked && <span className="badge">Evidence not checked</span>}
           {fact.state === 'superseded' && <span className="badge">superseded</span>}
           {fact.state === 'proposed' && <span className="badge">proposed</span>}
           <button type="button" className="fact-card__id" onClick={() => onJumpTo(`fact:${fact.id}`)} aria-label={`Show fact ${fact.id} in the graph`}>
@@ -282,10 +286,18 @@ function FactCard({
         {fact.summary !== fact.title && <p className="fact-card__summary">{fact.summary}</p>}
 
         <div className="trust">
-          <span className="small muted" id={`${domId}-trust`}>Trust</span>
-          <meter min={0} max={1} low={0.4} high={0.75} optimum={1} value={fact.trust} aria-labelledby={`${domId}-trust`} aria-valuetext={`${trust}%`} />
+          <span className="small muted" id={`${domId}-trust`}>{unchecked ? 'Trust (unverified)' : 'Trust'}</span>
+          <meter min={0} max={1} low={0.4} high={0.75} optimum={1} value={fact.trust} aria-labelledby={`${domId}-trust`}
+            aria-valuetext={unchecked ? `${trust}%, unverified` : `${trust}%`} />
           <span className="small">{trust}%</span>
         </div>
+        {unchecked && (
+          <p className="small muted">
+            {fact.uncheckedSymbols === null
+              ? 'Its symbol evidence has not been re-read from source, so trust and anchor status reflect the last index.'
+              : `${fact.uncheckedSymbols} symbol ${fact.uncheckedSymbols === 1 ? 'anchor' : 'anchors'} could not be re-read from source, so trust and anchor status reflect the last index. Re-check drift to retry.`}
+          </p>
+        )}
 
         {(fact.evidence.length > 0 || fact.symbols.length > 0) && (
           <ul className="evidence" aria-label="Evidence">
@@ -296,6 +308,7 @@ function FactCard({
                   <button type="button" className="chip chip--symbol" disabled={nodeId === null} onClick={() => { if (nodeId) onJumpTo(nodeId); }}>
                     {item.qualifiedName}
                     {!item.current && <span className="chip__warn"> · changed</span>}
+                    {item.current && unchecked && <span> · not checked</span>}
                   </button>
                 </li>
               );
