@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use caipira_ast::{
     AstError, Resolver, confine, index_workspace, open_database, parse_source, update_single_file,
-    workspace_relative,
+    walk_workspace, workspace_relative,
 };
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -94,7 +94,13 @@ fn run(command: Command) -> Result<String, AstError> {
                 return Err(AstError::io(&absolute, missing));
             }
             let bytes = std::fs::read(&absolute).map_err(|e| AstError::io(&absolute, e))?;
-            to_json(&parse_source(&rel_path, &bytes, &Resolver::new(&root))?)
+            // Imports resolve to the files a full index would hold.
+            let indexed = walk_workspace(&root)?.files.into_iter().map(|f| f.rel_path);
+            to_json(&parse_source(
+                &rel_path,
+                &bytes,
+                &Resolver::new(&root, indexed),
+            )?)
         }
     }
 }

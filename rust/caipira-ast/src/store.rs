@@ -8,10 +8,12 @@
 //! transaction. `ast_symbols_fts` follows `ast_symbols` through triggers.
 //!
 //! Pruning needs a complete walk: when a directory could not be read, the
-//! sync reports it and deletes nothing. When a file enters or leaves the
-//! index, every unchanged file whose imports probed its path is re-linked
-//! from `ast_links` in the same transaction, so cross-file edge targets
-//! follow the index without those importers being read or parsed.
+//! sync reports it and deletes nothing. Edges are linked against the files
+//! the index keeps once the sync or update is applied, so a target is always
+//! a row in `ast_files`, never a file the walker excludes. When a file enters
+//! or leaves the index, every unchanged file whose imports probed its path is
+//! re-linked from `ast_links` in the same transaction, so cross-file edge
+//! targets follow the index without those importers being read or parsed.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -28,7 +30,7 @@ use crate::diff::{AstDiffReport, compare_snapshots};
 use crate::error::AstError;
 use crate::parser::{
     AstEdge, AstSnapshot, Language, LinkState, Links, ParamSignature, SymbolSignature,
-    parse_linked, relink,
+    link_snapshot, parse_unlinked, relink,
 };
 use crate::resolve::{Probes, Resolver};
 use crate::walker::{FileFailure, WalkedFile, confine, walk_file, walk_workspace};
@@ -179,11 +181,19 @@ struct FileState {
 }
 
 struct ParsedFile {
+    /// Without edges until [`ParsedFile::link`] runs.
     snapshot: AstSnapshot,
     links: Links,
     size: i64,
     mtime_ms: i64,
     sha256: String,
+}
+
+impl ParsedFile {
+    /// Resolves the file's edges against the files the index will hold.
+    fn link(&mut self, resolver: &Resolver) {
+        self.links.probes = link_snapshot(&mut self.snapshot, &self.links.state, resolver);
+    }
 }
 
 enum Outcome {
@@ -225,7 +235,6 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
     let started = Instant::now();
     let walk = walk_workspace(root)?;
     let known = load_file_states(conn)?;
-    let resolver = Resolver::new(root);
 
     let mut stats = IndexStats::default();
     let mut work: Vec<(&WalkedFile, Option<&str>)> = Vec::new();
@@ -239,9 +248,9 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
             _ => work.push((file, None)),
         }
     }
-    let outcomes: Vec<Outcome> = work
+    let mut outcomes: Vec<Outcome> = work
         .par_iter()
-        .map(|(file, known_sha)| process(root, &resolver, file, *known_sha))
+        .map(|(file, known_sha)| process(root, file, *known_sha))
         .collect();
 
     // An incomplete walk cannot tell a deleted file from one it never
@@ -257,6 +266,25 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
     }
     stats.failed = walk.failures.len();
     stats.failures = walk.failures;
+
+    // Edges target only files the index holds after this sync: every known
+    // file not pruned (one that failed to re-read keeps its rows) and every
+    // file parsed now. A new file that failed is not among them.
+    let pruned: HashSet<&str> = removed.iter().map(|path| path.as_str()).collect();
+    let retained = known
+        .keys()
+        .filter(|path| !pruned.contains(path.as_str()))
+        .cloned()
+        .chain(outcomes.iter().filter_map(|outcome| match outcome {
+            Outcome::Parsed(parsed) => Some(parsed.snapshot.path.clone()),
+            _ => None,
+        }));
+    let resolver = Resolver::new(root, retained);
+    outcomes.par_iter_mut().for_each(|outcome| {
+        if let Outcome::Parsed(parsed) = outcome {
+            parsed.link(&resolver);
+        }
+    });
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -300,12 +328,7 @@ pub fn index_workspace(conn: &mut Connection, root: &Path) -> Result<IndexStats,
     Ok(stats)
 }
 
-fn process(
-    root: &Path,
-    resolver: &Resolver,
-    file: &WalkedFile,
-    known_sha: Option<&str>,
-) -> Outcome {
+fn process(root: &Path, file: &WalkedFile, known_sha: Option<&str>) -> Outcome {
     let fail = |message: String| {
         Outcome::Failed(FileFailure {
             path: file.rel_path.clone(),
@@ -323,10 +346,13 @@ fn process(
             mtime_ms: file.mtime_ms,
         };
     }
-    match parse_linked(&file.rel_path, &bytes, resolver) {
-        Ok((snapshot, links)) => Outcome::Parsed(Box::new(ParsedFile {
+    match parse_unlinked(&file.rel_path, &bytes) {
+        Ok((snapshot, state)) => Outcome::Parsed(Box::new(ParsedFile {
             snapshot,
-            links,
+            links: Links {
+                state,
+                probes: Probes::new(),
+            },
             size: to_i64(bytes.len() as u64),
             mtime_ms: file.mtime_ms,
             sha256,
@@ -340,7 +366,8 @@ fn process(
 /// The file must be one a full [`index_workspace`] would visit: a path
 /// through a symlink is rejected before anything is read, and a file the
 /// walker's rules exclude is never parsed; if it was indexed before, its rows
-/// are deleted and the status is [`UpdateStatus::Ignored`].
+/// are deleted and the status is [`UpdateStatus::Ignored`]. The file's edges
+/// target only files in `ast_files`.
 ///
 /// # Arguments
 /// `conn`: an open workspace database.
@@ -366,7 +393,6 @@ pub fn update_single_file(
     let before = load_symbols(conn, rel_path)?;
     let state = load_file_state(conn, rel_path)?;
     let absolute = root.join(rel_path);
-    let resolver = Resolver::new(root);
     let result = |status, diff, relinked| FileUpdate {
         status,
         path: rel_path.to_string(),
@@ -395,6 +421,7 @@ pub fn update_single_file(
         }
         let tx = immediate(conn)?;
         delete_file(&tx, rel_path)?;
+        let resolver = Resolver::new(root, load_indexed_paths(&tx)?);
         let relinked = relink_dependents(&tx, &resolver, &[rel_path.to_string()], &HashSet::new())?;
         tx.commit()
             .map_err(|e| AstError::database("committing the file removal", e))?;
@@ -421,16 +448,22 @@ pub fn update_single_file(
         return Ok(result(UpdateStatus::Unchanged, AstDiffReport::default(), 0));
     }
 
-    let (snapshot, links) = parse_linked(rel_path, &bytes, &resolver)?;
+    let (snapshot, link_state) = parse_unlinked(rel_path, &bytes)?;
     let diff = compare_snapshots(&before, &snapshot.symbols);
-    let parsed = ParsedFile {
+    let mut parsed = ParsedFile {
         snapshot,
-        links,
+        links: Links {
+            state: link_state,
+            probes: Probes::new(),
+        },
         size: to_i64(bytes.len() as u64),
         mtime_ms: mtime,
         sha256,
     };
     let tx = immediate(conn)?;
+    let indexed = load_indexed_paths(&tx)?;
+    let resolver = Resolver::new(root, indexed.into_iter().chain([rel_path.to_string()]));
+    parsed.link(&resolver);
     write_file(&tx, &parsed, now_ms())?;
     let relinked = match state {
         Some(_) => 0,
@@ -509,6 +542,19 @@ fn load_file_states(conn: &Connection) -> Result<HashMap<String, FileState>, Ast
         })
         .map_err(|e| AstError::database(context, e))?;
     rows.collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|e| AstError::database(context, e))
+}
+
+/// Every path in `ast_files`: the files edges may target.
+fn load_indexed_paths(conn: &Connection) -> Result<Vec<String>, AstError> {
+    let context = "reading ast_files";
+    let mut statement = conn
+        .prepare_cached("SELECT path FROM ast_files")
+        .map_err(|e| AstError::database(context, e))?;
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| AstError::database(context, e))?;
+    rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| AstError::database(context, e))
 }
 
@@ -1232,6 +1278,135 @@ mod tests {
         }
         let quiet = fixture.index();
         assert_eq!((quiet.parsed, quiet.skipped, quiet.relinked), (0, 1, 0));
+    }
+
+    #[test]
+    fn cross_file_edges_never_target_files_outside_the_index() {
+        const CONSUMER: &str = "import { provide } from './provider.js';\nexport function consume() { return provide(); }\n";
+        const PROVIDER: &str = "export function provide() { return 1; }\n";
+        let mut fixture = Fixture::new(&[
+            ("consumer.js", CONSUMER),
+            ("provider.js", PROVIDER),
+            (".gitignore", "provider.js\n"),
+        ])
+        .unwrap();
+        let target = |path: Option<&str>| {
+            vec![
+                (
+                    "imports".to_string(),
+                    "./provider.js".to_string(),
+                    path.map(String::from),
+                ),
+                (
+                    "calls".to_string(),
+                    "provide".to_string(),
+                    path.map(String::from),
+                ),
+            ]
+        };
+        let first = fixture.index();
+        assert_eq!((first.parsed, first.failed), (1, 0));
+        assert_eq!(fixture.footprint("provider.js"), [0, 0, 0, 0]);
+        assert_eq!(fixture.edges("consumer.js"), target(None));
+
+        // An unreadable consumer proves re-linking never reads it.
+        let consumer = fixture.root().join("consumer.js");
+        #[cfg(unix)]
+        let locked = chmod(&consumer, 0o000);
+        let gate = |fixture: &Fixture| -> (i64, i64, String) {
+            fixture
+                .conn
+                .query_row(
+                    "SELECT size, mtime_ms, content_sha256 FROM ast_files WHERE path = 'consumer.js'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let consumer_gate = gate(&fixture);
+
+        fixture.write(".gitignore", "").unwrap();
+        let eligible = fixture.index();
+        assert_eq!(
+            (eligible.parsed, eligible.skipped, eligible.relinked),
+            (1, 1, 1)
+        );
+        assert_eq!(fixture.edges("consumer.js"), target(Some("provider.js")));
+
+        fixture.write(".gitignore", "provider.js\n").unwrap();
+        let ignored = fixture.index();
+        assert_eq!(
+            (ignored.removed, ignored.skipped, ignored.relinked),
+            (1, 1, 1)
+        );
+        assert_eq!(fixture.footprint("provider.js"), [0, 0, 0, 0]);
+        assert_eq!(fixture.edges("consumer.js"), target(None));
+
+        fixture.write(".gitignore", "").unwrap();
+        let added = fixture.update("provider.js").unwrap();
+        assert_eq!((added.status, added.relinked), (UpdateStatus::Added, 1));
+        assert_eq!(fixture.edges("consumer.js"), target(Some("provider.js")));
+        fixture.write(".gitignore", "provider.js\n").unwrap();
+        let dropped = fixture.update("provider.js").unwrap();
+        assert_eq!(
+            (dropped.status, dropped.relinked),
+            (UpdateStatus::Ignored, 1)
+        );
+        assert_eq!(fixture.edges("consumer.js"), target(None));
+        assert_eq!(gate(&fixture), consumer_gate);
+
+        #[cfg(unix)]
+        {
+            if locked {
+                chmod(&consumer, 0o644);
+            }
+            // A provider reached through a symlink stays outside the index,
+            // whether the file itself or a directory above it is the link.
+            let outside = fixture.dir.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("provider.js"), PROVIDER).unwrap();
+            fixture.write(".gitignore", "").unwrap();
+            fixture.write("provider.js", PROVIDER).unwrap();
+            assert_eq!(fixture.index().relinked, 1);
+            assert_eq!(fixture.edges("consumer.js"), target(Some("provider.js")));
+            std::fs::remove_file(fixture.root().join("provider.js")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.join("provider.js"),
+                fixture.root().join("provider.js"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside, fixture.root().join("ext")).unwrap();
+            fixture
+                .write(
+                    "via_dir.js",
+                    &CONSUMER.replace("./provider.js", "./ext/provider.js"),
+                )
+                .unwrap();
+            let linked = fixture.index();
+            assert_eq!((linked.parsed, linked.removed, linked.relinked), (1, 1, 1));
+            assert_eq!(fixture.edges("consumer.js"), target(None));
+            let via_dir: Vec<_> = fixture
+                .edges("via_dir.js")
+                .into_iter()
+                .map(|(_, _, path)| path)
+                .collect();
+            assert_eq!(via_dir, vec![None, None]);
+            let indexed: i64 = fixture
+                .conn
+                .query_row("SELECT COUNT(*) FROM ast_files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(indexed, 2);
+            let targets: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ast_edges WHERE target_path IS NOT NULL
+                     AND target_path NOT IN (SELECT path FROM ast_files)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(targets, 0);
+        }
     }
 
     #[test]

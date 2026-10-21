@@ -259,7 +259,7 @@ pub struct AstSnapshot {
 /// # Arguments
 /// `rel_path`: workspace-relative path; selects the language and anchors import resolution.
 /// `source`: the file's bytes.
-/// `resolver`: resolves import specifiers to workspace files.
+/// `resolver`: resolves import specifiers to indexed workspace files.
 ///
 /// # Errors
 /// `AstError::Unsupported` for an unknown extension; `AstError::Parse` when
@@ -294,6 +294,24 @@ pub(crate) fn parse_linked(
     source: &[u8],
     resolver: &Resolver,
 ) -> Result<(AstSnapshot, Links), AstError> {
+    let (mut snapshot, state) = parse_unlinked(rel_path, source)?;
+    let probes = link_snapshot(&mut snapshot, &state, resolver);
+    Ok((snapshot, Links { state, probes }))
+}
+
+/// Parses a file without resolving its imports: the snapshot has no edges
+/// until [`link_snapshot`] runs with the returned state.
+///
+/// # Arguments
+/// `rel_path`: workspace-relative path; selects the language.
+/// `source`: the file's bytes.
+///
+/// # Errors
+/// As for [`parse_source`].
+pub(crate) fn parse_unlinked(
+    rel_path: &str,
+    source: &[u8],
+) -> Result<(AstSnapshot, LinkState), AstError> {
     let language =
         Language::from_path(rel_path).ok_or_else(|| AstError::Unsupported(rel_path.to_string()))?;
     let (grammar_language, text) = match language {
@@ -328,18 +346,36 @@ pub(crate) fn parse_linked(
         Family::Cpp => cpp::extract(&mut ctx, root),
     }
     let (symbols, state) = ctx.finish();
-    let names: Vec<(String, String)> = symbols
-        .iter()
-        .map(|s| (s.name.clone(), s.qualified_name.clone()))
-        .collect();
-    let (edges, probes) = link(rel_path, family, &names, &state, resolver);
     let snapshot = AstSnapshot {
         path: rel_path.to_string(),
         language,
         symbols,
-        edges,
+        edges: Vec::new(),
     };
-    Ok((snapshot, Links { state, probes }))
+    Ok((snapshot, state))
+}
+
+/// Resolves a parsed file's imports and references, replacing its edges.
+///
+/// # Arguments
+/// `snapshot`: the file, as [`parse_unlinked`] returned it. `state`: its
+/// link state. `resolver`: the workspace resolver.
+///
+/// Returns every path resolving the imports checked.
+pub(crate) fn link_snapshot(
+    snapshot: &mut AstSnapshot,
+    state: &LinkState,
+    resolver: &Resolver,
+) -> Probes {
+    let names: Vec<(String, String)> = snapshot
+        .symbols
+        .iter()
+        .map(|s| (s.name.clone(), s.qualified_name.clone()))
+        .collect();
+    let family = snapshot.language.family();
+    let (edges, probes) = link(&snapshot.path, family, &names, state, resolver);
+    snapshot.edges = edges;
+    probes
 }
 
 /// Recomputes a file's edges from its stored [`LinkState`].
@@ -1233,9 +1269,15 @@ pub(crate) fn generic_names(ctx: &Ctx, type_parameters: Option<Node>) -> HashSet
 pub(crate) mod test_support {
     use super::*;
 
-    /// Parses `source` as `path` against a resolver rooted at `root`.
+    /// A resolver over the files a full walk of `root` would index.
+    pub fn resolver(root: &std::path::Path) -> Resolver {
+        let walk = crate::walker::walk_workspace(root).expect("walk");
+        Resolver::new(root, walk.files.into_iter().map(|f| f.rel_path))
+    }
+
+    /// Parses `source` as `path` against the files on disk under `root`.
     pub fn parse(root: &std::path::Path, path: &str, source: &str) -> AstSnapshot {
-        parse_source(path, source.as_bytes(), &Resolver::new(root)).expect("parse")
+        parse_source(path, source.as_bytes(), &resolver(root)).expect("parse")
     }
 
     /// The symbol with this qualified name.
@@ -1449,13 +1491,25 @@ mod tests {
         };
         write("Cargo.toml", "[package]\nname = \"x\"\n");
         write("go.mod", "module example.com/app\n");
-        write("pkg/__init__.py", "");
+        // Every target is on disk throughout: only the index decides.
+        let mut indexed = vec!["pkg/__init__.py".to_string()];
         for (path, text) in LINKED {
             write(path, text);
+            indexed.push(path.to_string());
         }
-        let resolver = Resolver::new(root);
-        let parse =
-            |path: &str, text: &str| parse_linked(path, text.as_bytes(), &resolver).expect("parse");
+        for path in TARGETS.iter().chain(["pkg/__init__.py"].iter()) {
+            write(path, "");
+        }
+        let outside = Resolver::new(root, indexed.clone());
+        let inside = Resolver::new(
+            root,
+            indexed
+                .into_iter()
+                .chain(TARGETS.iter().map(|t| t.to_string())),
+        );
+        let parse = |path: &str, text: &str, resolver: &Resolver| {
+            parse_linked(path, text.as_bytes(), resolver).expect("parse")
+        };
         let names = |snapshot: &AstSnapshot| {
             snapshot
                 .symbols
@@ -1466,33 +1520,26 @@ mod tests {
         let stored: Vec<(AstSnapshot, String)> = LINKED
             .iter()
             .map(|(path, text)| {
-                let (snapshot, links) = parse(path, text);
+                let (snapshot, links) = parse(path, text, &outside);
                 (snapshot, serde_json::to_string(&links.state).unwrap())
             })
             .collect();
 
-        for step in ["targets appear", "targets disappear"] {
-            for target in TARGETS {
-                match step {
-                    "targets appear" => write(target, ""),
-                    _ => std::fs::remove_file(root.join(target)).unwrap(),
-                }
-            }
-            if step == "targets disappear" {
-                // A Go import resolves to its package directory.
-                std::fs::remove_dir_all(root.join("internal")).unwrap();
-            }
+        for (step, resolver, entered) in [
+            ("targets enter the index", &inside, true),
+            ("targets leave the index", &outside, false),
+        ] {
             for ((path, text), (before, state_json)) in LINKED.iter().zip(&stored) {
-                let (fresh, fresh_links) = parse(path, text);
+                let (fresh, fresh_links) = parse(path, text, resolver);
                 let state: LinkState = serde_json::from_str(state_json).unwrap();
-                let relinked = relink(path, &names(before), &state, &resolver).unwrap();
+                let relinked = relink(path, &names(before), &state, resolver).unwrap();
                 assert_eq!(
                     relinked,
                     (fresh.edges.clone(), fresh_links.probes),
                     "{path}: {step}"
                 );
                 let changed = fresh.edges != before.edges;
-                assert_eq!(changed, step == "targets appear", "{path}: {step}");
+                assert_eq!(changed, entered, "{path}: {step}");
             }
         }
     }
@@ -1502,7 +1549,7 @@ mod tests {
         let actual = parse_source(
             "notes.txt",
             b"hello",
-            &Resolver::new(std::path::Path::new(".")),
+            &Resolver::new(std::path::Path::new("."), []),
         );
         assert!(matches!(actual, Err(AstError::Unsupported(_))));
     }

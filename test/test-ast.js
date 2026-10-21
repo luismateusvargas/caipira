@@ -2,7 +2,7 @@
 // covering all eight language families, then checks the incremental gates,
 // single-file diffs, the symbol queries, error mapping, the workspace
 // boundary (unreadable directories, symlinks, ignore rules), cross-file edge
-// re-linking, and schemas v3 and v4.
+// re-linking, edge targets limited to indexed files, and schemas v3 and v4.
 //
 // Builds the crate first (debug profile) and points CAIPIRA_AST_BIN at it, so
 // the suite always tests the source in this checkout rather than whatever
@@ -732,6 +732,88 @@ console.log('\n11. cross-file edges follow targets entering and leaving the inde
   fs.chmodSync(consumer, 0o644);
   const quiet = ast.syncWorkspaceAst(bws, bdb);
   check('a quiet sync re-links nothing', quiet.parsed === 0 && quiet.relinked === 0 && quiet.skipped === 1, quiet);
+}
+
+console.log('\n12. edge targets never name a file outside the index');
+{
+  const graphRoot = tempDir('caipira-ast-graph-');
+  const gws = path.join(graphRoot, 'ws');
+  const gdb = path.join(graphRoot, 'graph.db');
+  const write = (rel, body) => {
+    const file = path.join(gws, rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, body);
+  };
+  const query = (sql, ...args) => {
+    const db = new Database(gdb, { readonly: true });
+    try { return db.prepare(sql).all(...args); } finally { db.close(); }
+  };
+  const targetsOf = file => query('SELECT edge_kind, target_path FROM ast_edges WHERE source_path = ? ORDER BY id', file)
+    .map(r => `${r.edge_kind}->${r.target_path}`);
+  const indexed = () => query('SELECT path FROM ast_files ORDER BY path').map(r => r.path);
+  const dangling = () => query('SELECT COUNT(*) n FROM ast_edges WHERE target_path IS NOT NULL AND target_path NOT IN (SELECT path FROM ast_files)')[0].n;
+  const gate = () => query("SELECT size, mtime_ms, content_sha256, indexed_at FROM ast_files WHERE path = 'consumer.js'")[0];
+  const unresolved = ['imports->null', 'calls->null'];
+  const resolved = ['imports->provider.js', 'calls->provider.js'];
+  const consumerSource = "import { provide } from './provider.js';\nexport function consume() { return provide(); }\n";
+  const providerSource = 'export function provide() { return 1; }\n';
+  write('consumer.js', consumerSource);
+  write('provider.js', providerSource);
+  write('.gitignore', 'provider.js\n');
+
+  const first = ast.syncWorkspaceAst(gws, gdb);
+  check('ignored provider on disk: only consumer.js indexed', first.parsed === 1 && same(indexed(), ['consumer.js']), [first, indexed()]);
+  check('ignored provider: import and call targets are null', same(targetsOf('consumer.js'), unresolved), targetsOf('consumer.js'));
+  const preview = ast.parseFileAst(gws, 'consumer.js');
+  check('parse-file agrees: an ignored file is not a target', preview.edges.every(e => e.target_path === null), preview.edges);
+
+  const consumerGate = gate();
+  // An unreadable consumer proves it is re-linked without being read.
+  const consumer = path.join(gws, 'consumer.js');
+  fs.chmodSync(consumer, 0o000);
+  if (!restricts(consumer)) console.log('  note: permissions are not enforced for this user; the no-read check is weaker');
+
+  write('.gitignore', '');
+  const eligible = ast.syncWorkspaceAst(gws, gdb);
+  check('provider made eligible: indexed, consumer skipped and re-linked', eligible.parsed === 1 && eligible.skipped === 1
+    && eligible.relinked === 1 && eligible.failed === 0 && same(indexed(), ['consumer.js', 'provider.js']), eligible);
+  check('provider made eligible: both edges resolve', same(targetsOf('consumer.js'), resolved), targetsOf('consumer.js'));
+
+  write('.gitignore', 'provider.js\n');
+  const ignored = ast.syncWorkspaceAst(gws, gdb);
+  check('provider ignored again: rows pruned, consumer skipped and re-linked', ignored.removed === 1 && ignored.skipped === 1
+    && ignored.relinked === 1 && ignored.failed === 0 && same(indexed(), ['consumer.js']), ignored);
+  check('provider ignored again: both edges unresolved', same(targetsOf('consumer.js'), unresolved), targetsOf('consumer.js'));
+
+  write('.gitignore', '');
+  const added = ast.updateFileAst(gws, gdb, 'provider.js');
+  check('update-file on the eligible provider: added, consumer re-linked', added.status === 'added' && added.relinked === 1
+    && same(targetsOf('consumer.js'), resolved), [added.status, added.relinked, targetsOf('consumer.js')]);
+  write('.gitignore', 'provider.js\n');
+  const dropped = ast.updateFileAst(gws, gdb, 'provider.js');
+  check('update-file on the re-ignored provider: ignored, rows pruned, edges unresolved', dropped.status === 'ignored'
+    && dropped.relinked === 1 && same(indexed(), ['consumer.js']) && same(targetsOf('consumer.js'), unresolved),
+  [dropped.status, dropped.relinked, indexed(), targetsOf('consumer.js')]);
+  check('the consumer was never re-indexed', same(gate(), consumerGate), [gate(), consumerGate]);
+  fs.chmodSync(consumer, 0o644);
+
+  const outside = path.join(graphRoot, 'outside');
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'provider.js'), providerSource);
+  write('.gitignore', '');
+  fs.rmSync(path.join(gws, 'provider.js'));
+  fs.symlinkSync(path.join(outside, 'provider.js'), path.join(gws, 'provider.js'));
+  fs.symlinkSync(outside, path.join(gws, 'ext'), 'dir');
+  write('via-dir.js', consumerSource.replace('./provider.js', './ext/provider.js'));
+  const linked = ast.syncWorkspaceAst(gws, gdb);
+  check('symlinked providers: neither is indexed', linked.parsed === 1 && same(indexed(), ['consumer.js', 'via-dir.js']), [linked, indexed()]);
+  check('a file symlink to an external provider is not a target', same(targetsOf('consumer.js'), unresolved), targetsOf('consumer.js'));
+  check('a directory symlink to an external provider is not a target', same(targetsOf('via-dir.js'), unresolved), targetsOf('via-dir.js'));
+  fs.appendFileSync(path.join(gws, 'via-dir.js'), 'export const again = 1;\n');
+  const reparsed = ast.updateFileAst(gws, gdb, 'via-dir.js');
+  check('update-file on the importer keeps the symlinked target unresolved', reparsed.status === 'updated'
+    && same(targetsOf('via-dir.js'), unresolved), [reparsed.status, targetsOf('via-dir.js')]);
+  check('no stored edge targets a path missing from ast_files', dangling() === 0, dangling());
 }
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

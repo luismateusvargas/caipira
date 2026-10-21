@@ -1,22 +1,31 @@
 //! Resolves import specifiers to workspace-relative files.
 //!
-//! Resolution is lexical plus a file-existence check under the workspace
-//! root; a specifier that would climb above the root never resolves. Every
-//! path a resolution checks is recorded as a probe, so a file can be
-//! re-linked when one of those paths enters or leaves the index.
+//! Resolution is lexical; a specifier that would climb above the root never
+//! resolves. A source candidate resolves only when it is one of the indexed
+//! files the resolver was built with, so an edge never targets a file the
+//! index excludes (ignored, hidden, over the size limit, or reached through
+//! a symlink). Any other candidate (`./data.json`, `Cargo.toml`) resolves to
+//! a regular file under the root, never through a symlink. Every source
+//! path and directory a resolution checks is recorded as a probe, so a file
+//! can be re-linked when one of those paths enters or leaves the index.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::parser::Language;
+use crate::walker::confine;
 
-/// Maps import specifiers to workspace files under one root.
+/// Maps import specifiers to indexed workspace files under one root.
 #[derive(Debug)]
 pub struct Resolver {
     root: PathBuf,
+    /// The source files in the index; no other source file is a target.
+    indexed: HashSet<String>,
+    /// Directories holding at least one indexed Go file.
+    go_packages: HashSet<String>,
     go_module: OnceLock<Option<String>>,
 }
 
@@ -50,10 +59,19 @@ impl Resolver {
     /// Creates a resolver for a workspace.
     ///
     /// # Arguments
-    /// `root`: the workspace root directory.
-    pub fn new(root: &Path) -> Self {
+    /// `root`: the workspace root directory. `indexed`: the workspace-relative
+    /// source files in the index, the only source files imports may target.
+    pub fn new(root: &Path, indexed: impl IntoIterator<Item = String>) -> Self {
+        let indexed: HashSet<String> = indexed.into_iter().collect();
+        let go_packages = indexed
+            .iter()
+            .filter(|path| Language::from_path(path) == Some(Language::Go))
+            .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()))
+            .collect();
         Self {
             root: root.to_path_buf(),
+            indexed,
+            go_packages,
             go_module: OnceLock::new(),
         }
     }
@@ -92,8 +110,10 @@ impl Resolver {
         }
         if Language::from_path(rel).is_some() {
             probes.insert(rel.to_string());
+            return self.indexed.contains(rel);
         }
-        self.root.join(rel).is_file()
+        // Never indexed, so never re-linked: any regular file under the root.
+        matches!(confine(&self.root, rel), Ok(Some(metadata)) if metadata.is_file())
     }
 
     fn is_dir(&self, rel: &str, probes: &mut Probes) -> bool {
@@ -270,7 +290,8 @@ impl Resolver {
         self.first_file(candidates.into_iter().flatten(), probes)
     }
 
-    /// The package directory of an import path inside the `go.mod` module.
+    /// The package directory of an import path inside the `go.mod` module,
+    /// when it holds an indexed Go file.
     fn go_import(&self, spec: &str, probes: &mut Probes) -> Option<String> {
         let module = self
             .go_module
@@ -278,7 +299,11 @@ impl Resolver {
             .as_deref()?;
         let rest = spec.strip_prefix(module)?.strip_prefix('/')?;
         let dir = join("", rest)?;
-        self.is_dir(&dir, probes).then_some(dir)
+        if dir.is_empty() {
+            return None;
+        }
+        probes.insert(dir.clone());
+        self.go_packages.contains(&dir).then_some(dir)
     }
 }
 
@@ -330,14 +355,16 @@ mod tests {
 
     use super::*;
 
-    fn fixture(files: &[&str]) -> anyhow::Result<tempfile::TempDir> {
+    /// Writes `files` and returns a resolver that treats all of them as indexed.
+    fn fixture(files: &[&str]) -> anyhow::Result<(tempfile::TempDir, Resolver)> {
         let dir = tempfile::tempdir()?;
         for file in files {
             let path = dir.path().join(file);
             std::fs::create_dir_all(path.parent().expect("file has a parent"))?;
             std::fs::write(path, "")?;
         }
-        Ok(dir)
+        let resolver = Resolver::new(dir.path(), files.iter().map(|f| f.to_string()));
+        Ok((dir, resolver))
     }
 
     /// The resolved file alone, discarding probes and the item path.
@@ -363,8 +390,8 @@ mod tests {
 
     #[test]
     fn script_specifiers_resolve_extensions_and_index_files() {
-        let dir = fixture(&["src/store.ts", "src/ui/index.tsx", "lib/util.js"]).unwrap();
-        let resolver = Resolver::new(dir.path());
+        let (_dir, resolver) =
+            fixture(&["src/store.ts", "src/ui/index.tsx", "lib/util.js"]).unwrap();
         let from = "src/app.ts";
         let actual = vec![
             file(&resolver, from, script("./store.js")),
@@ -387,8 +414,7 @@ mod tests {
 
     #[test]
     fn probes_stop_at_the_first_hit_and_skip_unindexable_candidates() {
-        let dir = fixture(&["src/store.ts"]).unwrap();
-        let resolver = Resolver::new(dir.path());
+        let (_dir, resolver) = fixture(&["src/store.ts"]).unwrap();
         let probed = |request: ImportRequest| {
             let mut probes = Probes::new();
             resolver.resolve("src/app.ts", &request, &mut probes);
@@ -408,14 +434,13 @@ mod tests {
 
     #[test]
     fn python_modules_resolve_relative_and_absolute() {
-        let dir = fixture(&[
+        let (_dir, resolver) = fixture(&[
             "pkg/__init__.py",
             "pkg/store.py",
             "pkg/sub/mod.py",
             "src/lib/core.py",
         ])
         .unwrap();
-        let resolver = Resolver::new(dir.path());
         let submodule = |module: &str, name: &str| ImportRequest::PythonSubmodule {
             module: module.into(),
             name: name.into(),
@@ -443,7 +468,7 @@ mod tests {
 
     #[test]
     fn rust_paths_resolve_crate_self_and_child_modules() {
-        let dir = fixture(&[
+        let (_dir, resolver) = fixture(&[
             "crates/x/Cargo.toml",
             "crates/x/src/lib.rs",
             "crates/x/src/store.rs",
@@ -451,7 +476,6 @@ mod tests {
             "crates/x/src/parser.rs",
         ])
         .unwrap();
-        let resolver = Resolver::new(dir.path());
         let from = "crates/x/src/lib.rs";
         let resolve =
             |from: &str, path: &str| resolver.resolve(from, &rust_use(path), &mut Probes::new());
@@ -492,9 +516,8 @@ mod tests {
 
     #[test]
     fn cpp_includes_and_go_imports() {
-        let dir = fixture(&["include/a.hpp", "src/b.h", "internal/db/db.go"]).unwrap();
+        let (dir, resolver) = fixture(&["include/a.hpp", "src/b.h", "internal/db/db.go"]).unwrap();
         std::fs::write(dir.path().join("go.mod"), "module example.com/app\n").unwrap();
-        let resolver = Resolver::new(dir.path());
         let include = |spec: &str| ImportRequest::CppInclude { spec: spec.into() };
         let go = |spec: &str| ImportRequest::GoImport { spec: spec.into() };
         assert_eq!(
@@ -512,5 +535,62 @@ mod tests {
         );
         assert_eq!(probes.into_iter().collect::<Vec<_>>(), vec!["internal/db"]);
         assert_eq!(file(&resolver, "main.go", go("github.com/other/db")), None);
+    }
+
+    #[test]
+    fn only_indexed_sources_and_confined_files_are_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let outside = dir.path().join("outside");
+        for path in [
+            root.join("src/kept.ts"),
+            root.join("src/ignored.ts"),
+            root.join("src/data.json"),
+            root.join("internal/db/db.go"),
+            root.join("internal/api/api.go"),
+            outside.join("provider.ts"),
+            outside.join("data.json"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::fs::write(root.join("go.mod"), "module example.com/app\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+            std::os::unix::fs::symlink(outside.join("provider.ts"), root.join("src/alias.ts"))
+                .unwrap();
+        }
+        // On disk but excluded from the index: ignored.ts, db.go, the links.
+        let indexed = ["src/kept.ts", "internal/api/api.go"].map(String::from);
+        let resolver = Resolver::new(&root, indexed);
+        let from = "src/app.ts";
+        let mut probes = Probes::new();
+        let go = |spec: &str| ImportRequest::GoImport { spec: spec.into() };
+        let actual = vec![
+            file(&resolver, from, script("./kept")),
+            file(&resolver, from, script("./data.json")),
+            file(&resolver, from, script("../linked/provider.ts")),
+            file(&resolver, from, script("../linked/data.json")),
+            file(&resolver, from, script("./alias")),
+            file(&resolver, "main.go", go("example.com/app/internal/api")),
+            file(&resolver, "main.go", go("example.com/app/internal/db")),
+            resolver
+                .resolve(from, &script("./ignored"), &mut probes)
+                .map(|(path, _)| path),
+        ];
+        let expected = vec![
+            Some("src/kept.ts".to_string()),
+            Some("src/data.json".to_string()),
+            None,
+            None,
+            None,
+            Some("internal/api".to_string()),
+            None,
+            None,
+        ];
+        assert_eq!(actual, expected);
+        // The excluded file is still probed, so indexing it later re-links.
+        assert!(probes.contains("src/ignored.ts"));
     }
 }

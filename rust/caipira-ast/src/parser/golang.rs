@@ -343,7 +343,9 @@ const MaxRows = 3
             "module example.com/app\n\ngo 1.22\n",
         )
         .unwrap();
+        // An import resolves to a package directory holding an indexed file.
         std::fs::create_dir_all(dir.path().join("internal/store")).unwrap();
+        std::fs::write(dir.path().join("internal/store/open.go"), "package store\n").unwrap();
         dir
     }
 
