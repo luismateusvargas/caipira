@@ -316,13 +316,58 @@ console.log('\n13. AST delta reminder and session digest');
   fs.writeFileSync(source, 'function api(value, extra) { return value + extra; }\nfunction caller() { return api(1); }\nmodule.exports = { api };\n');
   const notice = run('codex', 'PostToolUse', { session_id: 'hook-ast-session', cwd: dir,
     tool_name: 'Edit', tool_input: { file_path: source } });
-  check('public signature change emits system reminder', notice.systemMessage?.includes('<system-reminder>') && notice.systemMessage.includes('api.js::api'), JSON.stringify(notice));
-  check('reminder names caller and impacted fact', notice.systemMessage?.includes('caller') && notice.systemMessage.includes(`[constraint#${id}]`), JSON.stringify(notice));
+  const codexContext = notice.hookSpecificOutput?.additionalContext;
+  check('Codex receives PostToolUse model context', notice.hookSpecificOutput?.hookEventName === 'PostToolUse' &&
+    codexContext?.includes('<system-reminder>') && codexContext.includes('api.js::api'), JSON.stringify(notice));
+  check('Codex context names caller and impacted fact', codexContext?.includes('caller') &&
+    codexContext.includes(`[constraint#${id}]`), JSON.stringify(notice));
+  fs.writeFileSync(source, 'function api(value, extra, flag) { return value + extra + flag; }\nfunction caller() { return api(1); }\nmodule.exports = { api };\n');
+  const claudeNotice = run('claude-code', 'PostToolUse', { session_id: 'hook-ast-claude', cwd: dir,
+    tool_name: 'Edit', tool_input: { file_path: source } });
+  const claudeContext = claudeNotice.hookSpecificOutput?.additionalContext;
+  check('Claude Code receives PostToolUse model context', claudeNotice.hookSpecificOutput?.hookEventName === 'PostToolUse' &&
+    claudeContext?.includes('<system-reminder>') && claudeContext.includes('api.js::api') &&
+    claudeContext.includes('caller') && claudeContext.includes(`[constraint#${id}]`), JSON.stringify(claudeNotice));
+  const quietCodex = run('codex', 'PostToolUse', { session_id: 'hook-ast-session', cwd: dir,
+    tool_name: 'Edit', tool_input: { file_path: source } });
+  const quietClaude = run('claude-code', 'PostToolUse', { session_id: 'hook-ast-claude', cwd: dir,
+    tool_name: 'Edit', tool_input: { file_path: source } });
+  check('unchanged Codex PostToolUse returns bare acknowledgement', JSON.stringify(quietCodex) === '{}', JSON.stringify(quietCodex));
+  check('unchanged Claude Code PostToolUse returns continue', JSON.stringify(quietClaude) === '{"continue":true}', JSON.stringify(quietClaude));
   run('codex', 'SessionEnd', { session_id: 'hook-ast-session', cwd: dir });
   const ended = sessionRow(info.dbFile, 'hook-ast-session');
   check('SessionEnd stores deterministic tool/file/symbol digest', ended.summary?.includes('Tools: Edit') && ended.summary.includes('Files:') && ended.summary.includes('Symbols: api.js::api'), JSON.stringify(ended));
   const prompt = run('codex', 'SessionStart', { session_id: 'hook-ast-next', cwd: dir });
   check('next session recalls the digest', prompt.hookSpecificOutput?.additionalContext?.includes('Recent sessions:'), JSON.stringify(prompt));
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n14. each Stop refreshes the digest and SessionEnd is idempotent');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-digest-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+  const firstFile = path.join(dir, 'api.js');
+  const secondFile = path.join(dir, 'b.js');
+  fs.writeFileSync(firstFile, 'function api(v) { return v; }\n');
+  run('claude-code', 'SessionStart', { session_id: 'hook-multiturn', cwd: dir });
+  run('claude-code', 'PostToolUse', { session_id: 'hook-multiturn', cwd: dir,
+    tool_name: 'Read', tool_input: { file_path: firstFile } });
+  run('claude-code', 'Stop', { session_id: 'hook-multiturn', cwd: dir });
+  const info = ensureWorkspace(dir);
+  const firstDigest = sessionRow(info.dbFile, 'hook-multiturn').summary;
+  fs.writeFileSync(firstFile, 'function api(v, w) { return v + w; }\n');
+  run('claude-code', 'PostToolUse', { session_id: 'hook-multiturn', cwd: dir,
+    tool_name: 'Edit', tool_input: { file_path: firstFile } });
+  fs.writeFileSync(secondFile, 'function beta() { return 2; }\n');
+  run('claude-code', 'PostToolUse', { session_id: 'hook-multiturn', cwd: dir,
+    tool_name: 'Write', tool_input: { file_path: secondFile } });
+  run('claude-code', 'Stop', { session_id: 'hook-multiturn', cwd: dir });
+  const finalDigest = sessionRow(info.dbFile, 'hook-multiturn').summary;
+  check('later Stop includes every turn', finalDigest !== firstDigest &&
+    ['Edit', 'Read', 'Write', 'Files:', 'api.js', 'b.js', '(3 calls)'].every(part => finalDigest.includes(part)), finalDigest);
+  run('claude-code', 'SessionEnd', { session_id: 'hook-multiturn', cwd: dir });
+  run('claude-code', 'SessionEnd', { session_id: 'hook-multiturn', cwd: dir });
+  check('repeated SessionEnd leaves identical digest', sessionRow(info.dbFile, 'hook-multiturn').summary === finalDigest);
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

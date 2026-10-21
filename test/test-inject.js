@@ -130,6 +130,26 @@ for (const budget of [0, 24, 70, 500]) {
   check(`strict ${budget}-character budget`, !text || text.length <= budget, text?.length);
 }
 
+console.log('\n8. prompt recall flags changed evidence without verify');
+{
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-stale-'));
+  const source = path.join(dir, 'server.js');
+  fs.writeFileSync(source, 'const PORT = 3000;\n');
+  const id = factStore.record({ kind: 'decision', title: 'Dev server port',
+    body: 'The dev server listens on port 3000.', summary: 'The dev server listens on port 3000.',
+    evidence: [source] });
+  fs.writeFileSync(source, 'const PORT = 8080;\n');
+  const recalled = buildInjection(db, { root: ROOT }, {
+    prompt: 'which port does the dev server use?', machine: machineId(), budget: 2000
+  });
+  check('active stale fact is explicitly flagged', recalled?.includes(`[decision#${id}]`) &&
+    recalled.includes(`NEEDS REVIEW — changed since recorded: ${source}`), recalled);
+  check('prompt recall does not silently change fact state', db.prepare('SELECT state FROM facts WHERE id = ?').get(id).state === 'active');
+  db.prepare('DELETE FROM facts WHERE id = ?').run(id);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 db.close();
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
 process.exit(fail ? 1 : 0);

@@ -4,7 +4,7 @@
 // Tools: search, get_observations, list_sessions, timeline
 
 const { MemoryStore, redactPrivate } = require('./store');
-const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces } = require('./workspace');
+const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces, canonicalKey } = require('./workspace');
 const { FactStore, searchWorkspaces } = require('./facts');
 const { syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast');
 const path = require('path');
@@ -20,6 +20,7 @@ let backfillTimer = null;
 // so it provisions the workspace itself rather than assuming a hook got there
 // first. Connections are cached per workspace: resolving is cheap, opening is not.
 const factConnections = new Map();
+const fullyIndexedWorkspaces = new Set();
 
 // `caipira prune --apply` can delete a workspace database under a running
 // server, and ensureWorkspace() then provisions a fresh file at the same path.
@@ -40,6 +41,7 @@ function factsFor(cwd) {
   if (entry && isStale(entry, workspace.dbFile)) {
     try { entry.db.close(); } catch {}
     factConnections.delete(workspace.dbFile);
+    fullyIndexedWorkspaces.delete(workspace.dbFile);
     entry = null;
   }
   if (!entry) {
@@ -58,6 +60,7 @@ function closeFactConnections() {
     try { entry.db.close(); } catch {}
   }
   factConnections.clear();
+  fullyIndexedWorkspaces.clear();
 }
 
 // Observations live in the same per-workspace database the hooks write to.
@@ -96,9 +99,10 @@ function closeAll() {
   closeFactConnections();
 }
 
-function ensureAstIndex(workspace, db) {
-  if (db.prepare('SELECT 1 FROM ast_files LIMIT 1').get()) return;
+function ensureAstIndex(workspace) {
+  if (fullyIndexedWorkspaces.has(workspace.dbFile)) return;
   syncWorkspaceAst(workspace.root, workspace.dbFile);
+  fullyIndexedWorkspaces.add(workspace.dbFile);
 }
 
 function resolveSymbolEvidence(workspace, db, selectors) {
@@ -525,6 +529,9 @@ function invalidArguments(name, args) {
             range.start_line < 1 || range.end_line < range.start_line))) {
         return 'evidence_ranges must contain absolute paths and valid inclusive line ranges';
       }
+      if (args.evidence_ranges && new Set(args.evidence_ranges.map(range => canonicalKey(range.path))).size !== args.evidence_ranges.length) {
+        return 'evidence_ranges may list each file once';
+      }
       return null;
     case 'inspect_symbol':
       return (nonEmptyString(args.symbol) || Number.isInteger(args.symbol)) &&
@@ -658,7 +665,7 @@ async function handleToolCall(id, params) {
       }
       case 'workspace_symbols': {
         const { workspace, facts } = factsFor(args.cwd);
-        ensureAstIndex(workspace, facts.db);
+        ensureAstIndex(workspace);
         result = { content: [{ type: 'text', text: JSON.stringify(queryWorkspaceSymbols(facts.db, {
           query: args.query, kind: args.kind, path: args.path_prefix,
           publicOnly: args.public_only, limit: args.limit
@@ -667,7 +674,7 @@ async function handleToolCall(id, params) {
       }
       case 'inspect_symbol': {
         const { workspace, facts } = factsFor(args.cwd);
-        ensureAstIndex(workspace, facts.db);
+        ensureAstIndex(workspace);
         const selector = args.path && typeof args.symbol === 'string'
           ? { path: args.path, name: args.symbol } : args.symbol;
         const detail = inspectSymbol(facts.db, selector, { workspaceRoot: workspace.root });

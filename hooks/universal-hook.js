@@ -202,8 +202,8 @@ const HOOK_EVENT_NAMES = {
 
 function writeClientResult(result, event, client, payload, recalled) {
   if (client === 'codex' || client === 'claude-code') {
-    // Only these two events may carry additionalContext; the others must
-    // return a bare acknowledgement or the client rejects the payload.
+    // SessionStart and UserPromptSubmit carry recall. PostToolUse can carry
+    // an AST reminder through its own additionalContext output.
     const canInject = event === 'session-start' || event === 'user-prompt-submit';
     if (canInject) {
       const parts = [];
@@ -223,7 +223,12 @@ function writeClientResult(result, event, client, payload, recalled) {
       }
     }
     if (event === 'post-tool-use' && result.reminder) {
-      writeResult({ systemMessage: result.reminder });
+      writeResult({
+        hookSpecificOutput: {
+          hookEventName: HOOK_EVENT_NAMES[event],
+          additionalContext: result.reminder
+        }
+      });
       return;
     }
     writeResult(client === 'codex' ? {} : { continue: true });
@@ -324,10 +329,10 @@ function postToolAstDelta(db, workspace, payload) {
 function synthesizeSessionDigest(store, sessionId) {
   const db = store.storage.db;
   const existing = db.prepare('SELECT summary FROM sessions WHERE id = ?').get(sessionId);
-  if (!existing || existing.summary) return existing?.summary || null;
+  if (!existing) return null;
   const rows = db.prepare(`SELECT content, metadata FROM observations
     WHERE session_id = ? AND kind = 'tool_result' ORDER BY id LIMIT 500`).all(sessionId);
-  if (rows.length === 0) return null;
+  if (rows.length === 0) return existing.summary || null;
   const tools = new Set(), files = new Set(), symbols = new Set();
   for (const row of rows) {
     let meta = {};
@@ -341,7 +346,8 @@ function synthesizeSessionDigest(store, sessionId) {
   const summary = [`Tools: ${list(tools)} (${rows.length} calls)`,
     files.size ? `Files: ${list(files)}` : '', symbols.size ? `Symbols: ${list(symbols)}` : '']
     .filter(Boolean).join('; ').slice(0, 500);
-  db.prepare('UPDATE sessions SET summary = ? WHERE id = ? AND summary IS NULL').run(summary, sessionId);
+  db.prepare('UPDATE sessions SET summary = ? WHERE id = ? AND (summary IS NULL OR summary != ?)')
+    .run(summary, sessionId, summary);
   return summary;
 }
 

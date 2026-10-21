@@ -155,6 +155,19 @@ const { call, tool } = server;
     body: 'The second line calls greet.', evidence_ranges: [{ path: source, start_line: 2, end_line: 2 }], cwd: tmp });
   const isolatedRange = await tool('inspect_symbol', { symbol: 'greet', path: 'symbols.js', cwd: tmp });
   check('a different function line is not attached', !isolatedRange.facts.some(f => f.fact_id === callerRange.id), JSON.stringify(isolatedRange.facts));
+  const countFacts = () => {
+    const db = new D(rec.db, { readonly: true });
+    try { return db.prepare('SELECT COUNT(*) AS n FROM facts').get().n; }
+    finally { db.close(); }
+  };
+  const beforeDuplicate = countFacts();
+  const duplicateRanges = await tool('record_fact', { kind: 'decision', title: 'duplicate range sentinel',
+    body: 'Two ranges in one file.', evidence_ranges: [
+      { path: source, start_line: 1, end_line: 1 }, { path: source, start_line: 3, end_line: 3 }
+    ], cwd: tmp });
+  check('duplicate file ranges are rejected without recording a fact',
+    duplicateRanges.__error?.includes('evidence_ranges may list each file once') &&
+    countFacts() === beforeDuplicate, JSON.stringify(duplicateRanges));
   fs.writeFileSync(source, 'function greet(name) { return name; }\nfunction caller() { return greet("Ada"); }\nfunction other(x, y) { return x + y; }\nmodule.exports = { greet };\n');
   const unrelated = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
   check('unrelated function edit leaves anchored fact clean', unrelated.drifted.length === 0, JSON.stringify(unrelated));
@@ -167,6 +180,20 @@ const { call, tool } = server;
   fs.writeFileSync(source, 'function caller() { return "Ada"; }\nfunction other(x, y) { return x + y; }\nmodule.exports = { caller };\n');
   const deleted = await tool('check_drift', { ids: [anchored.id], cwd: tmp });
   check('deleted symbol reports symbol_missing', deleted.drifted[0]?.broken?.[0]?.reason === 'symbol_missing', JSON.stringify(deleted));
+
+  console.log('\n2b. a single-file delta does not count as a full workspace index');
+  const partial = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-partial-'));
+  fs.writeFileSync(path.join(partial, 'package.json'), '{}');
+  const alphaFile = path.join(partial, 'a.js');
+  fs.writeFileSync(alphaFile, 'function alpha() { return 1; }\nmodule.exports = { alpha };\n');
+  fs.writeFileSync(path.join(partial, 'b.js'), 'function beta() { return 2; }\nmodule.exports = { beta };\n');
+  const partialInfo = require(ROOT + '/workspace.js').ensureWorkspace(partial);
+  require(ROOT + '/ast.js').updateFileAst(partial, partialInfo.dbFile, alphaFile);
+  const betaSymbols = await tool('workspace_symbols', { query: 'beta', cwd: partial });
+  check('first workspace_symbols call completes a partial index',
+    betaSymbols.some(s => s.path === 'b.js' && s.name === 'beta'), JSON.stringify(betaSymbols));
+  const betaDetail = await tool('inspect_symbol', { symbol: 'beta', path: 'b.js', cwd: partial });
+  check('inspect_symbol sees the completed index', betaDetail?.symbol?.name === 'beta', JSON.stringify(betaDetail));
 
   console.log('\n3. search_facts finds it, in compressed and verbatim form');
   const verbatim = await tool('search_facts', { query: 'development server configuration' });
@@ -311,6 +338,7 @@ const { call, tool } = server;
 
   await server.stop();
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(partial, { recursive: true, force: true }); } catch {}
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
   process.exit(fail ? 1 : 0);
 })().catch(e => {

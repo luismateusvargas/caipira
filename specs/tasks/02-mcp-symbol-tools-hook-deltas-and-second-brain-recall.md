@@ -35,7 +35,7 @@ Outside scope: The `caipira explore` HTTP server and React UI, which belong to B
    - On `Write`, `Edit`, or `MultiEdit`, `handlePostToolUse` runs `updateFileAst(ws.root, ws.dbFile, filePath)` instead of spawning `madar`.
    - If a public symbol's signature changed (`modified` or `removed` in the AST diff) or a symbol referenced by an active fact changed, `handlePostToolUse` emits a `<system-reminder>` listing the changed symbol signature, its known callers in the workspace, and any impacted `[category#id]` facts.
 5. **Episodic Session Digest & Enhanced `buildInjection` (`inject.js`)**:
-   - At `Stop` / `SessionEnd`, `universal-hook.js` computes a deterministic session digest summarizing files modified, symbols touched, and tools executed, saving it to `sessions.summary` when not already populated.
+   - At `Stop` / `SessionEnd`, `universal-hook.js` computes a deterministic session digest summarizing files modified, symbols touched, and tools executed, saving it to `sessions.summary` unless an identical digest is already stored.
    - `buildInjection(registry, ws, { cwd, budget })` in `inject.js` prioritizes facts whose `fact_evidence.path` or `fact_symbol_evidence.path` matches the active relative subpath (`cwd` inside `ws.root`), appends a concise `Recent sessions:` block (last 1–2 non-empty session digests), and stays strictly within `budget` characters.
 
 ## Implementation plan

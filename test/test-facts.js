@@ -255,6 +255,12 @@ console.log('\n17. update and record validation');
 const rejects = fn => { try { fn(); return false; } catch { return true; } };
 check('record rejects invalid confidence', rejects(() => store.record({ kind: 'decision', title: 'x', body: 'y', confidence: 1.2 })));
 check('record rejects unknown supersedes ID', rejects(() => store.record({ kind: 'decision', title: 'x', body: 'y', supersedes: 999999 })));
+const beforeDuplicateRanges = store.count();
+check('record rejects two ranges for the same file without inserting a fact',
+  rejects(() => store.record({ kind: 'decision', title: 'duplicate ranges', body: 'invalid',
+    evidence_ranges: [{ path: activeFile, start_line: 1, end_line: 1 },
+      { path: path.join(tmp, '.', 'active.js'), start_line: 2, end_line: 2 }] })) &&
+  store.count() === beforeDuplicateRanges);
 check('update rejects invalid kind', rejects(() => store.update(activeId, { kind: 'nonsense' })));
 check('update rejects empty title and body',
   rejects(() => store.update(activeId, { title: '  ' })) && rejects(() => store.update(activeId, { body: '' })));

@@ -221,7 +221,7 @@ function buildInjection(db, workspace, opts = {}) {
     let facts;
     if (opts.prompt) {
       facts = selectFacts(db, opts.prompt, { machine: opts.machine, root: workspace?.root })
-        .map(row => ({ ...row.fact, score: row.score }));
+        .map(row => ({ ...row.fact, score: row.score, stale: row.stale }));
     } else {
       facts = db.prepare(`SELECT *, 0 AS score FROM facts WHERE state IN ('active','needs_review')
         ORDER BY updated_at DESC LIMIT 40`).all();
@@ -253,7 +253,9 @@ function buildInjection(db, workspace, opts = {}) {
     if (facts.length) {
       add(opts.prompt ? 'Caipira recalled facts:' : 'Caipira standing facts for this workspace:');
       for (const fact of facts.slice(0, 8)) {
-        const flag = fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
+        const flag = fact.stale?.length
+          ? ` (NEEDS REVIEW — changed since recorded: ${fact.stale.join(', ')})`
+          : fact.state === 'needs_review' ? ' (NEEDS REVIEW)' : '';
         add(`- [${fact.kind}#${fact.id}] ${fact.summary}${flag}`);
       }
     }

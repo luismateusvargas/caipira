@@ -119,6 +119,9 @@ class FactStore {
         range.end_line < range.start_line)) {
       throw new Error('evidence_ranges must contain a path and valid inclusive line range');
     }
+    if (new Set(evidence_ranges.map(range => canonicalKey(range.path))).size !== evidence_ranges.length) {
+      throw new Error('evidence_ranges may list each file once');
+    }
 
     const now = Date.now();
     const ttl = ttl_days !== undefined ? ttl_days : DEFAULT_TTL_DAYS[kind] ?? null;
