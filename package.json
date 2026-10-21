@@ -2,6 +2,7 @@
   "name": "caipira",
   "version": "1.0.0",
   "description": "Local-first cross-client memory + compression. No daemon. No HTTP. Direct SQLite.",
+  "license": "GPL-3.0-only",
   "type": "commonjs",
   "main": "store.js",
   "scripts": {
