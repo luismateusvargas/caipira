@@ -17,6 +17,7 @@ const { ROOT, openWorkspaceDb } = require('./workspace');
 const BIN_NAME = process.platform === 'win32' ? 'caipira-ast.exe' : 'caipira-ast';
 const CRATE_DIR = path.join(__dirname, 'rust', 'caipira-ast');
 const INSTALLED_BIN = path.join(ROOT, 'bin', BIN_NAME);
+const LOCAL_BIN = path.join(__dirname, 'bin', BIN_NAME);
 const DEFAULT_TIMEOUT_MS = 120000;
 const MAX_BUFFER = 256 * 1024 * 1024;
 const DEFAULT_LIMIT = 50;
@@ -69,11 +70,12 @@ function resolveBinary() {
     if (isExecutable(override)) return override;
     throw new AstEngineError('binary_missing', `CAIPIRA_AST_BIN does not point at an executable: ${override}`);
   }
-  const candidates = [
+  const candidates = [...new Set([
     INSTALLED_BIN,
+    LOCAL_BIN,
     path.join(CRATE_DIR, 'target', 'release', BIN_NAME),
     path.join(CRATE_DIR, 'target', 'debug', BIN_NAME)
-  ];
+  ])];
   const found = candidates.find(isExecutable);
   if (!found) {
     throw new AstEngineError('binary_missing', `caipira-ast not found (looked in ${candidates.join(', ')}) — run: caipira install`);

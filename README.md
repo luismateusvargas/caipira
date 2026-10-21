@@ -1,62 +1,88 @@
 # Caipira
 
-**Local-first, zero-daemon, cross-client memory and boundary-protected prose compression for coding agents.**
+**Local-first, zero-daemon, cross-client memory, polyglot Rust AST symbol engine, boundary-protected prose compression, and interactive graph inspector for coding agents.**
 
-Caipira gives **Claude Code**, **Codex**, and **Antigravity** a shared, persistent, per-workspace SQLite memory and MCP toolset. There is no background HTTP server, no cloud dependency, and no external vector database—everything runs locally over `stdio` and direct SQLite (`better-sqlite3` with WAL + FTS5) paired with a local quantized ONNX embedding model (`Xenova/all-MiniLM-L6-v2`).
+Caipira gives **Claude Code**, **Codex**, and **Antigravity** a shared, persistent, per-workspace SQLite second brain and structural code intelligence layer. During agent sessions, there is no background daemon, no cloud dependency, and no external vector database—everything runs locally over `stdio`, direct SQLite (`better-sqlite3` with WAL + FTS5), a compiled Rust `tree-sitter` AST engine (`caipira-ast`), and a local quantized ONNX embedding model (`Xenova/all-MiniLM-L6-v2`). When you want to inspect or curate a workspace visually, `caipira explore` launches an on-demand local graph and symbol workbench on `127.0.0.1:4777`.
 
 ---
 
 ## What It Is & How It Helps
 
-Coding sessions across different AI clients normally lose context as soon as a transcript ends—or worse, force every new session to re-read files and re-derive architecture decisions from scratch. Caipira solves this through four core mechanisms:
+Coding sessions across different AI clients normally lose context as soon as a transcript ends—forcing every new session to re-read files, re-trace call graphs, and re-derive architecture decisions from scratch. Caipira solves this through five core mechanisms:
 
-### 1. Two-Tier Memory Architecture
+### 1. Two-Tier Memory Architecture (`facts.js` + `store.js`)
 Caipira separates **what happened** from **what is currently true**:
 
-- **Facts (`facts.js` — Knowledge Layer)**:
+- **Facts (`facts.js` — Standing Knowledge Layer)**:
   - Durable statements of current truth (`decision`, `constraint`, `preference`, `status`, `gotcha`) stored **verbatim** so exact technical terms, paths, and identifiers are never altered.
-  - Backed by **two-tier file evidence fingerprinting**: when a fact is recorded with `evidence: ["/abs/path/to/file.js"]`, Caipira records the file's `size`, `mtime`, and `sha256`.
-  - On subsequent checks, `fs.statSync` acts as a microsecond fast gate; only if `size` or `mtime` moved does Caipira compute `sha256` to determine whether the content actually changed.
-  - Unflagged facts are verified by construction—agents act on them directly without re-opening the underlying files. When an evidence file *does* change (either in-session via tool writes or between sessions via `git` / another editor) or a `status` fact's `ttl_days` expires, Caipira automatically flips the fact to `needs_review` and tells the agent the exact file(s) to re-read.
-- **Observations (`store.js` — Episodic Layer)**:
+  - **Two-tier file evidence (`fact_evidence`)**: When a fact is recorded with `evidence: ["/abs/path/to/file.js"]`, Caipira stores the file's `size`, `mtime`, and `sha256`. On subsequent checks, `fs.statSync` acts as a microsecond fast gate; only if `size` or `mtime` moved does Caipira compute `sha256` to verify whether content changed.
+  - **Symbol-level AST signature anchors (`fact_symbol_evidence`)**: Facts can be anchored to specific symbols (`evidence_symbols: ["src/store.ts::UserStore.addUser"]`) or line ranges (`evidence_ranges: [{ path, start_line, end_line }]`). Internal edits to a function body that leave its normalized `signature_hash` intact **do not** trigger false drift—the file hash is automatically re-baselined while keeping the fact `active`. Only when the anchored symbol's signature changes or the symbol is removed does Caipira flip the fact to `needs_review`.
+- **Observations & Session Digests (`store.js` — Episodic Layer)**:
   - Append-only log of session prompts, tool calls, model invocations, and session summaries captured automatically by lifecycle hooks.
   - Automatically strips `<private>...</private>` blocks and compresses prose (`compress.js`) while strictly preserving code fences, inline code, URLs, file paths, dates, versions, numbers, and identifiers.
+  - At `Stop` / `SessionEnd`, Caipira deterministically synthesizes a multi-turn **`session_digest`** observation (intent, key decisions, modified files/symbols, and verification commands) and records touched files/symbols in `session_touches`.
   - Indexed with dual-form FTS5 (`porter unicode61`, matching both abbreviated and expanded lexicon forms) and backfilled on idle with 384-dimensional local embeddings for hybrid BM25 + cosine similarity search.
 
-### 2. High-Precision, Silence-by-Default Prompt Injection (`inject.js`)
-- Never injects "top-N" results on unrelated prompts.
-- Every prompt-driven injection gates independently on **term coverage** (`MIN_COVERAGE = 0.4` over meaningful domain terms) and **evidence trust** (`MIN_TRUST = 0.25`, combining state weight, confidence, evidence freshness, and TTL).
-- If a prompt is unrelated to recorded facts, Caipira injects **nothing** (`null`), preserving context window budget and avoiding false premises.
+### 2. Polyglot Incremental Rust AST Engine (`rust/caipira-ast` + `ast.js`)
+- A standalone Rust binary (`caipira-ast`) powered by `tree-sitter`, `ignore`, and `rayon` indexes **8 language families**:
+  - **JavaScript** (`.js`, `.mjs`, `.cjs`)
+  - **TypeScript** (`.ts`, `.mts`, `.cts`)
+  - **React JSX / TSX** (`.jsx`, `.tsx`)
+  - **Vue 3 SFCs** (`.vue`, with line-preserving masking of non-`<script>` / `<script setup>` blocks so line numbers match the original file)
+  - **Python** (`.py`)
+  - **Rust** (`.rs`)
+  - **Go** (`.go`)
+  - **C / C++** (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`)
+- Extracts structured symbols (`function`, `method`, `class`, `struct`, `interface`, `trait`, `enum`, `type`, `union`, `const`), structured parameters (`name`, `type_annotation`, `default_value`), `return_type`, `doc_summary`, normalized `signature_text`, 64-bit FNV-1a `signature_hash`, and dependency edges (`calls`, `imports`, `uses_type`, `extends`, `implements`).
+- **Three-tier incremental sync**: `(size, mtime_ms)` fast gate → `sha256` content gate → `tree-sitter` parse only on modified files, plus probe-based cross-file relinking (`ast_links` / `ast_link_probes`) so newly added or edited exports automatically resolve callers and importers across the workspace.
+- **Zero-spawn read path**: Symbol searches (`workspace_symbols`) and deep symbol inspections (`inspect_symbol`) run as pure in-process SQLite queries (`ast_files`, `ast_symbols`, `ast_edges`, `ast_symbols_fts`) in `ast.js`.
 
-### 3. Per-Workspace Isolation with Opt-In Cross-Workspace Recall (`workspace.js`)
-- Resolves every working directory to its enclosing workspace root (`.caipira-workspace` > `.git` / `.hg` > manifest files like `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`), so monorepo subdirectories share a single workspace database (`~/.caipira/database/<slug>-<hash>.db`) tracked in `~/.caipira/database/master.db`.
-- Searches are strictly isolated to the current workspace by default. Passing `scope: "all"` to `search_facts` fuses results across all registered workspaces via Reciprocal Rank Fusion (`RRF_K = 60`) weighted by trust and labels each borrowed result with its origin workspace.
+### 3. High-Precision Prompt Injection & Subpath Recall (`inject.js`)
+- **Silence by default on prompts**: Prompt-driven injection (`buildPromptInjection`) gates independently on **term coverage** (`MIN_COVERAGE = 0.4` over meaningful domain terms) and **evidence trust** (`MIN_TRUST = 0.25`, combining state weight, confidence, evidence freshness, and TTL). Unrelated prompts inject `null`.
+- **Subpath-aware session start (`buildInjection`)**: Boosts standing facts whose `scope` or evidence paths match the active subdirectory (`+0.35`), surfaces drifted active facts with `[NEEDS REVIEW]` warnings, includes recent episodic session digests (`Recent sessions:`), and lists top public workspace symbols ranked by caller fan-in (`Workspace symbols:`).
 
 ### 4. Fail-Open Cross-Client Lifecycle Adapter (`hooks/universal-hook.js`)
 - A single hook adapter handles lifecycle payloads for Claude Code, Codex, and Antigravity (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PreInvocation`, `PostInvocation`, `Stop`, `SessionEnd`).
-- Detects file writes in real time across clients (`Edit`, `Write`, `edit_file`, `write_file`, `MultiEdit`, `apply_patch`, etc.) to invalidate drifted facts immediately.
-- Always exits `0` with valid client JSON so a memory error can never block your coding client.
+- **Real-time AST delta & blast-radius reminders**: On `PostToolUse` file writes (`Edit`, `Write`, `edit_file`, `write_file`, `MultiEdit`, `apply_patch`), Caipira runs `caipira-ast update-file` (<50 ms). When a modified or removed symbol's signature changes and has callers or anchored facts, the hook emits a concise model-visible reminder (`hookSpecificOutput.additionalContext` / `injectSteps`) showing the before/after signature, affected callers, and facts moved to `needs_review`.
+- Always exits `0` with valid client JSON so a memory or parser error can never block your coding client.
+
+### 5. Interactive Graph & Symbol Workbench (`caipira explore`)
+- Launches a local HTTP server (`explore-server.js` on `127.0.0.1:4777`) serving a compiled React 19 + TypeScript + HTML5 Canvas application (`explore-ui/dist`) styled in a dark-gray (`#0d0e11` / `#14161b` / `#1c1f26`) and crimson (`#7f1d1d` / `#b91c1c` / `#dc2626`) palette:
+  - **4 Graph Perspectives**: `Unified` (files, symbols, facts, and sessions), `Architecture` (code structure, call graph, imports, type dependencies, and inheritance), `Knowledge` (standing facts, sessions, and evidence targets), and `Impact` (1–3 hop blast-radius neighborhood around any focused symbol).
+  - **Madar-Style Symbol Inspector Drawer**: Inspects any symbol's `RECEIVES (INPUTS)` (parameter names, clickable workspace type annotations, default values), `RETURNS (OUTPUT)`, docstring summary, `CALLED BY (UPSTREAM)` and `CALLS (DOWNSTREAM)` (including unique member-call resolution), `TYPE CONNECTIONS`, `LINKED FACTS` (with live drift badges, `Focus Impact`, and `+ Attach Fact`), and a workspace-confined source code preview.
+  - **Live Knowledge Board**: Browse, search, and filter facts by category (`decision`, `constraint`, `preference`, `status`, `gotcha`) and state (`active`, `needs_review`, `superseded`). Create facts anchored to symbols or files, edit in place, supersede with a replacement fact, archive (`revoked`), reaffirm drifted facts (re-indexing evidence files via `caipira-ast` and re-baselining `signature_hash` + `sha256`), or trigger an explicit `Re-check Drift`.
+  - **Omni-Search (`Ctrl+K` / `Cmd+K`)**: Instant search across symbol names, parameter types, return types, file paths, and standing facts.
+  - **Hardened Local Security**: Loopback binding by default, DNS-rebinding `Host` header check, same-origin `application/json` CSRF enforcement on writes, strict CSP headers, and symlink-aware workspace path confinement.
 
 ---
 
 ## Runtime Layout & Prerequisites
 
-Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v22.20.0** runtime and local ONNX model:
+Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v22.20.0** runtime, compiled `caipira-ast` binary, built `explore-ui/dist` bundle, and local ONNX model:
 
 ```text
 ~/.caipira/
 ├── caipira.sh                  # Linux/macOS CLI launcher (uses bundled Node 22)
 ├── caipira.cmd                 # Windows CLI launcher (uses bundled Node 22)
-├── install.js                  # Installer, uninstaller, doctor, status, prune, mode CLI
-├── mcp.js                      # Stdio MCP server
+├── install.js                  # Installer, uninstaller, doctor, status, prune, mode, explore CLI
+├── mcp.js                      # Stdio MCP server (11 tools)
+├── ast.js                      # Bridge to caipira-ast + in-process SQLite symbol queries
+├── explore-server.js           # Local HTTP API & static bundle server for `caipira explore`
 ├── workspace.js                # Workspace root resolution & master.db registry
-├── migrate.js                  # Transactional schema migrations (master + workspace v1/v2)
+├── migrate.js                  # Transactional schema migrations (master v1 + workspace v1..v6)
 ├── store.js                    # Observation storage, redaction, FTS5 + hybrid embedding search
-├── facts.js                    # Verbatim facts, two-tier stat+sha256 verification, RRF recall
-├── inject.js                   # Coverage + trust prompt-injection gate
+├── facts.js                    # Verbatim facts, file + symbol evidence verification, RRF recall
+├── inject.js                   # Coverage + trust prompt-injection gate & session-start recall
 ├── compress.js                 # Boundary-protected prose compressor & FTS query builders
 ├── hooks/
-│   └── universal-hook.js       # Cross-client lifecycle hook adapter
+│   └── universal-hook.js       # Cross-client lifecycle hook adapter (AST deltas & session digests)
+├── bin/
+│   └── caipira-ast             # Compiled Rust tree-sitter AST indexer binary
+├── rust/
+│   └── caipira-ast/            # Rust crate source for the polyglot AST engine
+├── explore-ui/
+│   ├── src/                    # React 19 + TypeScript source for the graph & symbol inspector
+│   └── dist/                   # Compiled production UI bundle served by explore-server.js
 ├── node22/                     # Bundled Node 22.20.0 runtime (ABI-matched to better-sqlite3)
 └── models/
     └── Xenova/all-MiniLM-L6-v2/ # Local quantized ONNX embedding model
@@ -68,7 +94,7 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
 
 ## Installation
 
-1. **Place or sync the repository into `~/.caipira`** (ensuring `node22/` and `models/` are present in `~/.caipira`).
+1. **Place or sync the repository into `~/.caipira`** (ensuring `node22/` and `models/` are present in `~/.caipira`, and `cargo` is on `PATH` to compile the Rust AST engine).
 2. **Run the installer**:
 
    **Linux / macOS:**
@@ -82,7 +108,9 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
    ```
 
 ### What `install` Does
-- Installs npm dependencies (`better-sqlite3`, `@xenova/transformers`) using the bundled Node 22 runtime if not already present.
+- Installs root npm dependencies (`better-sqlite3`, `@xenova/transformers`) using the bundled Node 22 runtime if not already present.
+- Compiles the release Rust AST binary (`cargo build --release --manifest-path rust/caipira-ast/Cargo.toml`) and installs it atomically to `bin/caipira-ast` (degrades gracefully with a warning if `cargo` is not installed).
+- Installs `explore-ui` dependencies and builds the production Vite bundle at `explore-ui/dist` (and copies `explore-server.js` + `explore-ui/dist` into `~/.caipira` when invoked from a separate checkout).
 - Creates runtime directories (`logs/`).
 - Atomically registers the `caipira` stdio MCP server and lifecycle hooks across all supported clients (saving a `.caipira-backup` copy before modifying any file):
   - **Claude Code**: `~/.claude.json` and `~/.claude/settings.json`
@@ -99,38 +127,53 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
 
 ### CLI Commands
 
-Run via `~/.caipira/caipira.sh <command>` on Linux or `caipira.cmd <command>` on Windows:
+Run via `~/.caipira/caipira.sh <command>` on Linux/macOS or `caipira.cmd <command>` on Windows:
 
 | Command | Description |
 | :--- | :--- |
-| `install` | Install dependencies and wire MCP server + hooks into Claude Code, Codex, and Antigravity. |
-| `doctor` | Check bundled Node 22, native dependencies, ONNX model, `master.db`, all workspace databases, dangling registry rows, client configs, and active mode. |
+| `install` | Install dependencies, build `caipira-ast` and `explore-ui`, and wire MCP server + hooks into Claude Code, Codex, and Antigravity. |
+| `explore [flags]` | Incrementally index the target workspace and launch the local graph & symbol inspector UI (`--port 4777`, `--host 127.0.0.1`, `--workspace <path>`, `--no-open`). |
+| `doctor` | Check bundled Node 22, native dependencies, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, dangling registry rows, client configs, and active mode. |
 | `status` | Display current compression mode and aggregated counts of workspaces, observations, embeddings, facts, and recent sessions. |
 | `mode <lite\|full\|ultra>` | Set the active prose compression intensity for newly recorded observations. |
 | `prune` | Dry-run report of dangling workspace registry rows (whose project root was deleted) and unclaimed `.db` files. |
 | `prune --apply` | Delete dangling workspace rows and their associated `.db` / `-wal` / `-shm` files. |
 | `uninstall` | Remove Caipira MCP and hook registrations from Claude Code, Codex, and Antigravity (leaves `~/.caipira/database/` untouched). |
 
+### Launching the Visual Explorer (`caipira explore`)
+
+```sh
+# Index the current working directory's workspace and open http://127.0.0.1:4777/
+~/.caipira/caipira.sh explore
+
+# Inspect a specific workspace on a custom port without opening a browser tab
+~/.caipira/caipira.sh explore --workspace /path/to/repo --port 4888 --no-open
+```
+
 ### MCP Tools
 
-Once registered, Caipira exposes **9 tools** to your coding agent over MCP:
+Once registered, Caipira exposes **11 tools** to your coding agent over MCP:
 
 #### Knowledge Layer (Facts)
-- **`record_fact`**: Record a durable workspace fact (`kind`: `'decision' | 'constraint' | 'preference' | 'status' | 'gotcha'`, `title`, `body`, optional `summary`, `evidence` array of absolute file paths, `scope`, `confidence` `0..1`, `ttl_days`, `supersedes`).
-- **`search_facts`**: Search durable facts ranked by trust (`relevance × freshness`). Supports `include_stale` (default `true`) and `scope` (`'workspace'` default, or `'all'` to search across every registered workspace).
-- **`update_fact`**: Revise a fact in place (`kind`, `title`, `body`, `summary`, `scope`, `evidence`, `confidence`, `ttl_days`) or transition its `state` (`'active' | 'needs_review' | 'superseded' | 'revoked' | 'proposed'`). Setting `state: 'active'` re-baselines local evidence fingerprints and renews TTL verification.
-- **`check_drift`**: Re-verify active facts against their on-disk evidence files (`stat` + `sha256` + `ttl_days`) and return only the drifted facts alongside `files_to_reread`.
+- **`record_fact`**: Record a durable workspace fact (`kind`: `'decision' | 'constraint' | 'preference' | 'status' | 'gotcha'`, `title`, `body`, optional `summary`, `evidence` array of file paths, `evidence_symbols` array of symbol selectors like `"src/store.ts::UserStore.addUser"`, `evidence_ranges` array of `{ path, start_line, end_line }`, `scope`, `confidence` `0..1`, `ttl_days`, `supersedes`).
+- **`search_facts`**: Search durable facts ranked by trust (`relevance × freshness`). Supports `include_stale` (default `true`) and `scope` (`'workspace'` default, or `'all'` to fuse results across every registered workspace via Reciprocal Rank Fusion).
+- **`update_fact`**: Revise a fact in place (`kind`, `title`, `body`, `summary`, `scope`, `evidence`, `evidence_symbols`, `evidence_ranges`, `confidence`, `ttl_days`) or transition its `state` (`'active' | 'needs_review' | 'superseded' | 'revoked' | 'proposed'`). Setting `state: 'active'` re-baselines local file and symbol evidence fingerprints and renews TTL verification.
+- **`check_drift`**: Re-verify active facts against their on-disk evidence files and AST symbol signatures (`stat` + `sha256` + `signature_hash` + `ttl_days`) and return only the drifted facts alongside `files_to_reread`.
 - **`list_workspaces`**: List all registered workspaces in `master.db` with their root paths, database files, and last-seen timestamps.
 
+#### Structural Code Intelligence Layer (AST Symbols)
+- **`workspace_symbols`**: Search or list indexed AST symbols in the current workspace by `query` (FTS5 over name, qualified name, signature, and docstring), `path` prefix, `kind` (`function`, `method`, `class`, `struct`, `interface`, `trait`, `enum`, `type`, `union`, `const`), `exported_only`, and `limit`. Incrementally refreshes the workspace index when `refresh: true` or on first query.
+- **`inspect_symbol`**: Inspect a symbol's full contract and relationships without reading the entire file. Accepts `selector` (`"path/to/file.ts::Qualified.name"`, `"path/to/file.ts:line"`, or `"Qualified.name"`) or explicit `path` + `qualified_name` / `line`. Returns signature, structured `params`, `return_type`, `doc_summary`, `callers`, `callees`, `uses_types`, `used_by`, `extends`, `implements`, `inherited_by`, file `imports` / `imported_by`, and anchored `facts` with live `evidence_status`.
+
 #### Episodic Layer (Observations & Sessions)
-- **`search`**: Hybrid FTS5 BM25 + 384-dim cosine similarity search over session observations (with automatic substring `LIKE` fallback).
+- **`search`**: Hybrid FTS5 BM25 + 384-dim cosine similarity search over session observations and session digests (with automatic substring `LIKE` fallback).
 - **`get_observations`**: Fetch specific observation rows by ID (`ids` array, up to 500), with optional `expand: true` to expand lexicon abbreviations back to full prose.
 - **`list_sessions`**: List recent coding sessions with client (`ide`), `cwd`, start/end timestamps, and session IDs.
 - **`timeline`**: Retrieve chronological observations for a given `session_id`.
 
 ### Privacy Redaction (`<private>`)
 
-Any text wrapped in `<private>...</private>` inside prompts, tool outputs, or summaries is stripped before observation storage or debug traffic logging:
+Any text wrapped in `<private>...</private>` inside prompts, tool outputs, or summaries is stripped before observation storage, session digest synthesis, or debug traffic logging:
 
 ```text
 Connected to staging DB with token <private>sk-live-secret</private>.
@@ -160,6 +203,7 @@ touch /path/to/workspace-root/.caipira-workspace
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `CAIPIRA_HOME` | `~/.caipira` | Redirects the `database/` directory (`master.db`, per-workspace `.db` files, legacy `data.db`) and `logs/mcp_traffic.log` to a custom directory. |
+| `CAIPIRA_AST_BIN` | `<root>/bin/caipira-ast` | Overrides the path to the `caipira-ast` executable. |
 | `CAIPIRA_MODEL_PATH` | `<root>/models` or `~/.caipira/models` | Overrides the directory containing `Xenova/all-MiniLM-L6-v2`. |
 | `CAIPIRA_DEBUG` | unset (`0`) | Set `CAIPIRA_DEBUG=1` to enable `<private>`-redacted MCP JSON-RPC traffic logging to `logs/mcp_traffic.log` (rotates to `.1` at 5 MB). |
 
@@ -170,11 +214,21 @@ touch /path/to/workspace-root/.caipira-workspace
 Every test suite runs against an isolated temporary `CAIPIRA_HOME` (`test/fixtures.js`) so tests never read or mutate your live `~/.caipira/database/` files:
 
 ```sh
+# 1. Run all Node integration & unit suites (store, workspace, facts, inject, hooks, install, ast, symbol-recall, explore):
 # From ~/.caipira (where node22/ and node_modules/ live locally):
 ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js
 
 # From a repository checkout using ~/.caipira's runtime and dependencies:
 NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js
+
+# 2. Run the Rust AST engine unit tests & Clippy lints:
+cargo test --manifest-path rust/caipira-ast/Cargo.toml
+cargo clippy --manifest-path rust/caipira-ast/Cargo.toml -- -D warnings
+
+# 3. Run the explore-ui TypeScript typecheck, Vitest suite, and production build:
+PATH="$HOME/.caipira/node22/node-v22.20.0-linux-x64/bin:$PATH" npm --prefix explore-ui run typecheck
+PATH="$HOME/.caipira/node22/node-v22.20.0-linux-x64/bin:$PATH" npm --prefix explore-ui test
+PATH="$HOME/.caipira/node22/node-v22.20.0-linux-x64/bin:$PATH" npm --prefix explore-ui run build
 ```
 
 ---
