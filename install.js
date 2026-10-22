@@ -1039,7 +1039,6 @@ function doctor() {
   }
   else {
     check('Codex MCP server registered', /^\[mcp_servers\.caipira\]/m.test(codexConfig), 'run: caipira install');
-    check('Codex free of cavemem references', !/cavemem/i.test(codexConfig), 'run: caipira install');
     check('Codex hooks point at Caipira',
       (codexConfig.match(/universal-hook\.js/g) || []).length >= CODEX_HOOKS.length * 2,
       'run: caipira install');
