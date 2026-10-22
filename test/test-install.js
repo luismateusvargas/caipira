@@ -28,9 +28,21 @@ const check = (label, cond, extra) => {
   else { fail++; console.log('  FAIL ' + label + (extra !== undefined ? ' -> ' + extra : '')); }
 };
 
+function isolateRegistry(env, home) {
+  if (!IS_WINDOWS) return env;
+  // HOME cannot isolate HKCU; intercept the registry adapter in every CLI
+  // subprocess, including uninstall on a fixture that has never installed.
+  const preload = path.join(home, 'isolate-registry.cjs');
+  fs.writeFileSync(preload, `const cp = require('child_process');
+const original = cp.execFileSync;
+cp.execFileSync = (command, ...args) => command === 'powershell.exe' ? Buffer.alloc(0) : original(command, ...args);
+`);
+  return { ...env, NODE_OPTIONS: `${env.NODE_OPTIONS || ''} --require ${JSON.stringify(preload)}` };
+}
+
 function caipira(...args) {
   const r = spawnSync(NODE, [path.join(ROOT, 'install.js'), ...args], {
-    encoding: 'utf8', env: { ...process.env, HOME, USERPROFILE: HOME }
+    encoding: 'utf8', env: isolateRegistry({ ...process.env, HOME, USERPROFILE: HOME }, HOME)
   });
   return { code: r.error ? null : r.status, out: `${r.stdout || ''}${r.stderr || ''}${r.error || ''}` };
 }
@@ -212,17 +224,7 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
       fs.writeFileSync(dest, marker.endsWith('.json') ? '{}' : 'model = "user-model"\n');
     } else fs.mkdirSync(dest, { recursive: true });
   }
-  const env = { ...process.env, HOME: home, USERPROFILE: home, CAIPIRA_HOME: live };
-  if (IS_WINDOWS) {
-    // HOME cannot isolate HKCU. Intercept only this platform adapter so even
-    // running the suite on Windows never edits the user's actual registry.
-    const preload = path.join(home, 'isolate-registry.cjs');
-    fs.writeFileSync(preload, `const cp = require('child_process');
-const original = cp.execFileSync;
-cp.execFileSync = (command, ...args) => command === 'powershell.exe' ? Buffer.alloc(0) : original(command, ...args);
-`);
-    env.NODE_OPTIONS = `${env.NODE_OPTIONS || ''} --require ${JSON.stringify(preload)}`;
-  }
+  const env = isolateRegistry({ ...process.env, HOME: home, USERPROFILE: home, CAIPIRA_HOME: live, SHELL: '/bin/bash' }, home);
   delete env.CAIPIRA_AST_BIN;
   const run = (...args) => {
     const child = spawnSync(NODE, [path.join(source, 'install.js'), ...args], { env, encoding: 'utf8', timeout: 30000 });
@@ -330,7 +332,8 @@ console.log('\n7. complete runtime sync and PATH launcher');
 check('all core files synchronized byte for byte', CORE.every(rel => fs.readFileSync(path.join(empty.source, rel)).equals(fs.readFileSync(path.join(empty.live, rel)))));
 const AST_REL = `bin/caipira-ast${IS_WINDOWS ? '.exe' : ''}`;
 check('UI bundle and executable synchronized', fs.readFileSync(path.join(empty.live, 'explore-ui/dist/index.html'), 'utf8') === '<html>fixture UI</html>' && fs.readFileSync(path.join(empty.live, AST_REL), 'utf8').includes('exit 1'));
-check('launcher path recommendation is explicit', empty.run('install').out.includes(IS_WINDOWS ? 'open a new terminal' : 'export PATH="$HOME/.local/bin:$PATH"'));
+const pathSetup = empty.run('install');
+check('automatic PATH setup asks only for a new terminal', pathSetup.code === 0 && pathSetup.out.includes('open a new terminal') && !pathSetup.out.includes('add export PATH='));
 const launcher = IS_WINDOWS ? path.join(empty.live, 'caipira.cmd') : path.join(empty.home, '.local/bin/caipira');
 const launcherContent = fs.readFileSync(launcher, 'utf8');
 check('launcher executable exists', IS_WINDOWS ? fs.existsSync(launcher) : Boolean(fs.statSync(launcher).mode & 0o111));
@@ -412,7 +415,124 @@ function registeredSessions(registration, env, cwd) {
   });
 }
 
+function automaticPathChecks() {
+  if (IS_WINDOWS) return;
+  const marker = '# >>> caipira PATH >>>';
+  const endMarker = '# <<< caipira PATH <<<';
+  const command = 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac';
+  const block = `${marker}\n${command}\n${endMarker}\n`;
+  const minimalPath = '/usr/bin:/bin';
+  const bash = installFixture();
+  bash.env.PATH = minimalPath;
+  const rc = path.join(bash.home, '.bashrc');
+  const original = '# user startup\r\nexport USER_STARTUP=kept\r\n';
+  fs.writeFileSync(rc, original);
+  fs.chmodSync(rc, 0o600);
+  let result = bash.run('install');
+  const installed = fs.readFileSync(rc, 'utf8');
+  check('bash install appends one exact marked block and preserves original bytes', result.code === 0 && installed === original + block, result.out);
+  const installedMode = fs.statSync(rc).mode & 0o777;
+  result = bash.run('install');
+  check('second bash install leaves marked startup file unchanged', result.code === 0 && fs.readFileSync(rc, 'utf8') === installed, result.out);
+  const directory = path.join(bash.home, 'another workspace');
+  fs.mkdirSync(directory);
+  fs.writeFileSync(path.join(directory, 'package.json'), '{}');
+  const shell = spawnSync('/bin/bash', ['-ic', 'command -v caipira && caipira status'], {
+    env: bash.env, cwd: directory, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
+  });
+  check('new real bash finds and runs caipira from another directory', !shell.error && shell.status === 0 && shell.stdout.includes(path.join(bash.home, '.local/bin/caipira')) && shell.stdout.includes('Caipira status'), shell.stdout + shell.stderr);
+  result = bash.run('uninstall');
+  check('uninstall restores bash startup bytes', result.code === 0 && fs.readFileSync(rc, 'utf8') === original, result.out);
+  check('install and uninstall preserve private startup file permissions', installedMode === 0o600 && (fs.statSync(rc).mode & 0o777) === 0o600);
+
+  const inPath = installFixture();
+  inPath.env.PATH = `${path.join(inPath.home, '.local/bin')}:${minimalPath}`;
+  result = inPath.run('install');
+  check('PATH already configured creates no startup file', result.code === 0 && !fs.existsSync(path.join(inPath.home, '.bashrc')), result.out);
+  fs.writeFileSync(path.join(inPath.home, '.bashrc'), 'user config without newline');
+  inPath.run('install');
+  check('PATH already configured does not change existing startup bytes', fs.readFileSync(path.join(inPath.home, '.bashrc'), 'utf8') === 'user config without newline');
+
+  for (const [shellName, rel, expectedCommand] of [
+    ['/bin/sh', '.profile', command], ['/usr/bin/zsh', '.zshrc', command],
+    ['/usr/bin/fish', '.config/fish/conf.d/caipira.fish', 'contains -- $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH']
+  ]) {
+    const fixture = installFixture();
+    fixture.env.SHELL = shellName;
+    fixture.env.PATH = minimalPath;
+    result = fixture.run('install');
+    const file = path.join(fixture.home, rel);
+    const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    check(`${shellName} selects startup file and shell syntax`, result.code === 0 && content === `${marker}\n${expectedCommand}\n${endMarker}\n`, result.out);
+    if (shellName === '/bin/sh') {
+      const login = spawnSync('/bin/sh', ['-lc', 'command -v caipira'], { env: fixture.env, cwd: directory, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+      check('new real sh login finds caipira', !login.error && login.status === 0 && login.stdout.trim() === path.join(fixture.home, '.local/bin/caipira'), login.stdout + login.stderr);
+    }
+    result = fixture.run('uninstall');
+    check(`${shellName} uninstall removes its block or owned fish file`, result.code === 0 &&
+      (shellName.endsWith('fish') ? !fs.existsSync(file) : !fs.existsSync(file) || fs.readFileSync(file, 'utf8') === ''), result.out);
+  }
+
+  const noNewline = installFixture();
+  noNewline.env.PATH = minimalPath;
+  const noNewlineFile = path.join(noNewline.home, '.bashrc');
+  const noNewlineOriginal = 'export USER_LAST_LINE=kept';
+  fs.writeFileSync(noNewlineFile, noNewlineOriginal);
+  noNewline.run('install');
+  const noNewlineInstalled = fs.readFileSync(noNewlineFile, 'utf8');
+  check('startup without final newline keeps original bytes and gains a valid block', noNewlineInstalled.includes(block) && noNewlineInstalled.includes(noNewlineOriginal));
+  noNewline.run('uninstall');
+  check('uninstall restores file without final newline exactly', fs.readFileSync(noNewlineFile, 'utf8') === noNewlineOriginal);
+
+  const mac = installFixture();
+  mac.env.PATH = minimalPath;
+  const macRc = path.join(mac.home, '.bashrc'), macProfile = path.join(mac.home, '.bash_profile');
+  fs.writeFileSync(macRc, 'bash rc\n');
+  fs.writeFileSync(macProfile, 'bash login\n');
+  const macContext = installerContext(mac, { process: { platform: 'darwin' } });
+  vm.runInContext('registerPath()', macContext);
+  check('macOS bash covers rc and login startup', fs.readFileSync(macRc, 'utf8') === 'bash rc\n' + block && fs.readFileSync(macProfile, 'utf8') === 'bash login\n' + block);
+  vm.runInContext('unregister()', macContext);
+  check('macOS uninstall restores both startup files', fs.readFileSync(macRc, 'utf8') === 'bash rc\n' && fs.readFileSync(macProfile, 'utf8') === 'bash login\n');
+
+  const untouched = installFixture();
+  const userFiles = ['.bashrc', '.bash_profile', '.zshrc', '.profile', '.config/fish/conf.d/caipira.fish'];
+  for (const rel of userFiles) {
+    const file = path.join(untouched.home, rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'unmarked user content\r\n');
+  }
+  result = untouched.run('uninstall');
+  check('uninstall leaves every unmarked startup file untouched', result.code === 0 && userFiles.every(rel => fs.readFileSync(path.join(untouched.home, rel), 'utf8') === 'unmarked user content\r\n'), result.out);
+  const fish = installFixture();
+  fish.env.SHELL = '/usr/bin/fish';
+  fish.env.PATH = minimalPath;
+  const fishFile = path.join(fish.home, '.config/fish/conf.d/caipira.fish');
+  fs.mkdirSync(path.dirname(fishFile), { recursive: true });
+  fs.writeFileSync(fishFile, 'set -gx USER_FISH kept\n');
+  fish.run('install');
+  fish.run('uninstall');
+  check('uninstall preserves user content in a pre-existing fish file', fs.readFileSync(fishFile, 'utf8') === 'set -gx USER_FISH kept\n');
+  const blank = installFixture([], { provisionDeployment: false });
+  result = blank.run('uninstall');
+  check('uninstall on never-installed home is quiet and creates no startup or deployment files', result.code === 0 && !result.out.includes('[warn]') &&
+    !fs.existsSync(blank.live) && !fs.existsSync(path.join(blank.home, '.local')) && userFiles.every(rel => !fs.existsSync(path.join(blank.home, rel))), result.out);
+  const markedFile = path.join(untouched.home, '.zshrc');
+  const surrounding = 'before\r\n' + block + 'between\n' + block + 'after';
+  fs.writeFileSync(markedFile, surrounding);
+  untouched.run('uninstall');
+  check('uninstall removes only marked ranges, preserving surrounding bytes', fs.readFileSync(markedFile, 'utf8') === 'before\r\nbetween\nafter');
+  fs.writeFileSync(markedFile, `${marker}\nuser incomplete block`);
+  untouched.env.SHELL = '/usr/bin/zsh';
+  untouched.env.PATH = minimalPath;
+  untouched.run('install');
+  untouched.run('uninstall');
+  check('existing incomplete marker is never rewritten or truncated', fs.readFileSync(markedFile, 'utf8') === `${marker}\nuser incomplete block`);
+}
+
 async function remainingChecks() {
+  console.log('\n7a. automatic PATH startup files and uninstall');
+  automaticPathChecks();
   console.log('\n8. interactive consent and failed deployment recovery');
   for (const [answer, agreed] of [['yes', true], ['', false], ['n', false]]) {
     let prompt = '';
@@ -479,6 +599,39 @@ async function remainingChecks() {
   check('Windows PATH preserves raw entries and deduplicates expanded paths', script.includes('DoNotExpandEnvironmentNames') && script.includes('ExpandEnvironmentVariables') && script.includes('-ieq') && script.includes('ExpandString') && windowsCall[2].env.CAIPIRA_PATH_TARGET === win.live);
   check('Windows registry errors fail the install', script.includes("$ErrorActionPreference = 'Stop'"));
   check('Windows PATH limit has no unnamed 15000 literal', !/\b15000\b/.test(fs.readFileSync(path.join(ROOT, 'install.js'), 'utf8')));
+  const broadcastContract = call => {
+    const body = call[1].at(-1);
+    return body.includes('Add-Type') && body.includes('SendMessageTimeout') && body.includes('0x1A') && body.includes('0xFFFF') &&
+      body.includes('SMTO_ABORTIFHUNG') && body.includes('Environment') && body.includes('CAIPIRA_PATH_BROADCAST_TIMEOUT_MS') &&
+      body.indexOf("$key.SetValue('Path'") < body.indexOf('Add-Type') &&
+      Number(call[2].env.CAIPIRA_PATH_BROADCAST_TIMEOUT_MS) > 0 && Number(call[2].env.CAIPIRA_PATH_BROADCAST_TIMEOUT_MS) < call[2].timeout;
+  };
+  check('Windows install broadcasts environment change after registry write with bounded timeout', broadcastContract(windowsCall));
+  let removalCall;
+  vm.runInContext('unregister()', installerContext(win, {
+    process: { platform: 'win32' }, child_process: { execFileSync: (...args) => { removalCall = args; } }
+  }));
+  check('Windows uninstall removes only expanded target and broadcasts with same contract', Boolean(removalCall) && broadcastContract(removalCall) &&
+    removalCall[2].env.CAIPIRA_PATH_ACTION === 'remove' && removalCall[1].at(-1).includes('-ine') &&
+    removalCall[1].at(-1).includes('DoNotExpandEnvironmentNames') && removalCall[1].at(-1).includes('ExpandString'));
+  let registryWrites = 0, warningOutput = '';
+  vm.runInContext('registerPath()', installerContext(win, {
+    process: { platform: 'win32', stdout: { on() {}, write: message => { warningOutput += message; } } },
+    child_process: { execFileSync: () => { registryWrites++; return 'CAIPIRA_PATH_CHANGED\nCAIPIRA_PATH_BROADCAST_FAILED\n'; } }
+  }));
+  check('simulated broadcast failure warns about sign-out without a registry rollback call', registryWrites === 1 && warningOutput.includes('[warn]') && /signing out/i.test(warningOutput));
+  warningOutput = '';
+  vm.runInContext('registerPath()', installerContext(win, {
+    process: { platform: 'win32', stdout: { on() {}, write: message => { warningOutput += message; } } },
+    child_process: { execFileSync: () => { throw Object.assign(new Error('broadcast subprocess deadline'), { code: 'ETIMEDOUT', stdout: 'CAIPIRA_PATH_CHANGED\n' }); } }
+  }));
+  check('outer timeout after registry write warns while retaining completed update', warningOutput.includes('[warn]') && /signing out/i.test(warningOutput));
+  let missingEntryOutput = '';
+  vm.runInContext('unregisterPath()', installerContext(win, {
+    process: { platform: 'win32', stdout: { on() {}, write: message => { missingEntryOutput += message; } } },
+    child_process: { execFileSync: () => '' }
+  }));
+  check('Windows missing PATH entry removal is silent', missingEntryOutput === '');
 
   console.log('\n8a. registered entry points inherit one data root after custom deployment');
   const shared = installFixture(['.claude', '.codex', '.gemini']);

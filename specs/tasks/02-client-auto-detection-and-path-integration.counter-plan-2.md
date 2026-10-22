@@ -3,7 +3,7 @@
 Original task spec: [02-client-auto-detection-and-path-integration.md](02-client-auto-detection-and-path-integration.md)
 Reviewed task: [Counter-plan 1, K1–K4](02-client-auto-detection-and-path-integration.counter-plan.md)
 Review evidence: independent review, 2026-10-22, plus the user's requirement decision of the same date.
-Status: ready
+Status: implemented — pending independent review and native Windows verification
 
 Reviewed baseline: `956481061a7f47368da3064bfe6c7f5a3ef14a7c`.
 Reviewed completion: `392dbd485cdb57520b622df8351d85bda9984e4c`.
@@ -98,3 +98,17 @@ Also run `sh -n caipira.sh`. Every startup-file test must use a fake `HOME`; non
 - Not blockers, recorded for later:
   - **Task 03:** after `npm i -g @luismateusvargas/caipira`, npm's global bin also provides a `caipira` command, so the two can shadow each other depending on PATH order.
   - The open decision from the first review: `doctor` fails a detected client that `--clients` deliberately excluded.
+
+## Implementation evidence
+
+- Baseline checkpoint: `076bf3f37dae91fc6c2828e5711abf128f25ba65`.
+- Q1: `registerPath` retains the single executable wrapper and configures the specified shell startup files only when the user bin directory is absent from PATH. Named constants define paths, commands and markers. Existing start markers prevent rewrites. Tests verify one exact block, repeat-install idempotence, original CRLF bytes, already-configured PATH with absent/existing files, zsh/fish content, and both macOS bash files through a platform override.
+- Real-shell verification with fake homes and minimal PATH passed: a new `/bin/bash -ic 'command -v caipira && caipira status'` resolves and runs the launcher from another workspace; `/bin/sh -lc 'command -v caipira'` resolves it through the generated `.profile`.
+- Q2: shared add/remove PowerShell preserves raw registry values, `ExpandString`, expanded case-insensitive matching, and terminating registry errors. A changed value is written before announcing `WM_SETTINGCHANGE` via `Add-Type`/`SendMessageTimeoutW`, with the specified message/recipient/flags and a named `PATH_BROADCAST_TIMEOUT_MS = 1_000` passed through the environment. The outer bound remains `PATH_REGISTRY_TIMEOUT_MS = 15_000`. API signature and broadcast parameters were checked against [Microsoft SendMessageTimeoutW documentation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw) and [WM_SETTINGCHANGE documentation](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-settingchange).
+- The adapter acknowledges a successful registry write before broadcasting. Simulated broadcast failure and an outer subprocess timeout after acknowledgement both preserve that write and warn that signing out completes the change; no rollback registry call occurs. An absent entry/key on removal is silent and is not created. Microsoft documents broadcast timeouts per recipient, so the outer subprocess deadline remains necessary.
+- Q3: uninstall scans every known startup file independently of the current shell, removes complete marked ranges and their line terminators, and preserves surrounding bytes. Incomplete markers and unmarked files remain unchanged. An owned fish file is removed when empty after block removal; pre-existing user content in a mixed fish file is preserved. Missing files/entries and a never-installed home remain quiet and create no startup/deployment files.
+- Compatibility details: a block is prepended when the original file lacks a final newline so uninstall restores its exact bytes without an extra separator. The existing atomic text writer also retains file permission bits before rename; a `0600` startup file stays private after install/uninstall. Client configuration backups and the launcher environment contract remain unchanged.
+- The initial regression run before implementation reported **111 passed, 13 failed**, reproducing P1/P2 and missing cleanup. Final expanded installation coverage passed **129/0**. All startup-file scenarios use fake homes; every Windows CLI test subprocess now intercepts the registry adapter, including uninstall before any install.
+- Final verification: `TMPDIR=/var/tmp NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **958 checks, 0 failures** (20/33/87/100/90/167/129/141/191). `git diff --check` and `sh -n caipira.sh` passed. Integration checks used approved execution outside the sandbox.
+- Changed paths: `install.js`, `test/test-install.js`, `README.md`, and this counter-plan. The permission-preserving text write is the small supporting change for private startup files; no other implementation deviations. Task 03 remains untouched and untracked.
+- Limits: checks 1–4 and 6 passed on Linux with bundled Node 22. Native Windows check 5, actual registry/broadcast delivery from Start-menu `cmd`, native macOS, and zsh/fish execution remain unverified. Independent review is pending. No approval tag was created; native Windows verification or explicit acceptance of that limit is still required before approval. No version bump, release, push or live user startup-file changes.

@@ -28,6 +28,22 @@ const HOME = os.homedir();
 const HOME_DIR = process.env.CAIPIRA_HOME ? path.resolve(process.env.CAIPIRA_HOME) : path.join(HOME, '.caipira');
 const IS_WINDOWS = process.platform === 'win32';
 const PATH_REGISTRY_TIMEOUT_MS = 15_000;
+const PATH_BROADCAST_TIMEOUT_MS = 1_000;
+const PATH_CHANGED_MARKER = 'CAIPIRA_PATH_CHANGED';
+const PATH_BROADCAST_FAILED_MARKER = 'CAIPIRA_PATH_BROADCAST_FAILED';
+const PATH_BLOCK_START = '# >>> caipira PATH >>>';
+const PATH_BLOCK_END = '# <<< caipira PATH <<<';
+const USER_BIN_DIR = path.join(HOME, '.local', 'bin');
+const USER_LAUNCHER = path.join(USER_BIN_DIR, 'caipira');
+const SHELL_STARTUP_FILES = {
+  bash: path.join(HOME, '.bashrc'),
+  bashLogin: path.join(HOME, '.bash_profile'),
+  zsh: path.join(HOME, '.zshrc'),
+  profile: path.join(HOME, '.profile'),
+  fish: path.join(HOME, '.config', 'fish', 'conf.d', 'caipira.fish')
+};
+const POSIX_PATH_COMMAND = 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac';
+const FISH_PATH_COMMAND = 'contains -- $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH';
 const NODE_RELEASE = `node-v22.20.0-${IS_WINDOWS ? 'win' : process.platform}-${process.arch}`;
 const NODE_DIR = path.join(ROOT, 'node22', NODE_RELEASE);
 const NODE_BIN = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
@@ -169,11 +185,14 @@ function writeJsonAtomic(file, data) {
 
 function writeTextAtomic(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  let mode = null;
   if (fs.existsSync(file)) {
+    mode = fs.statSync(file).mode & 0o777;
     fs.copyFileSync(file, `${file}.caipira-backup`);
   }
   const tmp = `${file}.caipira-tmp`;
   fs.writeFileSync(tmp, text, 'utf8');
+  if (mode !== null) fs.chmodSync(tmp, mode);
   fs.renameSync(tmp, file);
 }
 
@@ -338,41 +357,143 @@ function deployRuntime() {
   ok(`complete runtime synchronized to ${HOME_DIR}`);
 }
 
-/** Installs the user launcher without changing the caller's working directory. */
-function registerPath() {
-  if (IS_WINDOWS) {
-    const script = [
+/**
+ * Updates only the deployment entry and announces a successful registry write.
+ * @param {boolean} remove Whether to remove rather than append the entry.
+ * @returns {boolean} Whether the registry changed.
+ */
+function updateWindowsPath(remove) {
+  const script = [
       "$ErrorActionPreference = 'Stop'",
+      "$remove = $env:CAIPIRA_PATH_ACTION -eq 'remove'",
       "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
-      "if ($null -eq $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }",
+      "if ($null -eq $key) { if ($remove) { return }; $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }",
       'try {',
       "  $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)",
       '  $target = $env:CAIPIRA_PATH_TARGET',
-      "  $present = @($current -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ieq $target.TrimEnd('\\') }).Count -gt 0",
-      "  if (-not $present) { $updated = ($current.TrimEnd(';') + ';' + $target).TrimStart(';'); $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString) }",
+      "  $parts = @($current -split ';')",
+      '  if ($remove) {',
+      "    $kept = @($parts | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ine $target.TrimEnd('\\') })",
+      '    $changed = $kept.Count -ne $parts.Count',
+      "    $updated = $kept -join ';'",
+      '  } else {',
+      "    $present = @($parts | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ieq $target.TrimEnd('\\') }).Count -gt 0",
+      '    $changed = -not $present',
+      "    $updated = ($current.TrimEnd(';') + ';' + $target).TrimStart(';')",
+      '  }',
+      '  if ($changed) {',
+      "    $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)",
+      `    Write-Output '${PATH_CHANGED_MARKER}'`,
+      '    try {',
+      "      Add-Type -TypeDefinition @'",
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public static class CaipiraEnvironment {',
+      '  [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]',
+      '  public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);',
+      '}',
+      "'@",
+      '      $HWND_BROADCAST = [IntPtr]0xFFFF',
+      '      $WM_SETTINGCHANGE = [uint32]0x1A',
+      '      $SMTO_ABORTIFHUNG = [uint32]0x0002',
+      '      $result = [UIntPtr]::Zero',
+      "      $sent = [CaipiraEnvironment]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, 'Environment', $SMTO_ABORTIFHUNG, [uint32]$env:CAIPIRA_PATH_BROADCAST_TIMEOUT_MS, [ref]$result)",
+      "      if ($sent -eq [IntPtr]::Zero) { throw 'Environment broadcast failed or timed out' }",
+      `    } catch { Write-Output '${PATH_BROADCAST_FAILED_MARKER}' }`,
+      '  }',
       '} finally { $key.Close() }'
-    ].join('\n');
-    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      env: { ...process.env, CAIPIRA_PATH_TARGET: HOME_DIR }, stdio: 'pipe', timeout: PATH_REGISTRY_TIMEOUT_MS, windowsHide: true
+  ].join('\n');
+  let output;
+  try {
+    output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      env: { ...process.env, CAIPIRA_PATH_TARGET: HOME_DIR, CAIPIRA_PATH_ACTION: remove ? 'remove' : 'add',
+        CAIPIRA_PATH_BROADCAST_TIMEOUT_MS: String(PATH_BROADCAST_TIMEOUT_MS) },
+      encoding: 'utf8', stdio: 'pipe', timeout: PATH_REGISTRY_TIMEOUT_MS, windowsHide: true
     });
+  } catch (error) {
+    // HWND_BROADCAST's timeout applies per window. Keep a completed write if
+    // the outer subprocess deadline interrupts a slow broadcast or Add-Type.
+    if (!String(error.stdout || '').includes(PATH_CHANGED_MARKER)) throw error;
+    output = `${PATH_CHANGED_MARKER}\n${PATH_BROADCAST_FAILED_MARKER}`;
+  }
+  if (String(output || '').includes(PATH_BROADCAST_FAILED_MARKER)) {
+    warn('User PATH updated, but the environment broadcast failed; signing out completes the change.');
+  }
+  return String(output || '').includes(PATH_CHANGED_MARKER);
+}
+
+/** @returns {string[]} Startup files for the shell that will open next. */
+function shellStartupFiles() {
+  switch (path.basename(process.env.SHELL || '')) {
+    case 'bash': return process.platform === 'darwin'
+      ? [SHELL_STARTUP_FILES.bash, SHELL_STARTUP_FILES.bashLogin] : [SHELL_STARTUP_FILES.bash];
+    case 'zsh': return [SHELL_STARTUP_FILES.zsh];
+    case 'fish': return [SHELL_STARTUP_FILES.fish];
+    default: return [SHELL_STARTUP_FILES.profile];
+  }
+}
+
+/** @param {string} file Startup path. @returns {string|null} Contents or null if absent. */
+function readStartupFile(file) {
+  try { return fs.readFileSync(file, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+/** Installs the user launcher without changing the caller's working directory. */
+function registerPath() {
+  if (IS_WINDOWS) {
+    updateWindowsPath(false);
     ok(`User PATH includes ${HOME_DIR} (open a new terminal)`);
     return;
   }
-  const bin = path.join(HOME, '.local', 'bin');
-  const launcher = path.join(bin, 'caipira');
   const quoted = `'${path.join(HOME_DIR, 'caipira.sh').replace(/'/g, `'\\''`)}'`;
-  fs.mkdirSync(bin, { recursive: true });
-  const tmp = `${launcher}.caipira-tmp`;
+  fs.mkdirSync(USER_BIN_DIR, { recursive: true });
+  const tmp = `${USER_LAUNCHER}.caipira-tmp`;
   try {
     fs.writeFileSync(tmp, `#!/bin/sh\nexec ${quoted} "$@"\n`, 'utf8');
     fs.chmodSync(tmp, 0o755);
-    fs.renameSync(tmp, launcher);
+    fs.renameSync(tmp, USER_LAUNCHER);
   } finally {
     fs.rmSync(tmp, { force: true });
   }
-  ok(`launcher installed at ${launcher}`);
-  if (!(process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === bin)) {
-    warn('add export PATH="$HOME/.local/bin:$PATH" to your shell rc, then open a new terminal');
+  ok(`launcher installed at ${USER_LAUNCHER}`);
+  if ((process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === USER_BIN_DIR)) return;
+  for (const file of shellStartupFiles()) {
+    const original = readStartupFile(file) || '';
+    if (!original.includes(PATH_BLOCK_START)) {
+      const command = file === SHELL_STARTUP_FILES.fish ? FISH_PATH_COMMAND : POSIX_PATH_COMMAND;
+      const block = `${PATH_BLOCK_START}\n${command}\n${PATH_BLOCK_END}\n`;
+      // Prepend when the original lacks a final newline: removal can then
+      // restore every original byte without inventing a separator newline.
+      const updated = original && !original.endsWith('\n') ? block + original : original + block;
+      writeTextAtomic(file, updated);
+    }
+    ok(`PATH configured in ${file} — open a new terminal`);
+  }
+}
+
+/** Removes owned startup ranges or the Windows deployment entry, leaving other content intact. */
+function unregisterPath() {
+  if (IS_WINDOWS) {
+    if (updateWindowsPath(true)) ok(`User PATH entry removed: ${HOME_DIR}`);
+    return;
+  }
+  for (const file of Object.values(SHELL_STARTUP_FILES)) {
+    const original = readStartupFile(file);
+    if (original === null) continue;
+    let updated = original, from = 0;
+    while ((from = updated.indexOf(PATH_BLOCK_START, from)) !== -1) {
+      const end = updated.indexOf(PATH_BLOCK_END, from + PATH_BLOCK_START.length);
+      if (end === -1) break;
+      let after = end + PATH_BLOCK_END.length;
+      if (updated.slice(after, after + 2) === '\r\n') after += 2;
+      else if (updated[after] === '\n') after++;
+      updated = updated.slice(0, from) + updated.slice(after);
+    }
+    if (updated === original) continue;
+    if (file === SHELL_STARTUP_FILES.fish && updated === '') fs.unlinkSync(file);
+    else writeTextAtomic(file, updated);
+    ok(`PATH block removed from ${file}`);
   }
 }
 
@@ -600,6 +721,7 @@ function unregister() {
 
   unregisterCodex();
   unregisterAntigravity();
+  unregisterPath();
 
   const { DB_DIR } = require('./workspace');
   log(`\nCaipira data under ${DB_DIR} was left untouched.`);
