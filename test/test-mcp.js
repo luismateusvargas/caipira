@@ -102,7 +102,12 @@ const server = startServer();
 const { call, tool } = server;
 
 (async () => {
-  await call('initialize', INITIALIZE);
+  const initialized = await call('initialize', INITIALIZE);
+  check('initialize advertises the package version', initialized.result.serverInfo.version === require('../package.json').version);
+  const discovered = await call('server/discover', {});
+  check('discovery advertises the package version', discovered.result._meta['io.modelcontextprotocol/serverInfo'].version === require('../package.json').version);
+  check('discovery explains facts, drift and symbol tools', ['record_fact', 'check_drift', 'workspace_symbols', 'inspect_symbol']
+    .every(name => discovered.result.instructions.includes(name)), discovered.result.instructions);
 
   console.log('\n1. tools are advertised');
   const list = await call('tools/list', {});
@@ -385,6 +390,36 @@ const { call, tool } = server;
     const seen = healthy.facts && healthy.facts.find(f => f.id === anchoredApi.id);
     check('with the parser available the anchor is checked and its change found', seen && seen.evidence_status?.unchecked === 0
       && seen.evidence_status?.broken[0]?.reason === 'symbol_signature_changed' && seen.stale_files.includes(path.join(info.root, 'api.js')), JSON.stringify(seen));
+  }
+
+  console.log('\n10. native module failure leaves MCP discovery and JSON-RPC errors usable');
+  const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-'));
+  const preload = path.join(nativeHome, 'native.cjs');
+  fs.writeFileSync(preload, `const Module = require('module'), load = Module._load;
+    Module._load = function(id, ...args) {
+      if (id === 'better-sqlite3') throw Object.assign(new Error('synthetic ABI failure <private>hidden</private>'), {code: 'ERR_DLOPEN_FAILED'});
+      return load.call(this, id, ...args);
+    };`);
+  const broken = startServer({ CAIPIRA_HOME: nativeHome, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, CAIPIRA_DEBUG: '1' });
+  try {
+    const init = await broken.call('initialize', INITIALIZE);
+    check('native failure still initializes MCP', init.result?.serverInfo.version === require('../package.json').version, JSON.stringify(init));
+    const response = await broken.call('tools/call', { name: 'list_sessions', arguments: {} });
+    check('native failure returns a protocol error', response.jsonrpc === '2.0' && response.error?.code === -32000, JSON.stringify(response));
+    check('native failure keeps dependency details out of the client response', !JSON.stringify(response).includes('hidden') &&
+      response.error.message.includes('caipira logs'), JSON.stringify(response));
+    const ping = await broken.call('ping', {});
+    check('native failure keeps the server responsive', Boolean(ping.result), JSON.stringify(ping));
+    const entries = fs.readFileSync(path.join(nativeHome, 'logs', 'errors.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    check('native failure is journaled once with sanitized metadata', entries.length === 1 && entries[0].component === 'mcp' &&
+      entries[0].error.code === 'ERR_DLOPEN_FAILED' && !JSON.stringify(entries).includes('hidden'), JSON.stringify(entries));
+    const logs = require('child_process').spawnSync(NODE, [ROOT + '/install.js', 'logs'], {
+      encoding: 'utf8', env: { ...process.env, CAIPIRA_HOME: nativeHome, NODE_OPTIONS: `--require=${preload}` }, timeout: 10000
+    });
+    check('logs command works without native SQLite', logs.status === 0 && logs.stdout.includes('ERR_DLOPEN_FAILED') && logs.stdout.includes('Reproduce:'), logs.stdout + logs.stderr);
+  } finally {
+    await broken.stop();
+    fs.rmSync(nativeHome, { recursive: true, force: true });
   }
 
   await server.stop();

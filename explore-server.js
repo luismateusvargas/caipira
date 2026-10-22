@@ -18,9 +18,21 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { spawn } = require('child_process');
-const { ensureWorkspace, listWorkspaces, openWorkspaceDb, machineId } = require('./workspace');
-const { FactStore, trustScore, VALID_KINDS } = require('./facts');
-const { AstEngineError, syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast');
+const { logError } = require('./errors');
+let ensureWorkspace, listWorkspaces, openWorkspaceDb, machineId, FactStore, trustScore, VALID_KINDS;
+let AstEngineError, syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol;
+
+function loadModules() {
+  if (FactStore) return;
+  try {
+    ({ ensureWorkspace, listWorkspaces, openWorkspaceDb, machineId } = require('./workspace'));
+    ({ AstEngineError, syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast'));
+    ({ FactStore, trustScore, VALID_KINDS } = require('./facts'));
+  } catch (error) {
+    logError({ component: 'explore', operation: 'load modules', error });
+    throw error;
+  }
+}
 
 const DEFAULT_PORT = 4777;
 const DEFAULT_HOST = '127.0.0.1';
@@ -70,8 +82,8 @@ class HttpError extends Error {
    * @param {string} code Stable machine-readable failure code.
    * @param {string} message Safe, human-readable detail.
    */
-  constructor(status, code, message) {
-    super(message);
+  constructor(status, code, message, options) {
+    super(message, options);
     this.name = 'HttpError';
     this.status = status;
     this.code = code;
@@ -730,7 +742,7 @@ function refreshFiles(ws, relPaths) {
       if (!(error instanceof AstEngineError)) throw error;
       const status = error.code === 'binary_missing' || error.code === 'timeout' ? 503 : 502;
       throw new HttpError(status, 'evidence_unverifiable',
-        `symbol evidence in ${rel} could not be re-read (${error.code}); no fact was changed — check caipira-ast (caipira install) and retry`);
+        `symbol evidence in ${rel} could not be re-read (${error.code}); no fact was changed — check caipira-ast (caipira install) and retry`, { cause: error });
     }
   }
 }
@@ -848,7 +860,9 @@ function getWorkspaces(ctx) {
   const workspaces = listWorkspaces().map(row => {
     let counts = null;
     if (fs.existsSync(row.db_file)) {
-      try { counts = workspaceCounts(row.db_file); } catch { /* unreadable: listed without counts */ }
+      try { counts = workspaceCounts(row.db_file); } catch (error) {
+        logError({ component: 'explore', operation: 'workspace counts', error });
+      }
     }
     return {
       id: row.id, label: row.label || row.root_path || 'legacy', root: row.root_path, machine: row.machine,
@@ -1145,6 +1159,7 @@ async function serveStatic(ctx, req, res, url) {
  * @returns {import('http').Server}
  */
 function createExploreServer(opts = {}) {
+  loadModules();
   const caipiraDir = path.resolve(opts.caipiraDir || __dirname);
   const workspace = ensureWorkspace(opts.defaultWorkspace || process.cwd());
   const host = bindHostname(opts.host);
@@ -1170,7 +1185,10 @@ function createExploreServer(opts = {}) {
       })
       .catch(error => {
         const failure = toHttpError(error);
-        if (failure.status >= 500) process.stderr.write(`[caipira-explore] ${req.method} ${url.pathname}: ${error.message}\n`);
+        if (failure.status >= 500) {
+          logError({ component: 'explore', operation: 'HTTP request', error });
+          process.stderr.write(`[caipira-explore] ${req.method} ${url.pathname}: ${error.message}\n`);
+        }
         if (res.headersSent) { res.destroy(); return; }
         sendError(res, failure);
       });
@@ -1221,9 +1239,13 @@ function openBrowser(url) {
       : ['xdg-open', [url]];
   try {
     const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true });
-    child.on('error', () => process.stderr.write(`[caipira-explore] could not open a browser; visit ${url}\n`));
+    child.on('error', error => {
+      logError({ component: 'explore', operation: 'open browser', error });
+      process.stderr.write(`[caipira-explore] could not open a browser; visit ${url}\n`);
+    });
     child.unref();
-  } catch {
+  } catch (error) {
+    logError({ component: 'explore', operation: 'open browser', error });
     process.stderr.write(`[caipira-explore] could not open a browser; visit ${url}\n`);
   }
 }
@@ -1251,6 +1273,7 @@ async function main(argv) {
     return null;
   }
 
+  loadModules();
   const workspace = ensureWorkspace(opts.workspace);
   if (workspace.root) {
     try {
@@ -1258,6 +1281,7 @@ async function main(argv) {
       process.stdout.write(`Indexed ${workspace.root}: ${stats.parsed} parsed, ${stats.skipped + stats.hash_matched} unchanged, ${stats.symbols_total} symbols\n`);
     } catch (error) {
       if (!(error instanceof AstEngineError)) throw error;
+      logError({ component: 'explore', operation: 'index workspace', error });
       process.stderr.write(`[caipira-explore] symbol index not refreshed — ${error.message}\n`);
     }
   }
@@ -1284,6 +1308,7 @@ async function main(argv) {
 
 if (require.main === module) {
   main(process.argv.slice(2)).catch(error => {
+    logError({ component: 'explore', operation: 'startup', error });
     process.stderr.write(`[caipira-explore] ${error.message}\n`);
     process.exitCode = 1;
   });

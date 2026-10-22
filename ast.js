@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { ROOT, openWorkspaceDb } = require('./workspace');
+const { logError } = require('./errors');
 
 const BIN_NAME = process.platform === 'win32' ? 'caipira-ast.exe' : 'caipira-ast';
 const CRATE_DIR = path.join(__dirname, 'rust', 'caipira-ast');
@@ -201,10 +202,21 @@ function prepareDb(dbFile) {
  * @throws {AstEngineError}
  */
 function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
-  requireText('workspaceRoot', workspaceRoot);
-  requireText('dbFile', dbFile);
-  prepareDb(dbFile);
-  return checkStats(runEngine(['index', '--workspace', workspaceRoot, '--db', dbFile], opts));
+  try {
+    requireText('workspaceRoot', workspaceRoot);
+    requireText('dbFile', dbFile);
+    prepareDb(dbFile);
+    const stats = checkStats(runEngine(['index', '--workspace', workspaceRoot, '--db', dbFile], opts));
+    if (stats.failed) {
+      const sample = (Array.isArray(stats.failures) ? stats.failures : []).slice(0, 3);
+      logError({ component: 'ast', operation: 'index partial',
+        error: new AstEngineError('io', `${stats.failed} unreadable path(s): ${JSON.stringify(sample)}`) });
+    }
+    return stats;
+  } catch (error) {
+    logError({ component: 'ast', operation: 'index', error });
+    throw error;
+  }
 }
 
 /**
@@ -223,12 +235,18 @@ function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
  *   through a symlink, io when it is missing and was never indexed.
  */
 function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
-  requireText('workspaceRoot', workspaceRoot);
-  requireText('dbFile', dbFile);
-  requireText('filePath', filePath);
-  prepareDb(dbFile);
-  const args = ['update-file', '--workspace', workspaceRoot, '--db', dbFile, '--file', filePath];
-  return checkUpdate(runEngine(args, opts));
+  try {
+    requireText('workspaceRoot', workspaceRoot);
+    requireText('dbFile', dbFile);
+    requireText('filePath', filePath);
+    prepareDb(dbFile);
+    const args = ['update-file', '--workspace', workspaceRoot, '--db', dbFile, '--file', filePath];
+    return checkUpdate(runEngine(args, opts));
+  } catch (error) {
+    // Non-source and previously unindexed missing files are normal tool edits.
+    if (error.code !== 'unsupported' && error.code !== 'io') logError({ component: 'ast', operation: 'update-file', error });
+    throw error;
+  }
 }
 
 /**
@@ -240,11 +258,16 @@ function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
  * @throws {AstEngineError} invalid_argument for a path through a symlink.
  */
 function parseFileAst(workspaceRoot, filePath, opts = {}) {
-  requireText('workspaceRoot', workspaceRoot);
-  requireText('filePath', filePath);
-  const snapshot = runEngine(['parse-file', '--workspace', workspaceRoot, '--file', filePath], opts);
-  if (!snapshot || !Array.isArray(snapshot.symbols) || !Array.isArray(snapshot.edges)) throw badOutput('snapshot');
-  return snapshot;
+  try {
+    requireText('workspaceRoot', workspaceRoot);
+    requireText('filePath', filePath);
+    const snapshot = runEngine(['parse-file', '--workspace', workspaceRoot, '--file', filePath], opts);
+    if (!snapshot || !Array.isArray(snapshot.symbols) || !Array.isArray(snapshot.edges)) throw badOutput('snapshot');
+    return snapshot;
+  } catch (error) {
+    logError({ component: 'ast', operation: 'parse-file', error });
+    throw error;
+  }
 }
 
 // ── reads, in SQL ──
@@ -269,7 +292,9 @@ const SYMBOL_COLUMNS = ['id', 'path', 'name', 'qualified_name', 'kind', 'is_publ
 
 function rowToSymbol(row) {
   let params = [];
-  try { params = JSON.parse(row.params_json); } catch { /* a corrupt row reads as no parameters */ }
+  try { params = JSON.parse(row.params_json); } catch (error) {
+    logError({ component: 'ast', operation: 'decode parameters', error });
+  }
   const { params_json: _, ...rest } = row;
   return { ...rest, is_public: row.is_public === 1, params };
 }

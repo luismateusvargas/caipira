@@ -14,7 +14,7 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const NODE = process.execPath;
 
-const SUITES = ['test-workspace', 'test-facts', 'test-inject', 'test-mcp', 'test-hook', 'test-install', 'test-ast', 'test-explore'];
+const SUITES = ['test-errors', 'test-workspace', 'test-facts', 'test-inject', 'test-mcp', 'test-hook', 'test-install', 'test-ast', 'test-explore'];
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'caipira-home-'));
 const ENV = { ...process.env, CAIPIRA_HOME: HOME };

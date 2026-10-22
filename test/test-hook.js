@@ -734,6 +734,57 @@ console.log('\n22. symbol evidence a missing parser cannot check is flagged in e
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+console.log('\n23. native dependency and process failures always acknowledge and journal once');
+{
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-fail-open-'));
+  const preload = path.join(scratch, 'failures.cjs');
+  fs.writeFileSync(preload, `
+    const mode = process.env.CAIPIRA_TEST_FAILURE;
+    const failure = () => Object.assign(new Error('synthetic ' + mode + ' <private>hidden</private>'),
+      { code: mode === 'missing' ? 'MODULE_NOT_FOUND' : mode === 'native' ? 'ERR_DLOPEN_FAILED' : 'EIO' });
+    if (mode === 'native' || mode === 'missing') {
+      const Module = require('module'), load = Module._load;
+      Module._load = function(id, ...args) {
+        if (id === 'better-sqlite3') throw failure();
+        return load.call(this, id, ...args);
+      };
+    } else {
+      const on = process.stdin.on;
+      process.stdin.on = function(name, handler) {
+        if (name !== 'end') return on.call(this, name, handler);
+        return on.call(this, name, () => {
+          if (mode === 'stdin') process.stdin.emit('error', failure());
+          else if (mode === 'rejection') Promise.reject(failure());
+          else throw failure();
+        });
+      };
+    }
+  `);
+  const replies = { codex: '{}\n', 'claude-code': '{"continue":true}\n', antigravity: '{}\n' };
+  for (const mode of ['native', 'missing', 'stdin', 'rejection', 'uncaught']) {
+    for (const [client, reply] of Object.entries(replies)) {
+      const home = path.join(scratch, mode, client);
+      const child = runRaw(client, 'SessionStart', JSON.stringify({ client, cwd: scratch }), {
+        CAIPIRA_HOME: home, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, CAIPIRA_TEST_FAILURE: mode
+      }, scratch);
+      check(`${mode}, ${client}: exit 0, exactly one client acknowledgement`, child.status === 0 && child.stdout === reply,
+        `${child.status} ${child.stdout} ${child.stderr}`);
+      const file = path.join(home, 'logs', 'errors.jsonl');
+      const entries = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      check(`${mode}, ${client}: one structured, redacted error`, entries.length === 1 && entries[0].component === 'hook' &&
+        entries[0].client === client && entries[0].env.abi === process.versions.modules &&
+        !JSON.stringify(entries).includes('hidden') && entries[0].repro.includes('--client ' + client), JSON.stringify(entries));
+    }
+  }
+  const unknown = runRaw('antigravity', 'FutureLifecycleEvent', JSON.stringify({ conversationId: 'future', cwd: scratch }),
+    { CAIPIRA_HOME: path.join(scratch, 'unknown') }, scratch);
+  check('Antigravity future lifecycle event acknowledges without internal fields', unknown.status === 0 && unknown.stdout === '{}\n', unknown.stdout);
+  const payloadClient = runRaw('claude-code', 'FutureEvent', JSON.stringify({ client: 'claude-code', cwd: scratch }),
+    { CAIPIRA_HOME: path.join(scratch, 'payload') }, scratch);
+  check('an unfamiliar Claude Code event keeps its acknowledgement', payloadClient.status === 0 && payloadClient.stdout === '{"continue":true}\n', payloadClient.stdout);
+  fs.rmSync(scratch, { recursive: true, force: true });
+}
+
 for (const probe of probes) fs.rmSync(probe.dir, { recursive: true, force: true });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed\n');

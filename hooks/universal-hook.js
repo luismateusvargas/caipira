@@ -4,13 +4,24 @@
 // and exits successfully so memory failures never block the coding client.
 
 const path = require('path');
-const { MemoryStore } = require('../store');
-const { ensureWorkspace, machineId } = require('../workspace');
-const {
-  buildInjection, buildDriftNotice, selectFacts, renderInjection, PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS
-} = require('../inject');
-const { FactStore, AstRefreshScope } = require('../facts');
-const { syncWorkspaceAst, updateFileAst } = require('../ast');
+const { logError } = require('../errors');
+let MemoryStore, ensureWorkspace, machineId, buildInjection, buildDriftNotice, selectFacts, renderInjection;
+let PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS, FactStore, AstRefreshScope, syncWorkspaceAst, updateFileAst;
+
+function loadModules() {
+  ({ MemoryStore } = require('../store'));
+  ({ ensureWorkspace, machineId } = require('../workspace'));
+  ({ buildInjection, buildDriftNotice, selectFacts, renderInjection, PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS } = require('../inject'));
+  ({ FactStore, AstRefreshScope } = require('../facts'));
+  ({ syncWorkspaceAst, updateFileAst } = require('../ast'));
+}
+
+let activeEvent = '';
+let activeClient = 'unknown';
+
+function journal(operation, error) {
+  logError({ component: 'hook', operation, client: activeClient, event: activeEvent, error });
+}
 
 // install.js registers every recall hook with a 15 s client timeout (only
 // Codex's SessionEnd gets less). Parser work for recall (the startup sync,
@@ -180,7 +191,11 @@ function readHookInput(text) {
   const counter = payload.invocationNum;
   if (Number.isSafeInteger(counter) && counter >= 0) invocationNum = counter;
   else if (counter !== undefined && counter !== null) invalid.push('invocationNum');
-  if (invalid.length) diagnose(`ignored invalid payload fields: ${invalid.join(', ')}`);
+  if (invalid.length) {
+    const message = `ignored invalid payload fields: ${invalid.join(', ')}`;
+    logError({ component: 'hook', operation: 'input fields', client, event, error: new HookInputError(message) });
+    diagnose(message);
+  }
   return { event, client, payload, sessionId, prompt, workspacePath, invocationNum };
 }
 
@@ -285,6 +300,7 @@ function reportPartialSync(stats) {
 function syncSessionAst(workspace, deadlineAtMs) {
   const timeoutMs = Math.min(STARTUP_SYNC_TIMEOUT_MS, deadlineAtMs - Date.now());
   if (timeoutMs <= 0) {
+    journal('AST sync budget', new Error('the recall parser budget is spent'));
     diagnose('AST sync skipped: the recall parser budget is spent');
     return new AstRefreshScope({ deadlineAtMs, parserUnavailable: true });
   }
@@ -292,6 +308,7 @@ function syncSessionAst(workspace, deadlineAtMs) {
     const stats = syncWorkspaceAst(workspace.root, workspace.dbFile, { timeoutMs });
     return new AstRefreshScope({ deadlineAtMs, unreadablePaths: reportPartialSync(stats) });
   } catch (error) {
+    journal('AST sync', error);
     diagnose(`AST sync skipped: ${error.message}`);
     return new AstRefreshScope({ deadlineAtMs, parserUnavailable: true });
   }
@@ -299,6 +316,7 @@ function syncSessionAst(workspace, deadlineAtMs) {
 
 /** @param {string} operation @param {Error} error */
 function reportRecallFailure(operation, error) {
+  journal(operation, error);
   diagnose(`recall degraded: ${operation} failed: ${error.message}`);
 }
 
@@ -364,6 +382,7 @@ function recallContext(db, input, workspace, deadlineAtMs) {
       : null;
     return [recalled, drift].filter(Boolean).join('\n\n') || null;
   } catch (error) {
+    journal('recall', error);
     diagnose(`recall skipped: ${error.message}`);
     return null;
   }
@@ -389,8 +408,9 @@ function acknowledgement(client) {
 // A failed run still owes the client a reply it accepts: a known client gets
 // its plain acknowledgement, and any other caller Caipira's own result shape
 // with a stable code. The error itself only ever reaches stderr.
-/** @param {string} event @param {string} client */
-function writeFailure(event, client) {
+/** @param {string} event @param {string} client @param {unknown} error @param {string} [operation] */
+function writeFailure(event, client, error, operation = event || 'startup') {
+  logError({ component: 'hook', operation, client, event, error });
   writeResult(KNOWN_CLIENTS.has(client) ? acknowledgement(client) : { ok: false, event, client, error: 'hook_failed' });
 }
 
@@ -444,7 +464,7 @@ function writeClientResult(result, input, recalled) {
     return;
   }
 
-  if (client === 'antigravity' && ['post-tool-use', 'pre-invocation', 'post-invocation', 'stop'].includes(event)) {
+  if (client === 'antigravity') {
     writeResult(event === 'post-tool-use' && result.reminder
       ? { injectSteps: [{ ephemeralMessage: result.reminder }] } : acknowledgement(client));
     return;
@@ -469,6 +489,7 @@ function verifyTouchedFacts(db, payload, workspacePath, workspaceRoot) {
     if (ids.length) facts.verify(ids);
   } catch (error) {
     // Drift detection must never break the tool call that triggered it.
+    journal('drift check', error);
     diagnose(`drift check skipped: ${error.message}`);
   }
 }
@@ -486,6 +507,7 @@ function postToolAstDelta(db, workspace, input) {
       result = updateFileAst(workspace.root, workspace.dbFile, absolute, { timeoutMs: POST_TOOL_AST_TIMEOUT_MS });
     } catch (error) {
       if (error.code !== 'unsupported' && error.code !== 'io') {
+        journal('AST delta', error);
         diagnose(`AST delta skipped: ${error.message}`);
       }
       continue;
@@ -604,16 +626,26 @@ function main() {
   // the moment the client started its own timeout.
   const deadlineAtMs = Date.now() + RECALL_PARSER_BUDGET_MS;
   const chunks = [];
+  activeEvent = resolveEvent(null);
+  activeClient = resolveClient(null);
+  const failOpen = (error, operation) => {
+    writeFailure(activeEvent, activeClient, error, operation);
+    process.exit(0);
+  };
+  process.on('uncaughtException', error => failOpen(error, 'uncaughtException'));
+  process.on('unhandledRejection', error => failOpen(error, 'unhandledRejection'));
+  process.stdin.on('error', error => failOpen(error, 'stdin'));
+  process.stdout.on('error', error => failOpen(error, 'stdout'));
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => chunks.push(chunk));
   process.stdin.on('end', () => {
     // Known before stdin is parsed, so even unreadable input gets a reply in
     // the shape the client expects.
-    let event = resolveEvent(null);
-    let client = resolveClient(null);
     try {
       const input = readHookInput(chunks.join(''));
-      ({ event, client } = input);
+      activeEvent = input.event;
+      activeClient = input.client;
+      loadModules();
 
       // Provisioned here as well as at SessionStart: a hook that never fired,
       // or fired late while PostToolUse was already writing, must not be able
@@ -622,6 +654,7 @@ function main() {
       try {
         workspace = ensureWorkspace(input.workspacePath || process.cwd());
       } catch (error) {
+        journal('workspace resolve', error);
         diagnose(`workspace resolve failed: ${error.message}`);
       }
 
@@ -637,7 +670,7 @@ function main() {
       }
     } catch (error) {
       diagnose(`${error.name}: ${error.message}`);
-      writeFailure(event, client);
+      writeFailure(activeEvent, activeClient, error);
     }
   });
 }

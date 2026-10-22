@@ -3,13 +3,28 @@
 // Loads @xenova/transformers lazily. Backfills embeddings on idle.
 // Tools: search, get_observations, list_sessions, timeline
 
-const { MemoryStore, redactPrivate } = require('./store');
-const { ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces, canonicalKey } = require('./workspace');
-const { FactStore, searchWorkspaces } = require('./facts');
-const { syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const { logError } = require('./errors');
+const { version } = require('./package.json');
+
+let MemoryStore, redactPrivate, ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces, canonicalKey;
+let FactStore, searchWorkspaces, syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol;
+let moduleFailure = null;
+try {
+  ({ MemoryStore, redactPrivate } = require('./store'));
+  ({ ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces, canonicalKey } = require('./workspace'));
+  ({ FactStore, searchWorkspaces } = require('./facts'));
+  ({ syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast'));
+} catch (error) {
+  moduleFailure = error;
+  journal('load modules', error);
+}
+
+function journal(operation, error, payload) {
+  logError({ component: 'mcp', operation, error, payload });
+}
 
 let embedderPromise = null;
 let backfillTimer = null;
@@ -142,7 +157,7 @@ const TRAFFIC_LOG = process.env.CAIPIRA_HOME
 const TRAFFIC_LOG_MAX_BYTES = 5 * 1024 * 1024;
 
 function logTraffic(direction, data) {
-  if (!DEBUG_TRAFFIC) return;
+  if (!DEBUG_TRAFFIC || moduleFailure) return;
   try {
     fs.mkdirSync(path.dirname(TRAFFIC_LOG), { recursive: true });
     let size = 0;
@@ -151,6 +166,7 @@ function logTraffic(direction, data) {
     fs.appendFileSync(TRAFFIC_LOG, `[${new Date().toISOString()}] ${direction}: ${redactPrivate(String(data))}\n`);
   } catch (e) {
     // Diagnostics must never take the server down with them.
+    journal('traffic log', e);
     console.error('[caipira] traffic log write failed:', e.message);
   }
 }
@@ -171,6 +187,7 @@ function modelDirectory() {
 function getEmbedder() {
   if (!embedderPromise) {
     embedderPromise = loadEmbedder().catch(error => {
+      journal('load embedder', error);
       embedderPromise = null;
       throw error;
     });
@@ -208,6 +225,7 @@ const BACKFILL_BATCH = 50;
 // started in: hooks from any client write to any workspace, and a workspace
 // nobody has searched yet should still be ready when someone does.
 async function backfillMissing() {
+  if (moduleFailure) return;
   let count = 0;
   let more = false;
   for (const row of listWorkspaces()) {
@@ -216,6 +234,7 @@ async function backfillMissing() {
     try {
       memory = memoryAt(row.db_file);
     } catch (e) {
+      journal('open backfill workspace', e);
       console.error('[caipira] backfill skipped', row.db_file, ':', e.message);
       continue;
     }
@@ -230,6 +249,7 @@ async function backfillMissing() {
         memory.putEmbedding(obs.id, MODEL, vec);
         count++;
       } catch (e) {
+        journal('embed observation', e);
         console.error('[caipira] embed failed for obs', obs.id, ':', e.message);
       }
     }
@@ -243,7 +263,10 @@ async function backfillMissing() {
 function scheduleBackfill() {
   if (backfillTimer) clearTimeout(backfillTimer);
   backfillTimer = setTimeout(() => {
-    backfillMissing().catch(e => console.error('[caipira] backfill error:', e.message));
+    backfillMissing().catch(e => {
+      journal('backfill', e);
+      console.error('[caipira] backfill error:', e.message);
+    });
   }, 5000); // 5s after last activity
 }
 
@@ -264,6 +287,7 @@ process.stdin.on('data', chunk => {
     try {
       msg = JSON.parse(line);
     } catch (e) {
+      journal('parse request', e);
       logTraffic('IN-ERR', e.message);
       respondError(null, -32700, 'Parse error: ' + e.message);
       continue;
@@ -274,7 +298,10 @@ process.stdin.on('data', chunk => {
     }
     // handle() is async: without this a throw inside it is an unhandled
     // rejection, which takes the whole server down.
-    handle(msg).catch(err => respondError(msg.id ?? null, -32603, err.message));
+    handle(msg).catch(err => {
+      journal(msg.method, err, msg);
+      respondError(msg.id ?? null, -32603, err.message);
+    });
   }
 });
 
@@ -316,10 +343,10 @@ async function handle(msg) {
         _meta: {
           'io.modelcontextprotocol/serverInfo': {
             name: 'caipira',
-            version: '2.0.0'
+            version
           }
         },
-        instructions: 'Caipira provides local cross-session memory search and session timeline tools.'
+        instructions: 'Caipira provides local cross-session memory search, observations and session timelines; durable facts (record_fact, search_facts, update_fact); drift detection (check_drift); and AST symbol tools (workspace_symbols, inspect_symbol).'
       });
       break;
 
@@ -327,7 +354,7 @@ async function handle(msg) {
       respond(id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'caipira', version: '2.0.0' }
+        serverInfo: { name: 'caipira', version }
       });
       break;
 
@@ -566,6 +593,7 @@ async function handleToolCall(id, params) {
   }
 
   try {
+    if (moduleFailure) throw moduleFailure;
     let result;
     switch (name) {
       case 'search': {
@@ -714,9 +742,23 @@ async function handleToolCall(id, params) {
     }
     respond(id, result);
   } catch (err) {
-    respondError(id, -32000, `Tool error: ${err.message}`);
+    journal(name, err, { params });
+    respondError(id, -32000, err === moduleFailure
+      ? 'Caipira storage unavailable; inspect caipira logs' : `Tool error: ${err.message}`);
   }
 }
 
 process.on('SIGTERM', () => { closeAll(); process.exit(0); });
 process.on('SIGINT', () => { closeAll(); process.exit(0); });
+
+function processFailure(error, operation) {
+  journal(operation, error);
+  respondError(null, -32603, 'Caipira runtime failure; inspect caipira logs');
+  closeAll();
+  process.exit(0);
+}
+
+process.stdin.on('error', error => processFailure(error, 'stdin'));
+process.stdout.on('error', error => { journal('stdout', error); process.exit(0); });
+process.on('uncaughtException', error => processFailure(error, 'uncaughtException'));
+process.on('unhandledRejection', error => processFailure(error, 'unhandledRejection'));

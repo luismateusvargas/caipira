@@ -1,8 +1,8 @@
 # Core resilience hardening, reproducible error logging, and hash spec alignment
 
-Status: ready
+Status: implemented
 Project rules: specs/project.md
-Target files: errors.js, hooks/universal-hook.js, install.js, mcp.js, README.md, test/test-hook.js, test/test-errors.js
+Target files: errors.js, hooks/universal-hook.js, install.js, mcp.js, ast.js, explore-server.js, README.md, test/run-all.js, test/test-hook.js, test/test-errors.js, test/test-mcp.js
 
 ## Outcome and boundary
 
@@ -66,3 +66,14 @@ Outside scope: Changes to the Rust AST indexing grammar, client configuration fi
 ## Open decisions and sources
 
 - None. Primary source verified: `rust/caipira-ast/src/parser.rs` lines 1119–1130 for SHA-256 signature hash.
+
+## Implementation evidence
+
+- Baseline checkpoint: `3fb1c54debdfad3e04ea69d67db928a7d2d481d9`.
+- Native load failures now produce exactly one client acknowledgement and exit 0 for all three clients. Regression cases cover both missing modules and `ERR_DLOPEN_FAILED`, stdin errors, uncaught exceptions, unhandled rejections, and unfamiliar Antigravity events.
+- `errors.js` uses Node built-ins, synchronous writes, credential/private-block redaction, synthetic reproduction payloads, a 2 MB rotation threshold, and one backup. Repeated reports of the same error (including a translated error's cause) share one entry. Recent error counts mean retained valid records across both journal generations.
+- CLI subprocess checks exercise formatted/limited/cleared logs, zero-error doctor/status output, non-zero doctor warnings, and inspection while native SQLite is unavailable. AST bridge, installer, and explorer failure checks also verify actual journal entries.
+- Scope corrections: added `ast.js` and `explore-server.js` to meet criterion 4; added `test/run-all.js` to include the new suite and `test/test-mcp.js` for protocol/version regressions. Explorer deployment copies its new `errors.js` dependency alongside the server. Full runtime deployment and client registration changes remain in Task 02.
+- Verification: all nine Node suites pass, **841 checks, 0 failures**. The journal suite has 13 passing checks, hook suite 167, and MCP suite 88. `git diff --check` passes.
+- Verification command: `TMPDIR=/var/tmp NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js`. `/var/tmp` avoids an existing `/tmp/.git` marker that would combine unrelated temporary workspaces; subprocess/loopback checks ran outside the restricted sandbox after an `EPERM` failure.
+- Limits: verified on Linux with bundled Node 22; Windows/macOS execution and a live installed-runtime upgrade were not exercised. The isolated source-checkout doctor verifies the journal counts; it is not evidence that a full installation passes every doctor check.

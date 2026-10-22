@@ -33,7 +33,7 @@ Caipira separates **what happened** from **what is currently true**:
   - **Rust** (`.rs`)
   - **Go** (`.go`)
   - **C / C++** (`.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`)
-- Extracts structured symbols (`function`, `method`, `class`, `struct`, `interface`, `trait`, `enum`, `type`, `union`, `const`), structured parameters (`name`, `type_annotation`, `default_value`), `return_type`, `doc_summary`, normalized `signature_text`, 64-bit FNV-1a `signature_hash`, and dependency edges (`calls`, `imports`, `uses_type`, `extends`, `implements`).
+- Extracts structured symbols (`function`, `method`, `class`, `struct`, `interface`, `trait`, `enum`, `type`, `union`, `const`), structured parameters (`name`, `type_annotation`, `default_value`), `return_type`, `doc_summary`, normalized `signature_text`, 64-bit truncated SHA-256 `signature_hash` (`hex::encode(&Sha256::digest(&payload)[..8])`), and dependency edges (`calls`, `imports`, `uses_type`, `extends`, `implements`).
 - **Three-tier incremental sync**: `(size, mtime_ms)` fast gate → `sha256` content gate → `tree-sitter` parse only on modified files, plus probe-based cross-file relinking (`ast_links` / `ast_link_probes`) so newly added or edited exports automatically resolve callers and importers across the workspace. Stored symbol rows (`1`-based line spans and `params_json`) are validated on read so corrupt rows fail transactionally without partial writes.
 - **Zero-spawn read path**: Symbol searches (`workspace_symbols`) and deep symbol inspections (`inspect_symbol`) run as pure in-process SQLite queries (`ast_files`, `ast_symbols`, `ast_edges`, `ast_symbols_fts`) in `ast.js`.
 
@@ -67,7 +67,8 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
 ~/.caipira/
 ├── caipira.sh                  # Linux/macOS CLI launcher (uses bundled Node 22)
 ├── caipira.cmd                 # Windows CLI launcher (uses bundled Node 22)
-├── install.js                  # Installer, uninstaller, doctor, status, prune, mode, explore CLI
+├── install.js                  # Installer, uninstaller, doctor, status, logs, prune, mode, explore CLI
+├── errors.js                   # Structured, redacted error journal; rotates at 2 MB with one backup
 ├── mcp.js                      # Stdio MCP server (11 tools)
 ├── ast.js                      # Bridge to caipira-ast + in-process SQLite symbol queries
 ├── explore-server.js           # Local HTTP API & static bundle server for `caipira explore`
@@ -136,8 +137,9 @@ Run via `~/.caipira/caipira.sh <command>` on Linux/macOS or `caipira.cmd <comman
 | :--- | :--- |
 | `install` | Install dependencies, build `caipira-ast` and `explore-ui`, and wire MCP server + hooks into Claude Code, Codex, and Antigravity. |
 | `explore [flags]` | Incrementally index the target workspace and launch the local graph & symbol inspector UI (`--port 4777`, `--host 127.0.0.1`, `--workspace <path>`, `--no-open`). |
-| `doctor` | Check bundled Node 22, native dependencies, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, dangling registry rows, client configs, and active mode. |
-| `status` | Display current compression mode and aggregated counts of workspaces, observations, embeddings, facts, and recent sessions. |
+| `doctor` | Check bundled Node 22, native dependencies, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, dangling registry rows, client configs, and active mode; warn when retained error logs are non-empty. |
+| `status` | Display current compression mode, retained error count, and aggregated counts of workspaces, observations, embeddings, facts, and recent sessions. |
+| `logs [--limit N] [--clear]` | Show the newest 20 errors (or N) with sanitized one-line reproduction commands; `--clear` removes the journal and backup. Works even when native SQLite cannot load. |
 | `mode <lite\|full\|ultra>` | Set the active prose compression intensity for newly recorded observations. |
 | `prune` | Dry-run report of dangling workspace registry rows (whose project root was deleted) and unclaimed `.db` files. |
 | `prune --apply` | Delete dangling workspace rows and their associated `.db` / `-wal` / `-shm` files. |
@@ -205,10 +207,12 @@ touch /path/to/workspace-root/.caipira-workspace
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `CAIPIRA_HOME` | `~/.caipira` | Redirects the `database/` directory (`master.db`, per-workspace `.db` files, legacy `data.db`) and `logs/mcp_traffic.log` to a custom directory. |
+| `CAIPIRA_HOME` | `~/.caipira` | Redirects the `database/` directory (`master.db`, per-workspace `.db` files, legacy `data.db`), `logs/mcp_traffic.log`, and `logs/errors.jsonl` to a custom directory. |
 | `CAIPIRA_AST_BIN` | `<root>/bin/caipira-ast` | Overrides the path to the `caipira-ast` executable. |
 | `CAIPIRA_MODEL_PATH` | `<root>/models` or `~/.caipira/models` | Overrides the directory containing `Xenova/all-MiniLM-L6-v2`. |
 | `CAIPIRA_DEBUG` | unset (`0`) | Set `CAIPIRA_DEBUG=1` to enable `<private>`-redacted MCP JSON-RPC traffic logging to `logs/mcp_traffic.log` (rotates to `.1` at 5 MB). |
+
+Runtime failures and degraded fallbacks are recorded synchronously in `logs/errors.jsonl`, including Node version, native ABI, Caipira version, platform, and a shell reproduction hint with a synthetic payload. Private blocks and common credential formats are redacted. The journal rotates at 2 MB and keeps one backup; doctor/status count retained entries across both files. If the log directory is unavailable, hooks still return their client acknowledgement and exit successfully.
 
 ---
 

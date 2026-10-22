@@ -5,13 +5,18 @@
 //   Windows: .\node22\node-v22.20.0-win-x64\node.exe install.js  (caipira.cmd)
 //   Linux:   ./node22/node-v22.20.0-linux-x64/bin/node install.js  (caipira.sh)
 //
-// Commands: install | uninstall | status | doctor | prune [--apply] | mode <lite|full|ultra>
+// Commands: install | uninstall | status | doctor | logs [--limit N] [--clear] | prune [--apply] | mode <lite|full|ultra>
 //           explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { logError, readErrors } = require('./errors');
+
+function journal(operation, error) {
+  logError({ component: 'install', operation, error });
+}
 
 const ROOT = __dirname;
 const HOME = os.homedir();
@@ -66,7 +71,10 @@ const warn = (msg) => log(`  [warn] ${msg}`);
 const fail = (msg) => log(`  [FAIL] ${msg}`);
 
 function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+    if (error.code !== 'ENOENT') journal('read configuration', error);
+    return fallback;
+  }
 }
 
 function writeJsonAtomic(file, data) {
@@ -117,12 +125,14 @@ function buildAstEngine() {
   const { CRATE_DIR, INSTALLED_BIN } = require('./ast');
   const manifest = path.join(CRATE_DIR, 'Cargo.toml');
   if (!fs.existsSync(manifest)) {
+    journal('build AST', new Error('rust/caipira-ast not found'));
     warn('rust/caipira-ast not found — AST symbol index unavailable');
     return;
   }
   try {
     execFileSync('cargo', ['--version'], { stdio: 'ignore' });
-  } catch {
+  } catch (error) {
+    journal('find cargo', error);
     warn('cargo not found — install Rust (https://rustup.rs) and re-run install to enable the AST symbol index');
     return;
   }
@@ -130,6 +140,7 @@ function buildAstEngine() {
   try {
     execFileSync('cargo', ['build', '--release', '--manifest-path', manifest], { cwd: ROOT, stdio: 'inherit' });
   } catch (error) {
+    journal('build AST', error);
     warn(`caipira-ast build failed — ${error.message}`);
     return;
   }
@@ -142,6 +153,7 @@ function buildAstEngine() {
     fs.chmodSync(tmp, 0o755);
     fs.renameSync(tmp, INSTALLED_BIN);
   } catch (error) {
+    journal('deploy AST', error);
     try { fs.rmSync(tmp, { force: true }); } catch {}
     warn(`caipira-ast could not be installed at ${INSTALLED_BIN} — ${error.message}`);
     return;
@@ -154,6 +166,7 @@ function buildAstEngine() {
 // the API and says the UI is missing.
 function buildExploreUi() {
   if (!fs.existsSync(path.join(EXPLORE_UI_DIR, 'package.json'))) {
+    journal('build explore UI', new Error('explore-ui not found'));
     warn('explore-ui not found — caipira explore will serve the API only');
     return;
   }
@@ -167,6 +180,7 @@ function buildExploreUi() {
     log('  building explore-ui (vite build)...');
     execFileSync(NODE_BIN, [NPM_CLI, 'run', 'build'], { cwd: EXPLORE_UI_DIR, stdio: 'inherit', env });
   } catch (error) {
+    journal('build explore UI', error);
     warn(`explore-ui build failed — ${error.message}`);
     return;
   }
@@ -187,6 +201,7 @@ function deployExplore() {
   const targetDist = path.join(HOME_DIR, 'explore-ui', 'dist');
   const staging = `${targetDist}.caipira-tmp`;
   const serverTmp = path.join(HOME_DIR, 'explore-server.js.caipira-tmp');
+  const errorsTmp = path.join(HOME_DIR, 'errors.js.caipira-tmp');
   try {
     fs.rmSync(staging, { recursive: true, force: true });
     fs.mkdirSync(path.dirname(targetDist), { recursive: true });
@@ -194,12 +209,15 @@ function deployExplore() {
     fs.rmSync(targetDist, { recursive: true, force: true });
     fs.renameSync(staging, targetDist);
     fs.copyFileSync(EXPLORE_SERVER, serverTmp);
+    fs.copyFileSync(path.join(ROOT, 'errors.js'), errorsTmp);
+    fs.renameSync(errorsTmp, path.join(HOME_DIR, 'errors.js'));
     fs.renameSync(serverTmp, path.join(HOME_DIR, 'explore-server.js'));
   } catch (error) {
-    for (const leftover of [staging, serverTmp]) {
+    for (const leftover of [staging, serverTmp, errorsTmp]) {
       try { fs.rmSync(leftover, { recursive: true, force: true }); } catch {}
     }
     warn(`explore server and UI could not be copied to ${HOME_DIR} — ${error.message}`);
+    journal('deploy explore', error);
     return;
   }
   ok(`explore server and UI copied to ${HOME_DIR}`);
@@ -533,6 +551,7 @@ function aggregateWorkspaces() {
     try {
       counts = workspaceCounts(row.db_file);
     } catch (error) {
+      journal('read workspace counts', error);
       broken.push({ row, error });
       continue;
     }
@@ -561,7 +580,8 @@ function doctor() {
   check('embedding model present', fs.existsSync(path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx')));
   try {
     ok(`AST engine at ${require('./ast').resolveBinary()}`);
-  } catch {
+  } catch (error) {
+    journal('doctor AST', error);
     warn('caipira-ast not built — AST symbol index unavailable (run: caipira install with cargo on PATH)');
   }
   if (fs.existsSync(path.join(EXPLORE_DIST, 'index.html'))) ok(`explore UI at ${EXPLORE_DIST}`);
@@ -580,6 +600,7 @@ function doctor() {
     if (missing.length) warn(`${missing.length} registered workspace database(s) missing — re-created on next use`);
   } catch (error) {
     problems++;
+    journal('doctor workspace registry', error);
     fail(`workspace registry — ${error.message}`);
   }
 
@@ -611,6 +632,7 @@ function doctor() {
       `${dangling.length} row(s) whose root is gone — run: caipira prune --apply`);
   } catch (error) {
     problems++;
+    journal('doctor dangling workspaces', error);
     fail(`workspace registry — ${error.message}`);
   }
 
@@ -619,6 +641,10 @@ function doctor() {
   check('Antigravity hooks registered', Boolean(readJson(ANTIGRAVITY_HOOKS, {}).caipira), 'run: caipira install');
 
   check(`mode flag (${currentMode()})`, ['lite', 'full', 'ultra'].includes(currentMode()));
+
+  const errors = readErrors({ limit: Number.MAX_SAFE_INTEGER }).length;
+  if (errors) warn(`${errors} recent logged error(s) — run: caipira logs`);
+  else ok('0 recent logged errors');
 
   log(problems === 0 ? '\nAll checks passed.\n' : `\n${problems} problem(s) found.\n`);
   process.exitCode = problems === 0 ? 0 : 1;
@@ -703,8 +729,12 @@ function setMode(mode) {
 }
 
 function status() {
-  const { totals, recent, missing, broken } = aggregateWorkspaces();
   log(`\nCaipira status`);
+  let aggregate;
+  try { aggregate = aggregateWorkspaces(); }
+  catch (error) { journal('status', error); throw error; }
+  finally { log(`  recent errors: ${readErrors({ limit: Number.MAX_SAFE_INTEGER }).length} (caipira logs)`); }
+  const { totals, recent, missing, broken } = aggregate;
   log(`  mode:         ${currentMode()}`);
   log(`  workspaces:   ${totals.workspaces}`);
   log(`  observations: ${totals.observations}`);
@@ -718,6 +748,33 @@ function status() {
     log(`    ${new Date(session.started_at).toISOString()}  ${String(session.ide).padEnd(12)}  ${String(session.workspace).padEnd(20)}  ${session.id}`);
   }
   log('');
+}
+
+/** Prints the retained error journal, or clears both journal generations.
+ * @returns {void}
+ * @throws {Error} For invalid flags or an unreadable journal.
+ */
+function logs() {
+  let limit = 20;
+  let clear = false;
+  const args = process.argv.slice(3);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--clear') clear = true;
+    else if (args[i] === '--limit') {
+      const raw = args[++i];
+      if (!/^\d+$/.test(raw || '') || !Number.isSafeInteger(Number(raw))) throw new Error('--limit needs a non-negative integer');
+      limit = Number(raw);
+    } else throw new Error(`unknown logs argument: ${args[i]}`);
+  }
+  const entries = readErrors({ limit, clear });
+  if (clear) { log('Error journal cleared.'); return; }
+  if (!entries.length) { log('No logged errors.'); return; }
+  // Stored records may contain line breaks in stacks; keep CLI fields on one line.
+  const line = value => String(value ?? '').replace(/[\r\n\x00-\x1f\x7f]/g, ' ');
+  for (const entry of entries) {
+    log(`${line(entry.ts)} [${line(entry.component)}/${line(entry.operation)}] ${line(entry.error.code || entry.error.name)}: ${line(entry.error.message)}`);
+    log(`  Reproduce: ${line(entry.repro)}`);
+  }
 }
 
 function install() {
@@ -742,17 +799,25 @@ const commands = {
   doctor,
   prune,
   status,
+  logs,
   mode: () => setMode(process.argv[3] || currentMode()),
   // caipira.sh starts explore-server.js directly; this serves caipira.cmd.
   explore: () => require('./explore-server').main(process.argv.slice(3)).catch(error => {
+    logError({ component: 'explore', operation: 'startup', error });
     fail(`caipira explore — ${error.message}`);
     process.exitCode = 1;
   })
 };
 
 if (!commands[command]) {
-  log(`Usage: caipira <install|uninstall|doctor|prune [--apply]|status|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
+  log(`Usage: caipira <install|uninstall|doctor|prune [--apply]|status|logs [--limit N] [--clear]|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
   process.exitCode = 1;
 } else {
-  commands[command]();
+  try {
+    commands[command]();
+  } catch (error) {
+    journal(command, error);
+    fail(`${command} — ${error.message}`);
+    process.exitCode = 1;
+  }
 }
