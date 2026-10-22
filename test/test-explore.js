@@ -608,9 +608,11 @@ async function main() {
     const home = tempDir('explore-launch-');
     fs.copyFileSync(path.join(ROOT, 'caipira.sh'), path.join(home, 'caipira.sh'));
     fs.symlinkSync(path.join(ROOT, 'explore-server.js'), path.join(home, 'explore-server.js'));
-    const nodeDir = path.join(home, 'node22', 'node-v22.20.0-linux-x64', 'bin');
+    const nodeDir = path.join(home, 'node22', 'node-v22.23.4-linux-x64', 'bin');
     fs.mkdirSync(nodeDir, { recursive: true });
-    fs.symlinkSync(process.execPath, path.join(nodeDir, 'node'));
+    fs.writeFileSync(path.join(nodeDir, 'node'),
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then printf 'v22.23.4\\n'; exit 0; fi\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+      { mode: 0o755 });
     const child = spawn('sh', [path.join(home, 'caipira.sh'), 'explore', '--no-open', '--port', '0', '--workspace', WS],
       { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';

@@ -6,10 +6,12 @@ Status: in progress
 
 ## Execution tracking
 
-- [~] Y1: pinned runtime provisioning and transactional dependencies.
-- [ ] Y2–Y6: deployment entry points, registration paths, optional assets and doctor.
-- [ ] Y7–Y9: static Linux assets, recorded client selection, workflow and README.
+- [x] Y1: pinned runtime provisioning and transactional dependencies.
+- [x] Y2–Y6: deployment entry points, registration paths, optional assets and doctor.
+- [x] Y7–Y9: static Linux assets, recorded client selection, workflow and README.
 - [ ] Linux acceptance, full suites, hygiene and independent review.
+
+The Y1–Y9 implementation is present. `git diff --check`, `sh -n caipira.sh`, and Node 22 syntax checks for `install.js` and `runtime.js` pass. `npm pack --dry-run` lists the runtime manifest and lockfile, but the checkout does not contain the release-staged AST binaries or model; asset-inclusive pack validation remains pending. Final Linux acceptance, full suites, workflow YAML parsing, and independent review remain pending. The user instructed this session not to run `test/run-all.js` or `test/test-install.js` after the re-exec fixture failure.
 
 Reviewed baseline: `255159fd002072c32ce4ef5283ad03d7fb9e97d2`.
 Reviewed completion: `29b43138894237b1f39236a637353faf97376614`.
@@ -26,7 +28,7 @@ Probes ran under `scratchpad/t3` with fake homes and prefixes. Besides the bundl
 2. **Node 22 and SQLite are mandatory.** Every Caipira process runs on a Node 22 runtime that `caipira install` provisions under `<CAIPIRA_HOME>/node22/`: hooks, MCP, launchers and every CLI command. The host Node is used only to start the installer, so upgrading or switching the host Node never affects Caipira.
    - This replaces criterion 1's "Node 20 and 24 use the matching host runtime".
    - It also replaces criterion 4's host-version matrix and its optional `better-sqlite3`.
-3. **Every Linux.** Install picks the Node 22 build that matches the host's architecture and C library. The Linux AST binaries are built with `cross` as static musl binaries, so one binary per architecture runs on any Linux.
+3. **Supported Linux hosts.** Install picks the Node 22 build that matches the host's architecture and C library. glibc 2.28+ is supported on x64 and arm64; musl is supported on x64. Older glibc, musl arm64, and hosts without a matching Node 22 build are refused. The Linux AST binaries are built with `cross` as static musl binaries, so one binary per architecture runs across the supported Linux targets.
 4. **`better-sqlite3` only needs Node 22 prebuilds.** Its 12.9.0 release has Node 22 (ABI 127) prebuilds for `linux-x64`, `linux-arm64`, `linuxmusl-x64`, `linuxmusl-arm64`, `darwin-x64`, `darwin-arm64`, `win32-x64` and `win32-arm64`, checked against the GitHub release assets. Keep the 12.9.0 pin, which passed the full suite.
 5. **`--clients` restricts what `doctor` checks.** Clients outside the selection are reported as not selected, never as failures.
 6. **Pin Node 22.23.4.** It is the newest 22.x, a security release dated 2026-10-20. It ships npm 10.9.9 and keeps ABI 127, so the 12.9.0 prebuilds still apply. The full suite passed under a downloaded, checksum-verified 22.23.4 against those prebuilds: 1,021 checks, 0 failures.

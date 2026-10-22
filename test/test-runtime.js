@@ -140,6 +140,14 @@ async function main() {
     assert(paths.npm.endsWith(path.join('node_modules', 'npm', 'bin', 'npm-cli.js')));
     assert.notEqual(paths.node, process.execPath);
   });
+  for (const version of ['2.28', '2.29', '3.0']) check(`glibc ${version} meets the minimum supported version`, () => {
+    assert.equal(runtime.selectArchive('linux', 'x64', { header: { glibcVersionRuntime: version } }).target, 'linux-x64');
+  });
+  check('glibc below 2.28 is refused with the supported minimum', () => assert.throws(
+    () => runtime.selectArchive('linux', 'x64', { header: { glibcVersionRuntime: '2.27' } }),
+    error => /glibc 2\.27/.test(error.message) && /2\.28\+/.test(error.message)));
+  for (const glibcVersionRuntime of ['', 'unknown']) check(`unrecognized glibc report ${JSON.stringify(glibcVersionRuntime)} is refused`, () => assert.throws(
+    () => runtime.selectArchive('linux', 'x64', { header: { glibcVersionRuntime } }), /supported glibc is 2\.28\+/));
   check('archive table contains only verified targets', () => assert.deepEqual(Object.keys(runtime.ARCHIVES).sort(), expectedTargets.map(row => row[3]).sort()));
   for (const [platform, arch, report] of [['linux', 'arm64', { header: {} }], ['linux', 'riscv64', { header: {} }], ['freebsd', 'x64', { header: {} }]]) {
     check(`unsupported ${platform}-${arch} reports supported targets`, () => assert.throws(() => runtime.selectArchive(platform, arch, report), error =>

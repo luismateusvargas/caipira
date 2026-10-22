@@ -22,7 +22,7 @@ process.on('exit', () => {
   for (const dir of scratch) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} }
 });
 
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, skipped = 0;
 const check = (label, cond, extra) => {
   if (cond) { pass++; console.log('  ok   ' + label); }
   else { fail++; console.log('  FAIL ' + label + (extra !== undefined ? ' -> ' + extra : '')); }
@@ -198,6 +198,16 @@ const { NODE_VERSION, CLIENT_SELECTION_FILE, runtimePaths: deploymentRuntimePath
 const NODE_RELEASE = require(ROOT + '/runtime.js').selectArchive().release;
 const MCP_SESSION_PROBE_TIMEOUT_MS = 10_000;
 
+// The launchers accept only the pinned runtime, and fixtures link the deployment
+// Node to this interpreter. Never fake `--version` with a wrapper script instead:
+// install() re-executes through any runtime whose real path differs from its own.
+const PINNED_INTERPRETER = process.version === `v${NODE_VERSION}`;
+const launcherCheck = (label, cond, extra) => {
+  if (PINNED_INTERPRETER) return check(label, cond, extra);
+  skipped++;
+  console.log(`  skip ${label} -> launchers need Node ${NODE_VERSION}; running ${process.version}`);
+};
+
 // Only installation I/O is substituted here. Runtime transactions and probes
 // are exercised without substitutions in test-runtime.js. The symlinked local
 // dependencies are read-only fixtures: never edit or remove anything below them.
@@ -265,7 +275,11 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
     fs.mkdirSync(path.join(dir, 'node22', NODE_RELEASE, process.platform === 'win32' ? '' : 'bin'), { recursive: true });
     const node = path.join(dir, 'node22', NODE_RELEASE, IS_WINDOWS ? 'node.exe' : 'bin/node');
     if (IS_WINDOWS) fs.linkSync(NODE, node);
-    else fs.symlinkSync(NODE, node);
+    else {
+      // install() compares real paths before re-exec; this fixture must resolve to the test Node.
+      fs.symlinkSync(NODE, node);
+      if (fs.realpathSync(node) !== fs.realpathSync(NODE)) throw new Error('fixture Node must resolve to the current interpreter');
+    }
     fs.symlinkSync(NODE_MODULES, path.join(dir, 'node_modules'), 'junction');
     const model = path.join(dir, 'models', 'Xenova', 'all-MiniLM-L6-v2', 'onnx');
     fs.mkdirSync(model, { recursive: true });
@@ -505,7 +519,7 @@ const launcherEnv = { ...empty.env, PATH: `${path.dirname(launcher)}${path.delim
 const launchCommand = IS_WINDOWS ? 'cmd.exe' : 'caipira';
 const launchArgs = IS_WINDOWS ? ['/d', '/c', 'caipira.cmd'] : [];
 const launched = spawnSync(launchCommand, [...launchArgs, 'status'], { cwd: workdir, env: launcherEnv, encoding: 'utf8', timeout: 10000 });
-check('PATH launcher runs from another directory', !launched.error && launched.status === 0 && launched.stdout.includes('Caipira status'), launched.stderr || launched.error);
+launcherCheck('PATH launcher runs from another directory', !launched.error && launched.status === 0 && launched.stdout.includes('Caipira status'), launched.stderr || launched.error);
 const packageActive = path.join(empty.source, 'active');
 fs.writeFileSync(packageActive, 'ultra');
 const npmCliRun = (...args) => spawnSync(NODE, [path.join(empty.source, 'bin/caipira-cli.js'), ...args],
@@ -513,10 +527,12 @@ const npmCliRun = (...args) => spawnSync(NODE, [path.join(empty.source, 'bin/cai
 const cliMode = npmCliRun('mode', 'lite');
 const cliStatus = npmCliRun('status');
 const pathStatus = spawnSync(launchCommand, [...launchArgs, 'status'], { env: launcherEnv, cwd: workdir, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
-check('npm CLI mode and both status entry points use deployment, not package files', cliMode.status === 0 &&
+check('npm CLI mode and status use deployment, not package files', cliMode.status === 0 &&
   fs.readFileSync(path.join(empty.live, 'active'), 'utf8').trim() === 'lite' && fs.readFileSync(packageActive, 'utf8') === 'ultra' &&
-  cliStatus.status === 0 && pathStatus.status === 0 && /mode:\s+lite/.test(cliStatus.stdout) && /mode:\s+lite/.test(pathStatus.stdout),
-  `${cliMode.stdout}${cliMode.stderr}${cliStatus.stdout}${cliStatus.stderr}${pathStatus.stdout}${pathStatus.stderr}`);
+  cliStatus.status === 0 && /mode:\s+lite/.test(cliStatus.stdout),
+  `${cliMode.stdout}${cliMode.stderr}${cliStatus.stdout}${cliStatus.stderr}`);
+launcherCheck('PATH launcher status reports the same deployment mode', pathStatus.status === 0 && /mode:\s+lite/.test(pathStatus.stdout),
+  `${pathStatus.stdout}${pathStatus.stderr}`);
 const cliDoctor = npmCliRun('doctor');
 check('npm CLI doctor inspects deployment paths', cliDoctor.status === 0 && cliDoctor.stdout.includes(deploymentRuntimePaths(empty.live).node), cliDoctor.stdout + cliDoctor.stderr);
 const runtimeDirectory = path.join(empty.live, 'node22');
@@ -634,7 +650,7 @@ function automaticPathChecks() {
   const shell = spawnSync('/bin/bash', ['-ic', 'command -v caipira && caipira status'], {
     env: bash.env, cwd: directory, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
   });
-  check('new real bash finds and runs caipira from another directory', !shell.error && shell.status === 0 && shell.stdout.includes(path.join(bash.home, '.local/bin/caipira')) && shell.stdout.includes('Caipira status'), shell.stdout + shell.stderr);
+  launcherCheck('new real bash finds and runs caipira from another directory', !shell.error && shell.status === 0 && shell.stdout.includes(path.join(bash.home, '.local/bin/caipira')) && shell.stdout.includes('Caipira status'), shell.stdout + shell.stderr);
   result = bash.run('uninstall');
   check('uninstall restores bash startup bytes', result.code === 0 && fs.readFileSync(rc, 'utf8') === original, result.out);
   check('install and uninstall preserve private startup file permissions', installedMode === 0o600 && (fs.statSync(rc).mode & 0o777) === 0o600);
@@ -749,7 +765,7 @@ function startupPreservationChecks() {
   const shell = spawnSync('/bin/bash', ['-ic', 'command -v caipira && caipira status'], {
     env: linked.env, cwd: linked.home, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
   });
-  check('new real bash loads the symlink target and runs caipira', !shell.error && shell.status === 0 &&
+  launcherCheck('new real bash loads the symlink target and runs caipira', !shell.error && shell.status === 0 &&
     shell.stdout.includes(path.join(linked.home, '.local/bin/caipira')) && shell.stdout.includes('Caipira status'), shell.stdout + shell.stderr);
   result = linked.run('uninstall');
   check('uninstall keeps the symlink and restores target bytes and permissions', result.code === 0 &&
@@ -1007,8 +1023,23 @@ async function remainingChecks() {
   await vm.runInContext('install()', reexecContext);
   check('host bootstrap re-launches the package installer on bundled Node before dependency work', provisionCalls === 1 &&
     reexecCall?.[0] === deploymentRuntimePaths(reexecFixture.live).node && JSON.stringify(reexecCall[1]) === JSON.stringify(installerArgs) &&
-    reexecCall[2].stdio === 'inherit' && reexecCall[2].timeout >= require(ROOT + '/runtime.js').DEPENDENCY_TIMEOUT_MS &&
+    reexecCall[2].env.CAIPIRA_REEXEC_GUARD === '1' && reexecCall[2].stdio === 'inherit' &&
+    reexecCall[2].timeout >= require(ROOT + '/runtime.js').DEPENDENCY_TIMEOUT_MS &&
     reexecContext.process.exitCode === 0 && registered(reexecFixture).every(value => !value));
+  const guardedFixture = installFixture(['.claude']);
+  let guardedOutput = '', guardedSpawns = 0;
+  const guardedContext = installerContext(guardedFixture, {
+    process: {
+      execPath: hostNode,
+      env: { ...guardedFixture.env, CAIPIRA_REEXEC_GUARD: '1' },
+      stdout: { on() {}, write: message => { guardedOutput += message; }, isTTY: false }
+    },
+    './runtime': { ...require(ROOT + '/runtime.js'), provisionRuntime: async home => deploymentRuntimePaths(home) },
+    child_process: { ...require('child_process'), spawnSync: () => { guardedSpawns++; return { status: 0 }; } }
+  });
+  await vm.runInContext('install()', guardedContext);
+  check('re-exec guard stops a mismatched runtime before spawning again', guardedContext.process.exitCode === 1 &&
+    /recursive re-exec loop detected/.test(guardedOutput) && guardedSpawns === 0);
   for (const operation of ['stage', 'promote']) {
     const fixture = installFixture();
     fixture.run('install');
@@ -1148,7 +1179,7 @@ async function remainingChecks() {
   const sessions = await registeredSessions(registration, parentEnv, workspace);
   check('registered MCP sees session captured by hook', sessions.length === 1 && sessions[0].id === sessionId, JSON.stringify(sessions));
   const status = spawnSync(launchCommand, [...launchArgs, 'status'], { cwd: workspace, env: parentEnv, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
-  check('PATH status counts same hook and MCP session', !status.error && status.status === 0 && /workspaces:\s+1\b/.test(status.stdout) && /sessions:\s+1\b/.test(status.stdout) && status.stdout.includes(sessionId), status.stdout || status.stderr || status.error);
+  launcherCheck('PATH status counts same hook and MCP session', !status.error && status.status === 0 && /workspaces:\s+1\b/.test(status.stdout) && /sessions:\s+1\b/.test(status.stdout) && status.stdout.includes(sessionId), status.stdout || status.stderr || status.error);
   check('entry points do not populate custom install data root without inherited override', !fs.existsSync(path.join(shared.live, 'database')));
 
   console.log('\n9. installed explorer uses the current directory');
@@ -1166,7 +1197,7 @@ async function remainingChecks() {
     });
   });
   try {
-    check('caipira explore --no-open starts from PATH', Boolean(listening), output);
+    launcherCheck('caipira explore --no-open starts from PATH', Boolean(listening), output);
     if (listening) {
       const response = await fetch(`${listening}api/workspaces`);
       const data = await response.json();
@@ -1182,12 +1213,14 @@ async function remainingChecks() {
 
   console.log('\n10. unsupported archive refusal and optional package assets');
   const compatibilityFixture = installFixture([], { provisionDeployment: false });
-  let unsupportedError;
+  let unsupportedOutput = '';
   const incompatible = installerContext(compatibilityFixture, {
-    './runtime': { ...require(ROOT + '/runtime.js'), selectArchive: () => { throw new Error('unsupported Node target fixture; supported targets: linux-x64'); } }
+    './runtime': { ...require(ROOT + '/runtime.js'), selectArchive: () => { throw new Error('unsupported Node target fixture; supported targets: linux-x64'); } },
+    process: { stdout: { on() {}, write: message => { unsupportedOutput += message; }, isTTY: false } }
   });
-  try { await vm.runInContext('install()', incompatible); } catch (error) { unsupportedError = error; }
-  check('unsupported target refuses before deployment or configuration writes', /unsupported Node target/.test(unsupportedError?.message || '') &&
+  await vm.runInContext('install()', incompatible);
+  check('unsupported target refuses before deployment or configuration writes', incompatible.process.exitCode === 1 &&
+    /unsupported Node target/.test(unsupportedOutput) &&
     !fs.existsSync(compatibilityFixture.live) && !fs.existsSync(path.join(compatibilityFixture.home, '.local')) && registered(compatibilityFixture).every(value => !value));
 
   fs.rmSync(path.join(compatibilityFixture.source, '.git'), { recursive: true, force: true });
@@ -1205,6 +1238,6 @@ async function remainingChecks() {
 }
 
 remainingChecks().catch(error => { check('integration checks complete', false, error.stack); }).finally(() => {
-  console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
+  console.log('\n' + pass + ' passed, ' + fail + ' failed' + (skipped ? `, ${skipped} skipped (launcher checks need Node ${NODE_VERSION})` : '') + '\n');
   process.exitCode = fail ? 1 : 0;
 });

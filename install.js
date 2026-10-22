@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // caipira/install.js — installs and wires Caipira into detected coding clients.
 //
-// npm installs use the active supported host Node; checkout launchers use bundled Node 22:
-//   Windows: .\node22\node-v22.20.0-win-x64\node.exe install.js  (caipira.cmd)
-//   Linux:   ./node22/node-v22.20.0-linux-x64/bin/node install.js  (caipira.sh)
+// Every Caipira process uses the deployment's pinned Node 22; host Node starts install only:
+//   Windows: .\node22\node-v22.23.4-win-x64\node.exe install.js  (caipira.cmd)
+//   Linux:   ./node22/node-v22.23.4-linux-x64/bin/node install.js  (caipira.sh)
 //
 // Commands: install | uninstall | status | doctor | logs [--limit N] [--clear] | prune [--apply] | mode <lite|full|ultra>
 //           explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]
@@ -1254,8 +1254,14 @@ async function install() {
     return;
   }
   if (realPath(process.execPath) !== realPath(deployedRuntime.node)) {
+    if (process.env.CAIPIRA_REEXEC_GUARD === '1') {
+      fail(`recursive re-exec loop detected: ${process.execPath} !== ${deployedRuntime.node}`);
+      process.exitCode = 1;
+      return;
+    }
     const args = [path.join(ROOT, 'install.js'), ...process.argv.slice(2)];
     const result = require('child_process').spawnSync(deployedRuntime.node, args, {
+      env: { ...process.env, CAIPIRA_REEXEC_GUARD: '1' },
       stdio: 'inherit', timeout: RUNTIME.DEPENDENCY_TIMEOUT_MS + RUNTIME.DOWNLOAD_TIMEOUT_MS + RUNTIME.EXTRACT_TIMEOUT_MS + 300_000, windowsHide: true
     });
     if (result.error) fail(`could not restart installer with bundled Node ${NODE_VERSION}: ${result.error.message}`);

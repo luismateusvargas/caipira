@@ -67,7 +67,7 @@ test('reproduction is a single shell command with synthetic input and no caller 
   assert.match(entry.repro, /printf '%s\\n'.*universal-hook\.js.*--client codex/);
   assert.equal(/[\r\n]/.test(entry.repro), false);
   for (const secret of ['touch ', 'user-prompt-secret', 'argument-secret']) assert.equal(entry.repro.includes(secret), false);
-  const syntax = spawnSync('/bin/sh', ['-n'], { input: entry.repro, encoding: 'utf8' });
+  const syntax = spawnSync('/bin/sh', ['-n', '-c', entry.repro], { encoding: 'utf8', timeout: 2000 });
   if (process.platform !== 'win32') assert.equal(syntax.status, 0, syntax.stderr);
 });
 test('reporting the same Error across boundaries appends only one entry', () => {
@@ -163,7 +163,7 @@ test('AST reproduction commands retain a resolved executable and quote spaces an
     assert.equal(entry.repro.includes('--db /tmp/'), false);
     if (entry.operation !== 'parse-file') assert.ok(entry.repro.includes('--db /path/to/repro.db'), entry.repro);
     if (process.platform !== 'win32') {
-      const syntax = spawnSync('/bin/sh', ['-n'], { input: entry.repro, encoding: 'utf8' });
+      const syntax = spawnSync('/bin/sh', ['-n', '-c', entry.repro], { encoding: 'utf8', timeout: 2000 });
       assert.equal(syntax.status, 0, syntax.stderr);
     }
   }
@@ -266,19 +266,10 @@ test('a closed output pipe preserves doctor failure status without changing the 
 });
 test('installer command failures are journaled without running installation steps', () => {
   readErrors({ clear: true });
-  // Satisfy the checkout deployment preflight; execFileSync below is still
-  // replaced before the installer can run any dependency/build command.
-  const release = `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`;
-  for (const rel of [`node22/${release}/${process.platform === 'win32' ? 'node.exe' : 'bin/node'}`,
-    'node_modules/better-sqlite3/package.json']) {
-    const marker = path.join(home, rel);
-    fs.mkdirSync(path.dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, 'unused prerequisite fixture');
-  }
   const preload = path.join(home, 'installer-failure.cjs');
   fs.writeFileSync(preload, `
-    const fs = require('fs'), exists = fs.existsSync;
-    fs.existsSync = file => String(file) === ${JSON.stringify(path.join(ROOT, 'node_modules', 'better-sqlite3', 'package.json'))} ? false : exists(file);
+    const runtime = require(${JSON.stringify(path.join(ROOT, 'runtime.js'))});
+    runtime.provisionRuntime = async () => ({ node: process.execPath });
     require('child_process').execFileSync = () => { throw Object.assign(new Error('synthetic install failure'), {code: 'ENOENT'}); };
   `);
   const child = cliWith({ NODE_OPTIONS: `--require=${JSON.stringify(preload)}` }, 'install');

@@ -38,7 +38,16 @@ const ARCHIVES = Object.freeze(Object.fromEntries([
  * @throws {Error} When no checksum-verified build is available for this host.
  */
 function selectArchive(platform = process.platform, arch = process.arch, report = process.report.getReport()) {
-  const target = `${platform}-${arch}${platform === 'linux' && !report.header?.glibcVersionRuntime ? '-musl' : ''}`;
+  const glibc = platform === 'linux' ? report.header?.glibcVersionRuntime : undefined;
+  const hasGlibcReport = glibc !== undefined && glibc !== null;
+  if (hasGlibcReport) {
+    const version = /^(\d+)\.(\d+)(?:\.|$)/.exec(String(glibc));
+    const supported = version && (Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 28));
+    if (!supported) {
+      throw new Error(`unsupported Node ${NODE_VERSION} target linux-${arch} with glibc ${glibc}; supported glibc is 2.28+; supported targets: ${Object.keys(ARCHIVES).join(', ')}`);
+    }
+  }
+  const target = `${platform}-${arch}${platform === 'linux' && !hasGlibcReport ? '-musl' : ''}`;
   if (!Object.hasOwn(ARCHIVES, target)) {
     throw new Error(`unsupported Node ${NODE_VERSION} target ${target}; supported targets: ${Object.keys(ARCHIVES).join(', ')}`);
   }
@@ -187,7 +196,9 @@ function installDependencies(home, manifestDirectory, adapters = {}) {
       keepRecovery = true;
       throw new Error(`dependency refresh and rollback failed; recovery files retained at ${staging}`, { cause: new AggregateError([error, rollbackError]) });
     }
-    throw new Error(`runtime dependency install failed; previous dependencies retained: ${error.message}`, { cause: error });
+    const failure = new Error(`runtime dependency install failed; previous dependencies retained: ${error.message}`, { cause: error });
+    if (error.code) failure.code = error.code;
+    throw failure;
   } finally {
     if (!keepRecovery) fs.rmSync(staging, { recursive: true, force: true });
   }
