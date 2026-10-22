@@ -1,16 +1,43 @@
-name: Build and publish npm release
+name: Release
 
+# Pushing an annotated vX.Y.Z tag builds and tests every target, publishes the
+# npm package, then creates the GitHub release from the same tarball. The tag
+# message becomes the release notes.
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  preflight:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.23.4'
+      - name: Verify tag matches package versions
+        run: |
+          set -eu
+          for manifest in package.json runtime/package.json; do
+            version="v$(node -p "require('./$manifest').version")"
+            if [ "$version" != "$GITHUB_REF_NAME" ]; then
+              echo "$manifest is $version but the tag is $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          done
+
   build-assets:
     name: Verify and build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -100,6 +127,7 @@ jobs:
 
   node-runtime:
     name: Verify pinned Node 22 runtime
+    needs: preflight
     runs-on: ubuntu-latest
     env:
       NODE_PATH: ${{ github.workspace }}/runtime/node_modules
@@ -114,8 +142,8 @@ jobs:
       - run: node -e "const Db = require('better-sqlite3'); const db = new Db(':memory:'); db.close();"
       - run: npm test
 
-  publish:
-    name: Assemble and publish scoped package
+  package:
+    name: Assemble scoped package
     runs-on: ubuntu-latest
     needs: [build-assets, node-runtime]
     steps:
@@ -123,7 +151,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '22.23.4'
-          registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v8
         with:
           pattern: ast-*
@@ -157,11 +184,59 @@ jobs:
         run: |
           npm pack --dry-run --json > pack-manifest.json
           node -e "const fs=require('fs'); const manifest=JSON.parse(fs.readFileSync('pack-manifest.json','utf8')); const pack=Array.isArray(manifest)?manifest[0]:Object.values(manifest)[0]; if(!pack) throw new Error('npm pack returned an empty manifest'); const files=new Set(pack.files.map(file=>file.path)); const expected=['runtime.js','runtime/package.json','runtime/package-lock.json','bin/caipira-cli.js','bin/caipira-ast-linux-x64','bin/caipira-ast-linux-arm64','bin/caipira-ast-darwin-arm64','bin/caipira-ast-darwin-x64','bin/caipira-ast-win32-x64.exe','caipira.sh','caipira.cmd','hooks/universal-hook.js','explore-ui/dist/index.html','models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx']; const missing=expected.filter(file=>!files.has(file)); if(missing.length) throw new Error('npm pack omitted: '+missing.join(', ')); if([...files].some(file=>file.startsWith('rust/')||file.startsWith('test/')||file.includes('node_modules/'))) throw new Error('npm package includes development files');"
-      - name: Verify tag matches package version
+      - name: Pack release files
         run: |
-          tag_version="v$(node -p 'require("./package.json").version')"
-          test "$tag_version" = "$GITHUB_REF_NAME"
+          set -eu
+          mkdir release
+          npm pack --pack-destination release
+          test -s "release/luismateusvargas-caipira-${GITHUB_REF_NAME#v}.tgz"
+          cp bin/caipira-ast-* release/
+          (cd release && sha256sum -- * > SHA256SUMS)
+      - name: Upload release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.23.4'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: release
       - name: Publish package
-        run: npm publish --access public
+        run: npm publish "release/luismateusvargas-caipira-${GITHUB_REF_NAME#v}.tgz" --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: publish-npm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: release
+      - name: Read release notes from the annotated tag
+        run: |
+          set -eu
+          # checkout stores the tag as lightweight; fetch the annotated object for its message.
+          git fetch --force --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git for-each-ref --format='%(contents)' "refs/tags/$GITHUB_REF_NAME" > release-notes.md
+          test -s release-notes.md
+      - name: Publish GitHub release
+        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --title "Caipira $GITHUB_REF_NAME" --notes-file release-notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

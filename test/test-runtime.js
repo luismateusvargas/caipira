@@ -172,8 +172,8 @@ async function main() {
     assert.equal(lock.packages['node_modules/better-sqlite3'].version, '12.9.0');
     assert(!lock.packages['node_modules/better-sqlite3'].optional);
   });
-  check('entry points, README and installer agree on the Node pin', () => {
-    for (const name of ['install.js', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd', 'README.md']) {
+  check('entry points, README, installer and release workflow agree on the Node pin', () => {
+    for (const name of ['install.js', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd', 'README.md', '.github/workflows/release.yml']) {
       const content = fs.readFileSync(path.join(ROOT, name), 'utf8');
       const pins = [...content.matchAll(/\b22\.\d+\.\d+\b/g)].map(match => match[0]);
       assert(!pins.some(pin => pin !== runtime.NODE_VERSION), `${name}: inconsistent pin ${pins.join(', ')}`);

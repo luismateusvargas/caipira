@@ -274,6 +274,20 @@ PATH="$HOME/.caipira/node22/node-v22.23.4-linux-x64/bin:$PATH" npm --prefix expl
 
 ---
 
+## Releasing
+
+Releases are cut from an annotated `vX.Y.Z` tag. Set the same version in `package.json`, `package-lock.json`, `runtime/package.json`, and `runtime/package-lock.json`, commit, then tag and push:
+
+```sh
+# --cleanup=whitespace keeps Markdown headings (lines starting with #) in the notes.
+git tag -a --cleanup=whitespace -F release-notes.md v2.2.0
+git push origin master v2.2.0
+```
+
+The tag runs `.github/workflows/release.yml`. It first rejects a tag that does not match both manifests. It then builds and tests the five AST targets (the Linux binaries are static musl builds) and runs the Node suite on the pinned Node 22.23.4. Next it packs the npm tarball with the prebuilt UI and checksum-verified model, and publishes that tarball to npm (repository secret `NPM_TOKEN`). Last, it creates the GitHub release from the same tarball, the AST binaries, and a `SHA256SUMS` file, with the tag message as the release notes.
+
+---
+
 ## License
 
 Released under the [GNU General Public License v3.0](LICENSE) (`GPL-3.0-only`).

@@ -1,6 +1,6 @@
 {
   "name": "@luismateusvargas/caipira",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Local-first cross-client memory, polyglot Rust AST symbol engine, prose compression, and interactive graph inspector.",
   "license": "GPL-3.0-only",
   "type": "commonjs",
