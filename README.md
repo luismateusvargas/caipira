@@ -111,12 +111,26 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
    %USERPROFILE%\.caipira\caipira.cmd install
    ```
 
+The installer detects Claude Code from `~/.claude/` or `~/.claude.json`, Codex from `~/.codex/` or `~/.codex/config.toml`, and Antigravity from `~/.gemini/` or `~/.gemini/config`. Absent clients are skipped without creating configuration directories. To select clients explicitly:
+
+```sh
+caipira install --clients claude-code,codex
+caipira install --clients all --accept-risk
+```
+
+Aliases `claude` and `agy` are accepted. The list restricts registration to those clients. Configuring an undetected client requires `--accept-risk` or an interactive `[y/N]` confirmation. Without agreement, the installer exits with code 1 before deployment or client configuration changes.
+
+On Linux and macOS, installation creates `~/.local/bin/caipira`. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc and open a new terminal. On Windows, installation adds the deployment directory (normally `%USERPROFILE%\.caipira`) to the User `PATH`; open a new terminal to use it. Then `caipira explore --no-open` works from any directory and selects that directory's workspace.
+
+Installing from a separate checkout synchronizes the core JavaScript runtime, hooks, installer, launchers, package metadata, built UI, and AST executable into `~/.caipira` (or `CAIPIRA_HOME`). Provision the bundled Node 22, dependencies, and model in both the build checkout and deployment first; downloading and packaging these prerequisites is separate from runtime synchronization. Existing databases, logs, models, and dependencies are preserved.
+
 ### What `install` Does
 - Installs root npm dependencies (`better-sqlite3`, `@xenova/transformers`) using the bundled Node 22 runtime if not already present.
 - Compiles the release Rust AST binary (`cargo build --release --manifest-path rust/caipira-ast/Cargo.toml`) and installs it atomically to `bin/caipira-ast` (degrades gracefully with a warning if `cargo` is not installed).
-- Installs `explore-ui` dependencies and builds the production Vite bundle at `explore-ui/dist` (and copies `explore-server.js` + `explore-ui/dist` into `~/.caipira` when invoked from a separate checkout).
+- Installs `explore-ui` dependencies and builds the production Vite bundle at `explore-ui/dist`.
+- Stages the complete checkout runtime before promoting files by rename, restores the previous runtime if promotion fails, and replaces the UI bundle without leaving obsolete assets. Optional UI/AST assets unavailable in the checkout retain their deployed copies. A failed rollback retains recovery files and reports their location.
 - Creates runtime directories (`logs/`).
-- Atomically registers the `caipira` stdio MCP server and lifecycle hooks across all supported clients (saving a `.caipira-backup` copy before modifying any file):
+- Installs the user PATH launcher and atomically registers the `caipira` stdio MCP server and lifecycle hooks for detected or explicitly selected clients (saving a `.caipira-backup` copy before modifying any file):
   - **Claude Code**: `~/.claude.json` and `~/.claude/settings.json`
   - **Codex**: `~/.codex/config.toml`
   - **Antigravity**: `~/.gemini/config/mcp_config.json` and `~/.gemini/config/hooks.json`
@@ -135,7 +149,7 @@ Run via `~/.caipira/caipira.sh <command>` on Linux/macOS or `caipira.cmd <comman
 
 | Command | Description |
 | :--- | :--- |
-| `install` | Install dependencies, build `caipira-ast` and `explore-ui`, and wire MCP server + hooks into Claude Code, Codex, and Antigravity. |
+| `install [--clients <list>] [--accept-risk]` | Install dependencies, build `caipira-ast` and `explore-ui`, synchronize the runtime, install the PATH launcher, and register detected or selected clients. |
 | `explore [flags]` | Incrementally index the target workspace and launch the local graph & symbol inspector UI (`--port 4777`, `--host 127.0.0.1`, `--workspace <path>`, `--no-open`). |
 | `doctor` | Check bundled Node 22, native dependencies, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, dangling registry rows, client configs, and active mode; warn when retained error logs are non-empty. |
 | `status` | Display current compression mode, retained error count, and aggregated counts of workspaces, observations, embeddings, facts, and recent sessions. |
@@ -207,7 +221,7 @@ touch /path/to/workspace-root/.caipira-workspace
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `CAIPIRA_HOME` | `~/.caipira` | Redirects the `database/` directory (`master.db`, per-workspace `.db` files, legacy `data.db`), `logs/mcp_traffic.log`, and `logs/errors.jsonl` to a custom directory. |
+| `CAIPIRA_HOME` | `~/.caipira` | Redirects databases and logs to a custom directory; `install` also synchronizes the checkout runtime and points the PATH launcher there. |
 | `CAIPIRA_AST_BIN` | `<root>/bin/caipira-ast` | Overrides the path to the `caipira-ast` executable. |
 | `CAIPIRA_MODEL_PATH` | `<root>/models` or `~/.caipira/models` | Overrides the directory containing `Xenova/all-MiniLM-L6-v2`. |
 | `CAIPIRA_DEBUG` | unset (`0`) | Set `CAIPIRA_DEBUG=1` to enable `<private>`-redacted MCP JSON-RPC traffic logging to `logs/mcp_traffic.log` (rotates to `.1` at 5 MB). |

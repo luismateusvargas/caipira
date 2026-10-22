@@ -1,6 +1,6 @@
 # Client auto-detection, risk-acknowledged client overrides, and global PATH integration
 
-Status: ready
+Status: implemented — pending independent review
 Project rules: specs/project.md
 Target files: install.js, caipira.sh, caipira.cmd, README.md, test/test-install.js
 
@@ -67,3 +67,16 @@ Outside scope: Publishing to the npm registry (Task 03) or modifying hook protoc
 ## Open decisions and sources
 
 - None. PATH registration targets `~/.local/bin` (XDG Base Directory / systemd user standard) on POSIX and `HKCU\Environment` on Windows.
+
+## Implementation evidence
+
+- Baseline checkpoint: `d28c6a39231713238c87974751af518f308e4dbe`.
+- Changed paths: `install.js`, `caipira.sh`, `caipira.cmd`, `README.md`, `test/test-install.js`, and this task spec. Task 03 remains untouched and untracked.
+- Default detection recognizes all six specified directory/file markers. Explicit selection accepts canonical names, aliases and `all`; unknown names and malformed arguments fail. Undetected selections require agreement before dependency, build, deployment or client configuration writes. Interactive yes/default-no responses are exercised with simulated TTY I/O.
+- Registration targets the synchronized deployment. Codex registration creates a fresh config when needed, preserves user hooks/settings, quotes paths containing apostrophes, and retains the 3-second SessionEnd timeout. Doctor skips absent clients with warnings; uninstall ignores missing registrations.
+- Runtime deployment stages all core files plus installer/launchers/package metadata and available UI/AST assets before promotion. Tests verify byte equality, replacement of stale files, removal of obsolete UI assets, and preservation of data/prerequisites. Injected staging and promotion failures preserve the previous deployment; a rollback failure retains recovery files and reports their location.
+- POSIX launcher execution through `PATH` works from an arbitrary directory, including a deployment path containing spaces and an apostrophe. The installed Explorer starts with `--no-open --port 0`; its HTTP workspace response identifies the invoking directory. POSIX launcher uses portable symlink resolution and selects Linux/macOS and x64/arm64 bundled runtimes; the Windows launcher selects x64/arm64.
+- Windows PATH adapter uses bounded PowerShell, preserves raw expandable registry entries, deduplicates expanded paths case-insensitively, and stops on registry errors. Its command/env contract is tested with simulated I/O. Windows integration fixtures intercept the registry boundary so tests cannot mutate the actual user PATH.
+- Final verification with bundled Node 22: `NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **912 checks, 0 failures** (20/33/87/100/90/167/83/141/191). The installation suite also passed independently. `git diff --check` and `sh -n caipira.sh` passed. Sandbox subprocesses returned EPERM, so successful integration runs used approved execution outside the sandbox with temporary homes.
+- Compatibility decisions: UI and AST remain optional; unavailable checkout assets retain their existing deployed copies with a warning. Node 22, native dependencies and model remain pre-provisioned; their packaging/download is Task 03. Synchronization promotes files atomically by rename with rollback across the staged set; it does not provide a simultaneous snapshot of all files to existing readers.
+- Limits: verified on Linux with isolated homes and local prerequisites. Native Windows/macOS execution, real Windows registry writes, a live user installation upgrade, abrupt termination during promotion, and concurrent installers were not verified. No hook protocol payloads, release versions, publications, pushes, or approval tags changed. Independent review is pending.

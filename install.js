@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// caipira/install.js — installs and wires Caipira into Claude Code.
+// caipira/install.js — installs and wires Caipira into detected coding clients.
 //
 // Run with the BUNDLED Node 22 runtime, never the system Node 24:
 //   Windows: .\node22\node-v22.20.0-win-x64\node.exe install.js  (caipira.cmd)
@@ -25,17 +25,16 @@ function journal(operation, error) {
 
 const ROOT = __dirname;
 const HOME = os.homedir();
+const HOME_DIR = process.env.CAIPIRA_HOME ? path.resolve(process.env.CAIPIRA_HOME) : path.join(HOME, '.caipira');
 const IS_WINDOWS = process.platform === 'win32';
-const NODE_DIR = path.join(ROOT, 'node22', IS_WINDOWS ? 'node-v22.20.0-win-x64' : 'node-v22.20.0-linux-x64');
+const NODE_RELEASE = `node-v22.20.0-${IS_WINDOWS ? 'win' : process.platform}-${process.arch}`;
+const NODE_DIR = path.join(ROOT, 'node22', NODE_RELEASE);
 const NODE_BIN = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
 const NPM_CLI = IS_WINDOWS
   ? path.join(NODE_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js')
   : path.join(NODE_DIR, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-const MCP_ENTRY = path.join(ROOT, 'mcp.js');
-const EXPLORE_SERVER = path.join(ROOT, 'explore-server.js');
 const EXPLORE_UI_DIR = path.join(ROOT, 'explore-ui');
 const EXPLORE_DIST = path.join(EXPLORE_UI_DIR, 'dist');
-const HOOK_ENTRY = path.join(ROOT, 'hooks', 'universal-hook.js');
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
 const CODEX_CONFIG = path.join(HOME, '.codex', 'config.toml');
@@ -75,6 +74,81 @@ const ok = (msg) => log(`  [ok]   ${msg}`);
 const warn = (msg) => log(`  [warn] ${msg}`);
 const fail = (msg) => log(`  [FAIL] ${msg}`);
 
+const CLIENTS = { claude: 'Claude Code', codex: 'Codex', antigravity: 'Antigravity' };
+const CLIENT_NAMES = { claude: 'claude-code', codex: 'codex', antigravity: 'antigravity' };
+const RISK_NOTICE = 'Configuring hooks and MCP servers for undetected clients is done under your own account and operational responsibility. Rerun with --accept-risk to confirm.';
+
+/** @returns {{claude: boolean, codex: boolean, antigravity: boolean}} Installed client markers. */
+function detectClients() {
+  const directory = name => {
+    try { return fs.statSync(path.join(HOME, name)).isDirectory(); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  };
+  return {
+    claude: directory('.claude') || fs.existsSync(CLAUDE_JSON),
+    codex: directory('.codex') || fs.existsSync(CODEX_CONFIG),
+    antigravity: directory('.gemini') || fs.existsSync(path.dirname(ANTIGRAVITY_MCP))
+  };
+}
+
+/**
+ * Validates selection and obtains consent before any install writes.
+ * @param {string[]} args Install arguments.
+ * @returns {Promise<object|null>} Enabled clients, or null when consent was refused.
+ * @throws {Error} For unknown arguments or client names.
+ */
+async function selectClients(args) {
+  const detected = detectClients();
+  let selected = null, acceptRisk = false;
+  const aliases = { claude: 'claude', 'claude-code': 'claude', codex: 'codex', agy: 'antigravity', antigravity: 'antigravity' };
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--accept-risk') { acceptRisk = true; continue; }
+    if (args[i] !== '--clients' || selected !== null) throw new Error(`unknown or repeated install argument: ${args[i]}`);
+    const list = args[++i];
+    if (!list || list.startsWith('--')) throw new Error('--clients needs a comma-separated client list');
+    selected = { claude: false, codex: false, antigravity: false };
+    for (const raw of list.split(',')) {
+      const name = raw.trim().toLowerCase();
+      if (name === 'all') { for (const key of Object.keys(CLIENTS)) selected[key] = true; }
+      else if (Object.hasOwn(aliases, name)) selected[aliases[name]] = true;
+      else throw new Error(`unknown client: ${raw || '(empty)'}`);
+    }
+  }
+  const enabled = selected || detected;
+  if (Object.keys(CLIENTS).some(key => enabled[key] && !detected[key]) && !acceptRisk) {
+    log(RISK_NOTICE);
+    let agreed = false;
+    if (process.stdin.isTTY && process.stdout.isTTY) {
+      const readline = require('readline');
+      const input = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const answer = await new Promise(resolve => {
+          input.once('close', () => resolve(''));
+          input.question('Proceed? [y/N] ', resolve);
+        });
+        agreed = /^y(es)?$/i.test(answer.trim());
+      } finally { input.close(); }
+    }
+    if (!agreed) { process.exitCode = 1; return null; }
+  }
+  for (const key of Object.keys(CLIENTS)) {
+    if (!enabled[key] && !detected[key]) log(`  [skip] ${CLIENTS[key]} not detected (use --clients ${CLIENT_NAMES[key]} --accept-risk to force)`);
+  }
+  return enabled;
+}
+
+/**
+ * Registration paths always point at the synchronized deployment.
+ * @returns {{node: string, mcp: string, hook: string, models: string}} Live entry points.
+ */
+function runtimePaths() {
+  return {
+    node: path.join(HOME_DIR, 'node22', NODE_RELEASE, IS_WINDOWS ? 'node.exe' : 'bin/node'),
+    mcp: path.join(HOME_DIR, 'mcp.js'), hook: path.join(HOME_DIR, 'hooks', 'universal-hook.js'),
+    models: path.join(HOME_DIR, 'models')
+  };
+}
+
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
     if (error.code !== 'ENOENT') journal('read configuration', error);
@@ -104,7 +178,8 @@ function writeTextAtomic(file, text) {
 
 function hookCommand(event) {
   // Quoted so spaces in the home directory path stay intact.
-  return `"${NODE_BIN}" "${HOOK_ENTRY}" --client claude-code --event ${event}`;
+  const runtime = runtimePaths();
+  return `"${runtime.node}" "${runtime.hook}" --client claude-code --event ${event}`;
 }
 
 function isCaipiraHook(entry) {
@@ -127,7 +202,8 @@ function installDependencies() {
 // The AST symbol index is optional: without cargo, or when the build fails,
 // memory and facts keep working and the hooks skip symbol updates.
 function buildAstEngine() {
-  const { CRATE_DIR, INSTALLED_BIN } = require('./ast');
+  const { CRATE_DIR } = require('./ast');
+  const INSTALLED_BIN = path.join(ROOT, 'bin', IS_WINDOWS ? 'caipira-ast.exe' : 'caipira-ast');
   const manifest = path.join(CRATE_DIR, 'Cargo.toml');
   if (!fs.existsSync(manifest)) {
     journal('build AST', new Error('rust/caipira-ast not found'));
@@ -190,65 +266,132 @@ function buildExploreUi() {
     return;
   }
   ok(`explore UI built at ${EXPLORE_DIST}`);
-  deployExplore();
 }
 
 function realPath(target) {
   try { return fs.realpathSync(target); } catch { return path.resolve(target); }
 }
 
-// Installing from a checkout copies the explorer into the Caipira home;
-// installing from the home itself has nothing to copy. The bundle is staged
-// and renamed into place, so a running server never serves half of it.
-function deployExplore() {
-  const { ROOT: HOME_DIR } = require('./workspace');
+// Stage the complete set before replacing any live file. Each file is promoted
+// by rename; directory swaps and failed promotions restore the previous set.
+function deployRuntime() {
   if (realPath(HOME_DIR) === realPath(ROOT)) return;
-  const targetDist = path.join(HOME_DIR, 'explore-ui', 'dist');
-  const staging = `${targetDist}.caipira-tmp`;
-  const serverTmp = path.join(HOME_DIR, 'explore-server.js.caipira-tmp');
-  const errorsTmp = path.join(HOME_DIR, 'errors.js.caipira-tmp');
+  const files = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspace.js',
+    'migrate.js', 'compress.js', 'errors.js', 'explore-server.js', 'hooks/universal-hook.js',
+    'install.js', 'package.json', 'caipira.sh', 'caipira.cmd'];
+  const binary = `bin/caipira-ast${IS_WINDOWS ? '.exe' : ''}`;
+  for (const optional of ['explore-ui/dist', binary]) {
+    if (fs.existsSync(path.join(ROOT, optional))) files.push(optional);
+    else warn(`${optional} unavailable in checkout — existing deployed asset kept`);
+  }
+  fs.mkdirSync(HOME_DIR, { recursive: true });
+  const staging = fs.mkdtempSync(path.join(HOME_DIR, '.runtime-'));
+  const promoted = [];
+  const movedDirectories = [];
+  let keepRecovery = false;
   try {
-    fs.rmSync(staging, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(targetDist), { recursive: true });
-    fs.cpSync(EXPLORE_DIST, staging, { recursive: true });
-    fs.rmSync(targetDist, { recursive: true, force: true });
-    fs.renameSync(staging, targetDist);
-    fs.copyFileSync(EXPLORE_SERVER, serverTmp);
-    fs.copyFileSync(path.join(ROOT, 'errors.js'), errorsTmp);
-    fs.renameSync(errorsTmp, path.join(HOME_DIR, 'errors.js'));
-    fs.renameSync(serverTmp, path.join(HOME_DIR, 'explore-server.js'));
-  } catch (error) {
-    for (const leftover of [staging, serverTmp, errorsTmp]) {
-      try { fs.rmSync(leftover, { recursive: true, force: true }); } catch {}
+    for (const rel of files) {
+      const live = path.join(HOME_DIR, rel), staged = path.join(staging, 'new', rel);
+      fs.mkdirSync(path.dirname(staged), { recursive: true });
+      fs.cpSync(path.join(ROOT, rel), staged, { recursive: true, dereference: true });
+      if (fs.existsSync(live)) {
+        const backup = path.join(staging, 'old', rel);
+        fs.mkdirSync(path.dirname(backup), { recursive: true });
+        fs.cpSync(live, backup, { recursive: true, dereference: true });
+      }
     }
-    warn(`explore server and UI could not be copied to ${HOME_DIR} — ${error.message}`);
-    journal('deploy explore', error);
+    fs.chmodSync(path.join(staging, 'new', 'caipira.sh'), 0o755);
+    for (const rel of files) {
+      const live = path.join(HOME_DIR, rel);
+      fs.mkdirSync(path.dirname(live), { recursive: true });
+      if (fs.existsSync(live) && fs.statSync(live).isDirectory()) {
+        const previous = path.join(staging, 'previous', rel);
+        fs.mkdirSync(path.dirname(previous), { recursive: true });
+        fs.renameSync(live, previous);
+        movedDirectories.push(rel);
+      }
+      fs.renameSync(path.join(staging, 'new', rel), live);
+      promoted.push(rel);
+    }
+  } catch (error) {
+    try {
+      for (const rel of new Set([...promoted, ...movedDirectories].reverse())) {
+        const live = path.join(HOME_DIR, rel), backup = path.join(staging, 'old', rel);
+        const previous = path.join(staging, 'previous', rel);
+        if (fs.existsSync(previous)) {
+          fs.rmSync(live, { recursive: true, force: true });
+          fs.renameSync(previous, live);
+        } else if (fs.existsSync(backup)) fs.renameSync(backup, live);
+        else fs.rmSync(live, { recursive: true, force: true });
+      }
+    } catch (rollbackError) {
+      keepRecovery = true;
+      throw new Error(`runtime sync and rollback failed; recovery files retained at ${staging}`, {
+        cause: new AggregateError([error, rollbackError])
+      });
+    }
+    throw new Error(`runtime could not be synchronized to ${HOME_DIR}`, { cause: error });
+  } finally {
+    if (!keepRecovery) fs.rmSync(staging, { recursive: true, force: true });
+  }
+  ok(`complete runtime synchronized to ${HOME_DIR}`);
+}
+
+/** Installs the user launcher without changing the caller's working directory. */
+function registerPath() {
+  if (IS_WINDOWS) {
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
+      "if ($null -eq $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }",
+      'try {',
+      "  $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)",
+      '  $target = $env:CAIPIRA_PATH_TARGET',
+      "  $present = @($current -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ieq $target.TrimEnd('\\') }).Count -gt 0",
+      "  if (-not $present) { $updated = ($current.TrimEnd(';') + ';' + $target).TrimStart(';'); $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString) }",
+      '} finally { $key.Close() }'
+    ].join('\n');
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      env: { ...process.env, CAIPIRA_PATH_TARGET: HOME_DIR }, stdio: 'pipe', timeout: 15000, windowsHide: true
+    });
+    ok(`User PATH includes ${HOME_DIR} (open a new terminal)`);
     return;
   }
-  ok(`explore server and UI copied to ${HOME_DIR}`);
+  const bin = path.join(HOME, '.local', 'bin');
+  const launcher = path.join(bin, 'caipira');
+  const quoted = `'${path.join(HOME_DIR, 'caipira.sh').replace(/'/g, `'\\''`)}'`;
+  writeTextAtomic(launcher, `#!/bin/sh\nexec ${quoted} "$@"\n`);
+  fs.chmodSync(launcher, 0o755);
+  ok(`launcher installed at ${launcher}`);
+  if (!(process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === bin)) {
+    warn('add export PATH="$HOME/.local/bin:$PATH" to your shell rc, then open a new terminal');
+  }
 }
 
 function ensureDirectories() {
   for (const dir of ['logs']) {
-    fs.mkdirSync(path.join(ROOT, dir), { recursive: true });
+    fs.mkdirSync(path.join(HOME_DIR, dir), { recursive: true });
   }
   ok('runtime directories ready');
 }
 
-function registerMcpServer() {
+function registerMcpServer(options) {
+  if (!options.claude) return;
+  const runtime = runtimePaths();
   const config = readJson(CLAUDE_JSON, {});
   config.mcpServers = config.mcpServers || {};
   config.mcpServers.caipira = {
     type: 'stdio',
-    command: NODE_BIN,
-    args: [MCP_ENTRY],
-    env: { CAIPIRA_MODEL_PATH: path.join(ROOT, 'models') }
+    command: runtime.node,
+    args: [runtime.mcp],
+    env: { CAIPIRA_MODEL_PATH: runtime.models, CAIPIRA_HOME: HOME_DIR }
   };
   writeJsonAtomic(CLAUDE_JSON, config);
   ok('MCP server "caipira" registered (user scope)');
 }
 
-function registerHooks() {
+function registerHooks(options) {
+  if (!options.claude) return;
   const settings = readJson(CLAUDE_SETTINGS, {});
   settings.hooks = settings.hooks || {};
   for (const event of HOOK_EVENTS) {
@@ -271,89 +414,32 @@ function registerHooks() {
 // Codex's config.toml is hand-maintained and full of unrelated plugin state,
 // so it is edited by line surgery rather than parsed and re-emitted — a round
 // trip through a TOML writer would reorder and reformat everything else in it.
-function registerCodex() {
-  if (!fs.existsSync(CODEX_CONFIG)) {
-    warn('Codex config.toml not found — skipped');
-    return;
-  }
-  const original = fs.readFileSync(CODEX_CONFIG, 'utf8');
-  const lines = original.split(/\r?\n/);
-  const out = [];
+function registerCodex(options) {
+  if (!options.codex) return;
+  const runtime = runtimePaths();
+  // Remove only our own old handlers; user-owned hooks retain their commands.
+  const original = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : '';
+  const stripped = stripCodexConfig(original).text;
+  const out = stripped.split(/\r?\n/);
 
-  // `command` is written POSIX-style and `command_windows` with escaped
-  // backslashes, matching how Codex already stores the pair.
-  const codexCommand = (lifecycle, windows) => {
-    const node = windows ? NODE_BIN.replace(/\\/g, '\\\\') : NODE_BIN.replace(/\\/g, '/');
-    const entry = windows ? HOOK_ENTRY.replace(/\\/g, '\\\\') : HOOK_ENTRY.replace(/\\/g, '/');
+  // Forward slashes work on both platforms; JSON quoting is also TOML basic
+  // string quoting and safely handles apostrophes in user directory names.
+  const codexCommand = lifecycle => {
+    const node = runtime.node.replace(/\\/g, '/');
+    const entry = runtime.hook.replace(/\\/g, '/');
     return `"${node}" "${entry}" --client codex --event ${lifecycle}`;
   };
 
-  let mcpFixed = 0;
-  let hooksFixed = 0;
-  let section = null;
-  let droppingState = false;
-
-  for (const line of lines) {
-    // Drop the [hooks.state] trust entries for our own hooks: Codex hashes the
-    // command string, so a repointed command still carrying its old hash reads
-    // as tampered-with rather than merely changed.
-    if (/^\[hooks\.state\./.test(line)) {
-      droppingState = CODEX_HOOKS.some(([, snake]) => line.includes(`:${snake}:`));
-      if (droppingState) continue;
-    } else if (droppingState) {
-      if (/^\s*trusted_hash\s*=/.test(line) || /^\s*$/.test(line)) continue;
-      droppingState = false;
-    }
-
-    if (/^\[mcp_servers\.caipira\]/.test(line)) { section = 'mcp'; out.push(line); continue; }
-    if (section === 'mcp') {
-      if (/^\s*command\s*=/.test(line)) { out.push(`command = '${NODE_BIN}'`); mcpFixed++; continue; }
-      if (/^\s*args\s*=/.test(line)) { out.push(`args = ['${MCP_ENTRY}']`); mcpFixed++; continue; }
-      if (/^\[/.test(line)) section = null;
-    }
-
-    const header = line.match(/^\[\[hooks\.(\w+)\.hooks\]\]/);
-    if (header) {
-      const found = CODEX_HOOKS.find(([toml]) => toml === header[1]);
-      section = found ? found[2] : null;
-      out.push(line);
-      continue;
-    }
-    if (section && section !== 'mcp') {
-      if (/^\s*command\s*=/.test(line)) {
-        out.push(`command = '${codexCommand(section, false)}'`);
-        hooksFixed++;
-        continue;
-      }
-      if (/^\s*command_windows\s*=/.test(line)) {
-        out.push(`command_windows = '${codexCommand(section, true)}'`);
-        hooksFixed++;
-        continue;
-      }
-      if (/^\s*timeout\s*=/.test(line)) {
-        const timeout = `timeout = ${codexTimeout(section)}`;
-        if (line.trim() !== timeout) hooksFixed++;
-        out.push(timeout);
-        continue;
-      }
-      if (/^\[/.test(line)) section = null;
-    }
-
-    out.push(line);
-  }
-
-  // Repointing only touches entries that exist; a fresh Codex has none, so the
-  // MCP server and hook tables are appended the first time round.
+  // Append our own tables after preserving every unrelated table verbatim.
   let appended = '';
   if (!out.some(line => /^\[mcp_servers\.caipira\]/.test(line))) {
-    appended += `\n[mcp_servers.caipira]\ncommand = '${NODE_BIN}'\nargs = ['${MCP_ENTRY}']\n`;
+    appended += `\n[mcp_servers.caipira]\ncommand = ${JSON.stringify(runtime.node)}\nargs = [${JSON.stringify(runtime.mcp)}]\n`
+      + `env = { CAIPIRA_HOME = ${JSON.stringify(HOME_DIR)}, CAIPIRA_MODEL_PATH = ${JSON.stringify(runtime.models)} }\n`;
   }
   for (const [toml, , lifecycle] of CODEX_HOOKS) {
-    const present = out.some(line => line.startsWith(`[[hooks.${toml}.hooks]]`));
-    if (present) continue;
     appended += `\n[[hooks.${toml}]]\n[[hooks.${toml}.hooks]]\ntype = "command"\n`
-      + `command = '${codexCommand(lifecycle, false)}'\n`
-      + `command_windows = '${codexCommand(lifecycle, true)}'\ntimeout = ${codexTimeout(lifecycle)}\n`;
+      + `command = ${JSON.stringify(codexCommand(lifecycle))}\n`
+      + `command_windows = ${JSON.stringify(codexCommand(lifecycle))}\ntimeout = ${codexTimeout(lifecycle)}\n`;
   }
   if (appended) {
     while (out.length && out[out.length - 1] === '') out.pop();
@@ -366,17 +452,19 @@ function registerCodex() {
     return;
   }
   writeTextAtomic(CODEX_CONFIG, updated);
-  ok(`Codex repointed (${mcpFixed} MCP keys, ${hooksFixed} hook commands, trust hashes cleared)`);
+  ok('Codex MCP server and hooks registered; old Caipira trust hashes cleared');
   warn('Codex will ask to re-trust its hooks on next launch');
 }
 
-function registerAntigravity() {
+function registerAntigravity(options) {
+  if (!options.antigravity) return;
+  const runtime = runtimePaths();
   const config = readJson(ANTIGRAVITY_MCP, {});
   config.mcpServers = config.mcpServers || {};
   config.mcpServers.caipira = {
-    command: NODE_BIN,
-    args: [MCP_ENTRY],
-    env: { CAIPIRA_MODEL_PATH: path.join(ROOT, 'models') }
+    command: runtime.node,
+    args: [runtime.mcp],
+    env: { CAIPIRA_MODEL_PATH: runtime.models, CAIPIRA_HOME: HOME_DIR }
   };
   writeJsonAtomic(ANTIGRAVITY_MCP, config);
   ok('MCP server "caipira" registered for Antigravity');
@@ -384,13 +472,15 @@ function registerAntigravity() {
 
 // hooks.json is keyed by hook name, so Caipira owns the "caipira" entry
 // outright and rewriting it never touches anyone else's hooks.
-function registerAntigravityHooks() {
+function registerAntigravityHooks(options) {
+  if (!options.antigravity) return;
+  const runtime = runtimePaths();
   const config = readJson(ANTIGRAVITY_HOOKS, {});
   const spec = {};
   for (const [event, lifecycle, grouped] of ANTIGRAVITY_EVENTS) {
     const handler = {
       type: 'command',
-      command: `"${NODE_BIN}" "${HOOK_ENTRY}" --client antigravity --event ${lifecycle}`,
+      command: `"${runtime.node}" "${runtime.hook}" --client antigravity --event ${lifecycle}`,
       timeout: 15
     };
     spec[event] = grouped ? [{ matcher: '*', hooks: [handler] }] : [handler];
@@ -454,16 +544,10 @@ function stripCodexConfig(text) {
 }
 
 function unregisterCodex() {
-  if (!fs.existsSync(CODEX_CONFIG)) {
-    warn('Codex config.toml not found — skipped');
-    return;
-  }
+  if (!fs.existsSync(CODEX_CONFIG)) return;
   const original = fs.readFileSync(CODEX_CONFIG, 'utf8');
   const { text, removed } = stripCodexConfig(original);
-  if (removed === 0) {
-    warn('Codex had no Caipira entries');
-    return;
-  }
+  if (removed === 0) return;
   writeTextAtomic(CODEX_CONFIG, text);
   ok(`Codex entries removed: ${removed}`);
 }
@@ -474,8 +558,6 @@ function unregisterAntigravity() {
     delete mcp.mcpServers.caipira;
     writeJsonAtomic(ANTIGRAVITY_MCP, mcp);
     ok('Antigravity MCP server unregistered');
-  } else {
-    warn('Antigravity MCP server was not registered');
   }
 
   const hooks = readJson(ANTIGRAVITY_HOOKS, null);
@@ -483,8 +565,6 @@ function unregisterAntigravity() {
     delete hooks.caipira;
     writeJsonAtomic(ANTIGRAVITY_HOOKS, hooks);
     ok('Antigravity hooks removed');
-  } else {
-    warn('Antigravity hooks were not registered');
   }
 }
 
@@ -494,8 +574,6 @@ function unregister() {
     delete config.mcpServers.caipira;
     writeJsonAtomic(CLAUDE_JSON, config);
     ok('MCP server unregistered');
-  } else {
-    warn('MCP server was not registered');
   }
 
   const settings = readJson(CLAUDE_SETTINGS, {});
@@ -606,19 +684,23 @@ function doctor() {
     fail(`workspace registry — ${error.message}`);
   }
 
-  const config = readJson(CLAUDE_JSON, {});
-  check('MCP server registered in ~/.claude.json', Boolean(config.mcpServers?.caipira), 'run: caipira install');
-
-  const settings = readJson(CLAUDE_SETTINGS, {});
-  for (const event of HOOK_EVENTS) {
-    const present = (settings.hooks?.[event] || []).some(group => (group.hooks || []).some(isCaipiraHook));
-    check(`hook ${event}`, present, 'run: caipira install');
+  const detected = detectClients();
+  if (!detected.claude) warn('Claude Code not detected — checks skipped');
+  else {
+    const config = readJson(CLAUDE_JSON, {});
+    check('Claude Code MCP server registered in ~/.claude.json', Boolean(config.mcpServers?.caipira), 'run: caipira install');
+    const settings = readJson(CLAUDE_SETTINGS, {});
+    for (const event of HOOK_EVENTS) {
+      const present = (settings.hooks?.[event] || []).some(group => (group.hooks || []).some(isCaipiraHook));
+      check(`Claude Code hook ${event}`, present, 'run: caipira install');
+    }
   }
 
   // Matches registerCodex(): a machine without Codex is fine, not broken.
   const codexConfig = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : '';
-  if (!codexConfig) warn('Codex config.toml not found — Codex checks skipped');
+  if (!detected.codex) warn('Codex not detected — checks skipped');
   else {
+    check('Codex MCP server registered', /^\[mcp_servers\.caipira\]/m.test(codexConfig), 'run: caipira install');
     check('Codex free of cavemem references', !/cavemem/i.test(codexConfig), 'run: caipira install');
     check('Codex hooks point at Caipira',
       (codexConfig.match(/universal-hook\.js/g) || []).length >= CODEX_HOOKS.length * 2,
@@ -637,9 +719,12 @@ function doctor() {
     fail(`workspace registry — ${error.message}`);
   }
 
-  const antigravity = readJson(ANTIGRAVITY_MCP, {});
-  check('Antigravity MCP registered', Boolean(antigravity.mcpServers?.caipira), 'run: caipira install');
-  check('Antigravity hooks registered', Boolean(readJson(ANTIGRAVITY_HOOKS, {}).caipira), 'run: caipira install');
+  if (!detected.antigravity) warn('Antigravity not detected — checks skipped');
+  else {
+    const antigravity = readJson(ANTIGRAVITY_MCP, {});
+    check('Antigravity MCP registered', Boolean(antigravity.mcpServers?.caipira), 'run: caipira install');
+    check('Antigravity hooks registered', Boolean(readJson(ANTIGRAVITY_HOOKS, {}).caipira), 'run: caipira install');
+  }
 
   check(`mode flag (${currentMode()})`, ['lite', 'full', 'ultra'].includes(currentMode()));
 
@@ -778,18 +863,22 @@ function logs() {
   }
 }
 
-function install() {
+async function install() {
+  const options = await selectClients(process.argv.slice(3));
+  if (!options) return;
   log('\nInstalling Caipira\n');
   installDependencies();
   buildAstEngine();
   buildExploreUi();
+  deployRuntime();
   ensureDirectories();
-  registerMcpServer();
-  registerHooks();
-  registerCodex();
-  registerAntigravity();
-  registerAntigravityHooks();
-  log('\nRestart Claude Code to load the MCP server and hooks.');
+  registerPath();
+  registerMcpServer(options);
+  registerHooks(options);
+  registerCodex(options);
+  registerAntigravity(options);
+  registerAntigravityHooks(options);
+  log('\nRestart the configured clients to load the MCP server and hooks.');
   log('Verify any time with: caipira doctor\n');
 }
 
@@ -811,14 +900,12 @@ const commands = {
 };
 
 if (!commands[command]) {
-  log(`Usage: caipira <install|uninstall|doctor|prune [--apply]|status|logs [--limit N] [--clear]|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
+  log(`Usage: caipira <install [--clients <list>] [--accept-risk]|uninstall|doctor|prune [--apply]|status|logs [--limit N] [--clear]|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
   process.exitCode = 1;
 } else {
-  try {
-    commands[command]();
-  } catch (error) {
+  Promise.resolve().then(() => commands[command]()).catch(error => {
     journal(command, error);
     fail(`${command} — ${error.message}`);
     process.exitCode = 1;
-  }
+  });
 }
