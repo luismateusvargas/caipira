@@ -183,15 +183,67 @@ const cmd = fs.readFileSync(path.join(ROOT, 'caipira.cmd'), 'utf8');
 const sh = fs.readFileSync(path.join(ROOT, 'caipira.sh'), 'utf8');
 check('caipira.cmd does not set CAIPIRA_HOME', !/CAIPIRA_HOME/.test(cmd), cmd);
 check('caipira.sh does not set CAIPIRA_HOME', !/CAIPIRA_HOME/.test(sh), sh);
+check('POSIX launcher pins Node 22.23.4 and has no host Node fallback', sh.includes('node-v22.23.4-') &&
+  sh.includes('!= v22.23.4') && !/command -v node|NODE_PATH/.test(sh), sh);
+check('Windows launcher pins Node 22.23.4 and has no host Node fallback', cmd.includes('node-v22.23.4-win-') &&
+  cmd.includes('v22.23.4') && !/where node|set "CAIPIRA_NODE=node"|better-sqlite3/.test(cmd), cmd);
 
 // Install fixtures contain real runtime code and existing local prerequisites.
 // Builds are deliberately unavailable: these checks need no network or cargo.
 const CORE = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspace.js',
   'migrate.js', 'compress.js', 'errors.js', 'explore-server.js', 'hooks/universal-hook.js',
-  'install.js', 'package.json', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd'];
+  'install.js', 'runtime.js', 'runtime/package.json', 'runtime/package-lock.json', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd'];
 const NODE_MODULES = path.dirname(path.dirname(require.resolve('better-sqlite3/package.json')));
-const NODE_RELEASE = `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`;
+const { NODE_VERSION, CLIENT_SELECTION_FILE, runtimePaths: deploymentRuntimePaths } = require(ROOT + '/runtime.js');
+const NODE_RELEASE = require(ROOT + '/runtime.js').selectArchive().release;
 const MCP_SESSION_PROBE_TIMEOUT_MS = 10_000;
+
+// Only installation I/O is substituted here. Runtime transactions and probes
+// are exercised without substitutions in test-runtime.js. The symlinked local
+// dependencies are read-only fixtures: never edit or remove anything below them.
+function offlineRuntimeEnv(env, home) {
+  const preload = path.join(home, 'offline-runtime.cjs');
+  fs.writeFileSync(preload, `const fs = require('fs'), path = require('path'), Module = require('module');
+const original = Module._load;
+Module._load = function(request, parent, isMain) {
+  const loaded = original.apply(this, arguments);
+  if (/(?:^|[\\\\/])runtime(?:\\.js)?$/.test(request) && loaded.provisionRuntime && !loaded.fixtureRuntime) {
+    loaded.fixtureRuntime = true;
+    const event = name => fs.appendFileSync(path.join(process.env.HOME, 'bootstrap-events'), name + '\\n');
+    loaded.runtimeWorks = node => fs.existsSync(node) && process.env.CAIPIRA_FIXTURE_WRONG_VERSION !== '1';
+    const verifySqlite = loaded.verifySqlite;
+    loaded.verifySqlite = (...args) => {
+      if (process.env.CAIPIRA_FIXTURE_FAIL_SQLITE === '1') throw new Error('fixture SQLite ABI mismatch');
+      return verifySqlite(...args);
+    };
+    loaded.provisionRuntime = async home => {
+      event('provision');
+      if (process.env.CAIPIRA_FIXTURE_FAIL_PROVISION === '1') throw new Error('fixture provisioning unavailable: https://fixture.invalid/node.tar.gz');
+      const paths = loaded.runtimePaths(home);
+      fs.mkdirSync(path.dirname(paths.node), { recursive: true });
+      if (!fs.existsSync(paths.node)) {
+        if (process.platform === 'win32') fs.linkSync(${JSON.stringify(NODE)}, paths.node);
+        else fs.symlinkSync(${JSON.stringify(NODE)}, paths.node);
+      }
+      return paths;
+    };
+    loaded.installDependencies = (home, manifestDirectory) => {
+      event('dependencies');
+      fs.mkdirSync(home, { recursive: true });
+      for (const name of ['package.json', 'package-lock.json']) {
+        const from = path.join(manifestDirectory, name), to = path.join(home, name);
+        if (from !== to) fs.copyFileSync(from, to);
+      }
+      if (!fs.existsSync(path.join(home, 'node_modules'))) fs.symlinkSync(${JSON.stringify(NODE_MODULES)}, path.join(home, 'node_modules'), 'junction');
+      loaded.verifySqlite(home);
+      return false;
+    };
+  }
+  return loaded;
+};
+`);
+  return { ...env, NODE_OPTIONS: `${env.NODE_OPTIONS || ''} --require ${JSON.stringify(preload)}` };
+}
 
 function installFixture(markers = [], { provisionDeployment = true } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "caipira-install 'home-"));
@@ -202,6 +254,7 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.copyFileSync(path.join(ROOT, rel), dest);
   }
+  fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(source, 'package.json'));
   const fixturePackage = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
   fixturePackage.name = 'caipira';
   fs.writeFileSync(path.join(source, 'package.json'), `${JSON.stringify(fixturePackage, null, 2)}\n`);
@@ -233,7 +286,7 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
       fs.writeFileSync(dest, marker.endsWith('.json') ? '{}' : 'model = "user-model"\n');
     } else fs.mkdirSync(dest, { recursive: true });
   }
-  const env = isolateRegistry({ ...process.env, HOME: home, USERPROFILE: home, CAIPIRA_HOME: live, SHELL: '/bin/bash' }, home);
+  const env = offlineRuntimeEnv(isolateRegistry({ ...process.env, HOME: home, USERPROFILE: home, CAIPIRA_HOME: live, SHELL: '/bin/bash' }, home), home);
   delete env.CAIPIRA_AST_BIN;
   const run = (...args) => {
     const child = spawnSync(NODE, [path.join(source, 'install.js'), ...args], { env, encoding: 'utf8', timeout: 30000 });
@@ -242,13 +295,13 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
   return { home, source, live, env, run };
 }
 
-console.log('\n4. npm packaging contract and host runtime entrypoint');
+console.log('\n4. npm packaging contract and deployment runtime entrypoint');
 const packageJson = require(ROOT + '/package.json');
 const requiredFiles = ['ast.js', 'compress.js', 'errors.js', 'explore-server.js', 'facts.js', 'inject.js',
-  'install.js', 'mcp.js', 'migrate.js', 'store.js', 'workspace.js', 'hooks/**', 'bin/**', 'explore-ui/dist/**', 'models/**'];
+  'install.js', 'runtime.js', 'runtime/package.json', 'runtime/package-lock.json', 'mcp.js', 'migrate.js', 'store.js', 'workspace.js', 'hooks/**', 'bin/**', 'explore-ui/dist/**', 'models/**'];
 check('scoped package exposes a global caipira command', packageJson.name === '@luismateusvargas/caipira' && packageJson.bin?.caipira === 'bin/caipira-cli.js');
-check('package supports Node 20/22/24 and keeps SQLite optional', packageJson.engines?.node === '^20 || ^22 || ^24' &&
-  packageJson.optionalDependencies?.['better-sqlite3'] === '12.9.0' && !packageJson.dependencies?.['better-sqlite3']);
+check('package bootstraps on Node >=20 without host runtime dependencies', packageJson.engines?.node === '>=20' &&
+  Object.keys(packageJson.dependencies || {}).length === 0 && Object.keys(packageJson.optionalDependencies || {}).length === 0);
 check('npm files whitelist covers runtime, CLI, UI and model assets', requiredFiles.every(file => packageJson.files.includes(file)) &&
   packageJson.files.includes('caipira.sh') && packageJson.files.includes('caipira.cmd'));
 const astApi = require(ROOT + '/ast.js');
@@ -261,15 +314,15 @@ check('AST asset name rejects unsupported platforms', astApi.platformBinaryName(
 const cliApi = require(ROOT + '/bin/caipira-cli.js');
 const cliHome = path.join(HOME, 'npm-cli-home');
 const bundledNode = cliApi.bundledNodePath(cliHome);
-check('npm CLI selects the deployment Node 22 path for the host', bundledNode.includes(path.join('node22', `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`)));
-check('npm CLI falls back when the bundled runtime is absent', cliApi.resolveBundledNode(cliHome) === null);
+check('npm CLI selects the deployment Node 22 path for the host', bundledNode === deploymentRuntimePaths(cliHome).node);
+check('npm CLI reports absent bundled runtime without a PATH fallback', cliApi.resolveBundledNode(cliHome) === null);
 fs.mkdirSync(path.dirname(bundledNode), { recursive: true });
 fs.writeFileSync(bundledNode, 'runtime fixture', { mode: 0o755 });
 check('npm CLI recognizes an installed bundled runtime', cliApi.resolveBundledNode(cliHome) === bundledNode);
 const hostCli = spawnSync(NODE, [path.join(ROOT, 'bin/caipira-cli.js'), '__invalid_command__'], {
   encoding: 'utf8', env: { ...process.env, HOME: cliHome, USERPROFILE: cliHome, CAIPIRA_HOME: path.join(cliHome, '.caipira') }
 });
-check('npm CLI executes install.js under the host Node fallback', hostCli.status === 1 && /Usage: caipira/.test(hostCli.stdout || ''));
+check('npm CLI refuses uninstalled commands instead of using host Node', hostCli.status === 1 && /run caipira install first/.test(`${hostCli.stdout || ''}${hostCli.stderr || ''}`));
 
 console.log('\n4b. npm distribution installs without checkout prerequisites');
 const npmPackage = installFixture([], { provisionDeployment: false });
@@ -278,7 +331,10 @@ fs.rmSync(path.join(npmPackage.source, 'rust'), { recursive: true, force: true }
 const npmManifest = JSON.parse(fs.readFileSync(path.join(npmPackage.source, 'package.json'), 'utf8'));
 npmManifest.name = '@luismateusvargas/caipira';
 fs.writeFileSync(path.join(npmPackage.source, 'package.json'), `${JSON.stringify(npmManifest, null, 2)}\n`);
-const npmInstall = npmPackage.run('install');
+const npmBootstrap = spawnSync(NODE, [path.join(npmPackage.source, 'bin/caipira-cli.js'), 'install'], {
+  env: npmPackage.env, encoding: 'utf8', timeout: 30000
+});
+const npmInstall = { code: npmBootstrap.status, out: `${npmBootstrap.stdout || ''}${npmBootstrap.stderr || ''}${npmBootstrap.error || ''}` };
 check('npm install works without a preinstalled deployment Node or dependencies', npmInstall.code === 0 &&
   fs.existsSync(path.join(npmPackage.live, 'node_modules/better-sqlite3/package.json')), npmInstall.out);
 check('npm install deploys the prebuilt AST, UI and model without cargo or frontend builds',
@@ -286,49 +342,65 @@ check('npm install deploys the prebuilt AST, UI and model without cargo or front
   fs.existsSync(path.join(npmPackage.live, 'explore-ui/dist/index.html')) &&
   fs.existsSync(path.join(npmPackage.live, 'models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx')) &&
   /using prebuilt caipira-ast/.test(npmInstall.out) && /using prebuilt explore UI/.test(npmInstall.out), npmInstall.out);
-const deployedSqlitePackage = path.join(npmPackage.live, 'node_modules/better-sqlite3/package.json');
-const sourceSqlitePackage = path.join(npmPackage.source, 'node_modules/better-sqlite3/package.json');
-const staleSqliteMetadata = JSON.parse(fs.readFileSync(deployedSqlitePackage, 'utf8'));
-staleSqliteMetadata.version = '0.0.0-stale-fixture';
-fs.writeFileSync(deployedSqlitePackage, `${JSON.stringify(staleSqliteMetadata)}\n`);
-const transformerPackage = path.join(npmPackage.live, 'node_modules/@xenova/transformers/package.json');
-const sourceTransformerPackage = path.join(npmPackage.source, 'node_modules/@xenova/transformers/package.json');
-if (fs.existsSync(transformerPackage) && fs.existsSync(sourceTransformerPackage)) fs.rmSync(transformerPackage);
 const deployedModelConfig = path.join(npmPackage.live, 'models/Xenova/all-MiniLM-L6-v2/config.json');
 const sourceModelConfig = path.join(npmPackage.source, 'models/Xenova/all-MiniLM-L6-v2/config.json');
 fs.writeFileSync(sourceModelConfig, '{"model":"fixture"}\n');
 fs.rmSync(deployedModelConfig, { force: true });
 const npmUpgrade = npmPackage.run('install');
-check('npm reinstall refreshes stale SQLite and restores missing runtime dependencies', npmUpgrade.code === 0 &&
-  JSON.parse(fs.readFileSync(deployedSqlitePackage, 'utf8')).version === JSON.parse(fs.readFileSync(sourceSqlitePackage, 'utf8')).version &&
-  fs.existsSync(transformerPackage) && fs.readFileSync(deployedModelConfig, 'utf8') === fs.readFileSync(sourceModelConfig, 'utf8'), npmUpgrade.out);
+check('npm reinstall restores model files without modifying shared dependency fixtures', npmUpgrade.code === 0 &&
+  fs.readFileSync(deployedModelConfig, 'utf8') === fs.readFileSync(sourceModelConfig, 'utf8'), npmUpgrade.out);
+check('deployed manifests equal the nested runtime manifests, not the npm bootstrap manifest',
+  ['package.json', 'package-lock.json'].every(name => fs.readFileSync(path.join(npmPackage.live, name)).equals(fs.readFileSync(path.join(npmPackage.source, 'runtime', name)))));
+const oldRuntimeFixture = installFixture(['.claude']);
+const oldRelease = path.join(oldRuntimeFixture.live, 'node22', `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`);
+fs.renameSync(deploymentRuntimePaths(oldRuntimeFixture.live).directory, oldRelease);
+const oldRegistration = { mcpServers: { caipira: { command: path.join(oldRelease, IS_WINDOWS ? 'node.exe' : 'bin/node'), args: [path.join(oldRuntimeFixture.live, 'mcp.js')] } } };
+fs.writeFileSync(path.join(oldRuntimeFixture.home, '.claude.json'), JSON.stringify(oldRegistration));
+const runtimeUpgrade = oldRuntimeFixture.run('install');
+check('upgrade from old Node release registers pinned runtime and removes old directory', runtimeUpgrade.code === 0 &&
+  readJsonFor(oldRuntimeFixture.home, '.claude.json').mcpServers.caipira.command === deploymentRuntimePaths(oldRuntimeFixture.live).node &&
+  !fs.existsSync(oldRelease), runtimeUpgrade.out);
+const sessionStart = readJsonFor(oldRuntimeFixture.home, '.claude/settings.json').hooks.SessionStart[0].hooks[0].command;
+const upgradedHook = spawnSync(sessionStart, { shell: IS_WINDOWS ? 'cmd.exe' : '/bin/sh', env: oldRuntimeFixture.env,
+  input: JSON.stringify({ session_id: 'upgrade-probe', cwd: oldRuntimeFixture.home }), encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+check('hook registered after runtime upgrade executes successfully', upgradedHook.status === 0, upgradedHook.stdout + upgradedHook.stderr);
+
 
 function registered(fixture) {
   return ['.claude.json', '.codex/config.toml', '.gemini/config/mcp_config.json'].map(rel => fs.existsSync(path.join(fixture.home, rel)));
 }
 
-console.log('\n5a. checkout installs refuse missing deployment prerequisites before writes');
+console.log('\n5a. checkout installs provision missing deployment prerequisites');
 for (const missing of [['node22', 'node_modules'], ['node22'], ['node_modules']]) {
   const fixture = installFixture(['.claude'], { provisionDeployment: missing.length !== 2 });
   if (missing.length === 1) fs.rmSync(path.join(fixture.live, missing[0]), { recursive: true, force: true });
-  const mcpFile = path.join(fixture.home, '.claude.json');
-  const hooksFile = path.join(fixture.home, '.claude/settings.json');
-  const originalMcp = '{"theme":"user-theme"}\n';
-  const originalHooks = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}\n';
-  fs.writeFileSync(mcpFile, originalMcp);
-  fs.writeFileSync(hooksFile, originalHooks);
   const result = fixture.run('install');
-  const expectedPaths = missing.map(name => path.join(fixture.live, name === 'node22'
-    ? `node22/${NODE_RELEASE}/${IS_WINDOWS ? 'node.exe' : 'bin/node'}`
-    : 'node_modules/better-sqlite3/package.json'));
-  check(`missing ${missing.join(' and ')} refuses installation and names prerequisites`, result.code === 1 && expectedPaths.every(file => result.out.includes(file)) && /provision/i.test(result.out), result.out);
-  const deployed = fs.existsSync(fixture.live) ? fs.readdirSync(fixture.live) : [];
-  check(`missing ${missing.join(' and ')} creates no deployment, staging, logs or launcher`,
-    CORE.every(rel => !fs.existsSync(path.join(fixture.live, rel))) && !deployed.some(name => name.startsWith('.runtime-') || name === 'logs') && !fs.existsSync(path.join(fixture.home, '.local')));
-  check(`missing ${missing.join(' and ')} preserves client configs byte for byte`,
-    fs.readFileSync(mcpFile, 'utf8') === originalMcp && fs.readFileSync(hooksFile, 'utf8') === originalHooks &&
-    !fs.existsSync(`${mcpFile}.caipira-backup`) && !fs.existsSync(`${hooksFile}.caipira-backup`));
+  check(`missing ${missing.join(' and ')} is provisioned instead of refused`, result.code === 0 &&
+    fs.existsSync(deploymentRuntimePaths(fixture.live).node) && fs.existsSync(path.join(fixture.live, 'node_modules/better-sqlite3/package.json')) &&
+    fs.existsSync(path.join(fixture.home, '.claude.json')), result.out);
 }
+const checkoutBootstrap = installFixture(['.claude'], { provisionDeployment: false });
+for (const name of ['node22', 'node_modules']) fs.rmSync(path.join(checkoutBootstrap.source, name), { recursive: true, force: true });
+const checkoutInstall = spawnSync(NODE, [path.join(checkoutBootstrap.source, 'bin/caipira-cli.js'), 'install'], {
+  env: checkoutBootstrap.env, encoding: 'utf8', timeout: 30000
+});
+check('checkout npm entrypoint bootstraps without checkout or deployment prerequisites', checkoutInstall.status === 0 &&
+  !fs.existsSync(path.join(checkoutBootstrap.source, 'node22')) && !fs.existsSync(path.join(checkoutBootstrap.source, 'node_modules')) &&
+  readJsonFor(checkoutBootstrap.home, '.claude.json').mcpServers.caipira.command === deploymentRuntimePaths(checkoutBootstrap.live).node,
+  `${checkoutInstall.stdout}${checkoutInstall.stderr}${checkoutInstall.error || ''}`);
+const failedBootstrap = installFixture(['.claude'], { provisionDeployment: false });
+const originalMcp = '{"theme":"user-theme"}\n';
+const originalHooks = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}\n';
+fs.writeFileSync(path.join(failedBootstrap.home, '.claude.json'), originalMcp);
+fs.writeFileSync(path.join(failedBootstrap.home, '.claude/settings.json'), originalHooks);
+failedBootstrap.env.CAIPIRA_FIXTURE_FAIL_PROVISION = '1';
+r = failedBootstrap.run('install');
+check('bootstrap failure names download URL and creates no deployment or launcher', r.code === 1 &&
+  r.out.includes('https://fixture.invalid/node.tar.gz') && !fs.existsSync(failedBootstrap.live) && !fs.existsSync(path.join(failedBootstrap.home, '.local')), r.out);
+check('bootstrap failure preserves client configuration byte for byte with no backups',
+  fs.readFileSync(path.join(failedBootstrap.home, '.claude.json'), 'utf8') === originalMcp &&
+  fs.readFileSync(path.join(failedBootstrap.home, '.claude/settings.json'), 'utf8') === originalHooks &&
+  !fs.existsSync(path.join(failedBootstrap.home, '.claude.json.caipira-backup')));
 
 console.log('\n5. default detection creates no phantom client configuration');
 const empty = installFixture();
@@ -337,10 +409,13 @@ check('empty home install succeeds', r.code === 0, r.out);
 check('all absent clients are skipped', ['Claude Code', 'Codex', 'Antigravity'].every(name => r.out.includes(`[skip] ${name} not detected`)), r.out);
 check('no client files or directories created', ['.claude', '.claude.json', '.codex', '.gemini'].every(rel => !fs.existsSync(path.join(empty.home, rel))));
 r = empty.run('doctor');
-check('doctor on empty client home has no failures', r.code === 0 && !r.out.includes('[FAIL]'), r.out);
-check('doctor warns for each absent client', ['Claude Code', 'Codex', 'Antigravity'].every(name => r.out.includes(`[warn] ${name} not detected — checks skipped`)), r.out);
+check('doctor on empty client home has no failures', r.code === 0 && !r.out.includes('[FAIL]') && r.out.includes(NODE_VERSION), r.out);
+check('doctor skips each unselected client', ['Claude Code', 'Codex', 'Antigravity'].every(name => r.out.includes(`[skip] ${name} not selected for this install`)), r.out);
 r = empty.run('uninstall');
 check('uninstall absent clients is quiet and does not create configs', r.code === 0 && !r.out.includes('[warn]') && registered(empty).every(value => !value), r.out);
+r = empty.run('doctor');
+check('legacy installs without a selection record retain detection-based doctor warnings',
+  ['Claude Code', 'Codex', 'Antigravity'].every(name => r.out.includes(`[warn] ${name} not detected — checks skipped`)), r.out);
 
 for (const [marker, expected] of [
   ['.claude', [true, false, false]], ['.claude.json', [true, false, false]],
@@ -364,7 +439,8 @@ console.log('\n6. explicit selection, consent, and user configuration preservati
 const forced = installFixture();
 r = forced.run('install', '--clients', 'all');
 check('undetected forced clients refused without consent', r.code === 1 && r.out.includes('under your own account and operational responsibility') && r.out.includes('Rerun with --accept-risk to confirm.'), r.out);
-check('refusal precedes deploy, launcher, and configuration writes', !fs.existsSync(path.join(forced.live, 'mcp.js')) && !fs.existsSync(path.join(forced.home, '.local')) && registered(forced).every(value => !value));
+check('refusal precedes deploy, provisioning, launcher, and configuration writes', !fs.existsSync(path.join(forced.live, 'mcp.js')) &&
+  !fs.existsSync(path.join(forced.home, 'bootstrap-events')) && !fs.existsSync(path.join(forced.home, '.local')) && registered(forced).every(value => !value));
 for (const args of [['--clients'], ['--clients', ''], ['--clients', 'unknown'], ['--clients', '__proto__'], ['--clients', 'all,'], ['--clients', 'codex', '--clients', 'agy'], ['--typo']]) {
   r = forced.run('install', ...args);
   check(`invalid args rejected: ${args.join(' ')}`, r.code === 1 && registered(forced).every(value => !value), r.out);
@@ -381,7 +457,7 @@ const forcedCodex = fs.readFileSync(path.join(forced.home, '.codex/config.toml')
 check('Codex MCP preserves model path without registering CAIPIRA_HOME', !forcedCodex.includes('CAIPIRA_HOME') &&
   forcedCodex.includes(`env = { CAIPIRA_MODEL_PATH = ${JSON.stringify(path.join(forced.live, 'models'))} }`), forcedCodex);
 check('Codex SessionEnd keeps 3s timeout', /session-end[^\n]*\ntimeout = 3/.test(forcedCodex), forcedCodex);
-check('Codex MCP uses the runtime that executed installation', forcedCodex.includes(`command = ${JSON.stringify(NODE)}`), forcedCodex);
+check('Codex MCP always registers the deployment runtime, not the installer host', forcedCodex.includes(`command = ${JSON.stringify(deploymentRuntimePaths(forced.live).node)}`), forcedCodex);
 check('Codex TOML quotes deployment paths containing apostrophes',
   forcedCodex.includes(`args = [${JSON.stringify(path.join(forced.live, 'mcp.js'))}]`), forcedCodex);
 r = forced.run('doctor');
@@ -397,8 +473,21 @@ fs.writeFileSync(configFile, userConfig);
 r = onlyCodex.run('install', '--clients', 'codex');
 check('explicit list restricts even detected clients', r.code === 0 && JSON.stringify(registered(onlyCodex)) === '[false,true,false]', r.out);
 check('Codex install preserves user hook and settings', fs.readFileSync(configFile, 'utf8').startsWith(userConfig));
+const selectedClientState = path.join(onlyCodex.live, CLIENT_SELECTION_FILE);
+check('explicit client selection is recorded in deployment state', fs.existsSync(selectedClientState));
+const restrictedClientState = fs.readFileSync(selectedClientState, 'utf8');
+r = onlyCodex.run('doctor');
+check('doctor checks only selected clients even when other clients are detected', r.code === 0 &&
+  ['Claude Code', 'Antigravity'].every(name => r.out.includes(`[skip] ${name} not selected for this install`)) && !r.out.includes('[FAIL]'), r.out);
+r = onlyCodex.run('install');
+check('plain reinstall refreshes selected-client state from detection', r.code === 0 && registered(onlyCodex).every(Boolean) &&
+  fs.readFileSync(selectedClientState, 'utf8') !== restrictedClientState, r.out);
+r = onlyCodex.run('doctor');
+check('doctor checks all clients after plain reinstall', r.code === 0 && !r.out.includes('not selected for this install'), r.out);
 r = onlyCodex.run('uninstall');
-check('uninstall preserves user hook after install', r.code === 0 && fs.readFileSync(configFile, 'utf8').trim() === userConfig.trim(), r.out);
+check('uninstall preserves user hook after install and removes selected-client record', r.code === 0 &&
+  fs.readFileSync(configFile, 'utf8').trim() === userConfig.trim() && !fs.existsSync(path.join(onlyCodex.live, CLIENT_SELECTION_FILE)) &&
+  !readJsonFor(onlyCodex.home, '.claude.json').mcpServers?.caipira && !readJsonFor(onlyCodex.home, '.gemini/config/mcp_config.json').mcpServers?.caipira, r.out);
 
 console.log('\n7. complete runtime sync and PATH launcher');
 check('all core files synchronized byte for byte', CORE.every(rel => fs.readFileSync(path.join(empty.source, rel)).equals(fs.readFileSync(path.join(empty.live, rel)))));
@@ -417,6 +506,39 @@ const launchCommand = IS_WINDOWS ? 'cmd.exe' : 'caipira';
 const launchArgs = IS_WINDOWS ? ['/d', '/c', 'caipira.cmd'] : [];
 const launched = spawnSync(launchCommand, [...launchArgs, 'status'], { cwd: workdir, env: launcherEnv, encoding: 'utf8', timeout: 10000 });
 check('PATH launcher runs from another directory', !launched.error && launched.status === 0 && launched.stdout.includes('Caipira status'), launched.stderr || launched.error);
+const packageActive = path.join(empty.source, 'active');
+fs.writeFileSync(packageActive, 'ultra');
+const npmCliRun = (...args) => spawnSync(NODE, [path.join(empty.source, 'bin/caipira-cli.js'), ...args],
+  { env: empty.env, cwd: workdir, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+const cliMode = npmCliRun('mode', 'lite');
+const cliStatus = npmCliRun('status');
+const pathStatus = spawnSync(launchCommand, [...launchArgs, 'status'], { env: launcherEnv, cwd: workdir, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+check('npm CLI mode and both status entry points use deployment, not package files', cliMode.status === 0 &&
+  fs.readFileSync(path.join(empty.live, 'active'), 'utf8').trim() === 'lite' && fs.readFileSync(packageActive, 'utf8') === 'ultra' &&
+  cliStatus.status === 0 && pathStatus.status === 0 && /mode:\s+lite/.test(cliStatus.stdout) && /mode:\s+lite/.test(pathStatus.stdout),
+  `${cliMode.stdout}${cliMode.stderr}${cliStatus.stdout}${cliStatus.stderr}${pathStatus.stdout}${pathStatus.stderr}`);
+const cliDoctor = npmCliRun('doctor');
+check('npm CLI doctor inspects deployment paths', cliDoctor.status === 0 && cliDoctor.stdout.includes(deploymentRuntimePaths(empty.live).node), cliDoctor.stdout + cliDoctor.stderr);
+const runtimeDirectory = path.join(empty.live, 'node22');
+fs.renameSync(runtimeDirectory, `${runtimeDirectory}.saved`);
+try {
+  const missingLauncher = spawnSync(launchCommand, [...launchArgs, 'status'], { env: launcherEnv, cwd: workdir, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+  const missingCli = npmCliRun('status');
+  check('launcher refuses missing runtime even with host Node on PATH', missingLauncher.status === 1 &&
+    /run caipira install/.test(`${missingLauncher.stdout}${missingLauncher.stderr}`), missingLauncher.stdout + missingLauncher.stderr);
+  check('npm CLI refuses missing runtime without host fallback', missingCli.status === 1 &&
+    /run caipira install first/.test(`${missingCli.stdout}${missingCli.stderr}`), missingCli.stdout + missingCli.stderr);
+  const missingDoctor = empty.run('doctor');
+  check('doctor detects missing deployed runtime', missingDoctor.code === 1 && /\[FAIL\].*Node/.test(missingDoctor.out) && /run.*caipira install/.test(missingDoctor.out), missingDoctor.out);
+} finally { fs.renameSync(`${runtimeDirectory}.saved`, runtimeDirectory); }
+empty.env.CAIPIRA_FIXTURE_WRONG_VERSION = '1';
+const wrongVersionDoctor = empty.run('doctor');
+delete empty.env.CAIPIRA_FIXTURE_WRONG_VERSION;
+check('doctor rejects wrong bundled Node version', wrongVersionDoctor.code === 1 && /\[FAIL\].*Node/.test(wrongVersionDoctor.out), wrongVersionDoctor.out);
+empty.env.CAIPIRA_FIXTURE_FAIL_SQLITE = '1';
+const brokenSqliteDoctor = empty.run('doctor');
+delete empty.env.CAIPIRA_FIXTURE_FAIL_SQLITE;
+check('doctor rejects SQLite that cannot open a fresh database', brokenSqliteDoctor.code === 1 && /\[FAIL\].*(SQLite|dependencies)/.test(brokenSqliteDoctor.out), brokenSqliteDoctor.out);
 fs.writeFileSync(path.join(empty.live, 'facts.js'), 'stale deployment');
 fs.writeFileSync(path.join(empty.live, 'explore-ui/dist/obsolete.js'), 'old asset');
 fs.writeFileSync(path.join(empty.live, 'keep.db'), 'user data');
@@ -435,7 +557,7 @@ if (!IS_WINDOWS) {
 function installerContext(fixture, overrides = {}) {
   const context = vm.createContext({
     __dirname: fixture.source, Buffer, console,
-    process: { platform: process.platform, arch: process.arch, env: fixture.env, stdout: { on() {}, write() {}, isTTY: false }, stdin: {}, ...overrides.process },
+    process: { platform: process.platform, arch: process.arch, execPath: NODE, argv: [NODE, path.join(fixture.source, 'install.js'), 'install'], versions: process.versions, report: process.report, env: fixture.env, stdout: { on() {}, write() {}, isTTY: false }, stdin: {}, ...overrides.process },
     require: name => name === 'os' ? { homedir: () => fixture.home }
       : overrides[name] || require(name.startsWith('.') ? path.resolve(ROOT, name) : name)
   });
@@ -870,6 +992,23 @@ async function remainingChecks() {
     const selection = await vm.runInContext("selectClients(['--clients', 'all'])", context);
     check(`TTY answer ${JSON.stringify(answer)} ${agreed ? 'accepts' : 'refuses'}`, Boolean(selection) === agreed && prompt.includes('[y/N]'));
   }
+  const reexecFixture = installFixture(['.claude']);
+  const hostNode = path.join(reexecFixture.home, 'host-runtime', 'node');
+  const installerArgs = [path.join(reexecFixture.source, 'install.js'), 'install', '--clients', 'claude-code'];
+  let reexecCall, provisionCalls = 0;
+  const reexecContext = installerContext(reexecFixture, {
+    process: { execPath: hostNode, argv: [hostNode, ...installerArgs] },
+    './runtime': { ...require(ROOT + '/runtime.js'),
+      provisionRuntime: async home => { provisionCalls++; return deploymentRuntimePaths(home); },
+      installDependencies: () => { throw new Error('host process must not install dependencies'); }
+    },
+    child_process: { ...require('child_process'), spawnSync: (...args) => { reexecCall = args; return { status: 0 }; } }
+  });
+  await vm.runInContext('install()', reexecContext);
+  check('host bootstrap re-launches the package installer on bundled Node before dependency work', provisionCalls === 1 &&
+    reexecCall?.[0] === deploymentRuntimePaths(reexecFixture.live).node && JSON.stringify(reexecCall[1]) === JSON.stringify(installerArgs) &&
+    reexecCall[2].stdio === 'inherit' && reexecCall[2].timeout >= require(ROOT + '/runtime.js').DEPENDENCY_TIMEOUT_MS &&
+    reexecContext.process.exitCode === 0 && registered(reexecFixture).every(value => !value));
   for (const operation of ['stage', 'promote']) {
     const fixture = installFixture();
     fixture.run('install');
@@ -912,6 +1051,31 @@ async function remainingChecks() {
   if (targetAst) fs.rmSync(path.join(unchanged.source, 'bin', targetAst), { force: true });
   r = unchanged.run('install');
   check('missing optional build assets retain previous deployment', r.code === 0 && fs.existsSync(path.join(unchanged.live, 'explore-ui/dist/index.html')) && fs.existsSync(path.join(unchanged.live, AST_REL)), r.out);
+  const partialUi = installFixture();
+  partialUi.run('install');
+  fs.rmSync(path.join(partialUi.source, 'explore-ui/dist'), { recursive: true });
+  fs.mkdirSync(path.join(partialUi.source, 'explore-ui/dist'), { recursive: true });
+  fs.writeFileSync(path.join(partialUi.source, 'explore-ui/dist', 'orphan.js'), 'incomplete build');
+  r = partialUi.run('install');
+  check('partial UI directory without index.html retains the last complete deployment bundle', r.code === 0 &&
+    fs.readFileSync(path.join(partialUi.live, 'explore-ui/dist/index.html'), 'utf8') === '<html>fixture UI</html>' &&
+    !fs.existsSync(path.join(partialUi.live, 'explore-ui/dist/orphan.js')), r.out);
+  const optionalPackage = installFixture(['.claude'], { provisionDeployment: false });
+  fs.rmSync(path.join(optionalPackage.source, '.git'), { recursive: true });
+  fs.rmSync(path.join(optionalPackage.source, 'rust'), { recursive: true });
+  fs.rmSync(path.join(optionalPackage.source, 'explore-ui/dist'), { recursive: true });
+  fs.rmSync(path.join(optionalPackage.source, AST_REL), { force: true });
+  if (targetAst) fs.rmSync(path.join(optionalPackage.source, 'bin', targetAst), { force: true });
+  const optionalManifest = readJsonFor(optionalPackage.source, 'package.json');
+  optionalManifest.name = '@luismateusvargas/caipira';
+  fs.writeFileSync(path.join(optionalPackage.source, 'package.json'), JSON.stringify(optionalManifest));
+  r = optionalPackage.run('install');
+  check('npm package missing optional AST and UI still registers selected clients', r.code === 0 &&
+    fs.existsSync(path.join(optionalPackage.home, '.claude.json')) && /\[warn\].*(AST|caipira-ast)/.test(r.out) && /\[warn\].*(UI|explore)/.test(r.out), r.out);
+  const deployedReinstall = spawnSync(deploymentRuntimePaths(optionalPackage.live).node, [path.join(optionalPackage.live, 'install.js'), 'install'],
+    { env: optionalPackage.env, encoding: 'utf8', timeout: 30000 });
+  check('deployment reinstall with runtime manifest and no optional assets is not mistaken for npm package', deployedReinstall.status === 0 &&
+    /\[warn\]/.test(`${deployedReinstall.stdout}${deployedReinstall.stderr}`), deployedReinstall.stdout + deployedReinstall.stderr);
   const sameHome = installFixture();
   sameHome.env.CAIPIRA_HOME = sameHome.source;
   r = sameHome.run('install');
@@ -973,11 +1137,14 @@ async function remainingChecks() {
   fs.mkdirSync(workspace);
   fs.writeFileSync(path.join(workspace, 'package.json'), '{}');
   const registration = JSON.parse(fs.readFileSync(path.join(shared.home, '.claude.json'))).mcpServers.caipira;
+  check('registered MCP and hook interpreter paths are owned by deployment', registration.command === deploymentRuntimePaths(shared.live).node &&
+    JSON.parse(fs.readFileSync(path.join(shared.home, '.claude/settings.json'))).hooks.UserPromptSubmit[0].hooks[0].command.includes(deploymentRuntimePaths(shared.live).node));
+  fs.renameSync(shared.source, `${shared.source}-moved`);
   const hook = JSON.parse(fs.readFileSync(path.join(shared.home, '.claude/settings.json'))).hooks.UserPromptSubmit[0].hooks[0].command;
   const sessionId = 'installed-shared-session';
   const captured = spawnSync(hook, { shell: IS_WINDOWS ? 'cmd.exe' : '/bin/sh', cwd: workspace, env: parentEnv,
     input: JSON.stringify({ session_id: sessionId, cwd: workspace, prompt: 'shared memory probe' }), encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
-  check('registered UserPromptSubmit captures session without inherited CAIPIRA_HOME', !captured.error && captured.status === 0 && fs.existsSync(path.join(shared.home, '.caipira/database/master.db')), captured.stderr || captured.error);
+  check('registered UserPromptSubmit captures session after checkout moves without inherited CAIPIRA_HOME', !captured.error && captured.status === 0 && fs.existsSync(path.join(shared.home, '.caipira/database/master.db')), captured.stderr || captured.error);
   const sessions = await registeredSessions(registration, parentEnv, workspace);
   check('registered MCP sees session captured by hook', sessions.length === 1 && sessions[0].id === sessionId, JSON.stringify(sessions));
   const status = spawnSync(launchCommand, [...launchArgs, 'status'], { cwd: workspace, env: parentEnv, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
@@ -1013,22 +1180,15 @@ async function remainingChecks() {
     }
   }
 
-  console.log('\n10. supported Node runtime contract');
+  console.log('\n10. unsupported archive refusal and optional package assets');
   const compatibilityFixture = installFixture([], { provisionDeployment: false });
-  for (const major of [20, 22, 24]) {
-    const context = installerContext(compatibilityFixture, { process: { versions: { node: `${major}.0.0` } } });
-    check(`Node ${major} is supported`, vm.runInContext('hasSupportedNodeMajor()', context));
-  }
-  let incompatibleOutput = '';
+  let unsupportedError;
   const incompatible = installerContext(compatibilityFixture, {
-    process: {
-      versions: { node: '26.0.0' },
-      stdout: { on() {}, write: message => { incompatibleOutput += message; }, isTTY: false }
-    }
+    './runtime': { ...require(ROOT + '/runtime.js'), selectArchive: () => { throw new Error('unsupported Node target fixture; supported targets: linux-x64'); } }
   });
-  await vm.runInContext('install()', incompatible);
-  check('unsupported Node exits before writing deployment files', incompatible.process.exitCode === 1 &&
-    /Node 26\.0\.0 is unsupported; use Node 20, 22, or 24/.test(incompatibleOutput) && !fs.existsSync(compatibilityFixture.live));
+  try { await vm.runInContext('install()', incompatible); } catch (error) { unsupportedError = error; }
+  check('unsupported target refuses before deployment or configuration writes', /unsupported Node target/.test(unsupportedError?.message || '') &&
+    !fs.existsSync(compatibilityFixture.live) && !fs.existsSync(path.join(compatibilityFixture.home, '.local')) && registered(compatibilityFixture).every(value => !value));
 
   fs.rmSync(path.join(compatibilityFixture.source, '.git'), { recursive: true, force: true });
   fs.rmSync(path.join(compatibilityFixture.source, AST_REL), { force: true });

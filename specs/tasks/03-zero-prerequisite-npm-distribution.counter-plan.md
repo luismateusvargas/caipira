@@ -2,7 +2,14 @@
 
 Original task spec: [03-zero-prerequisite-npm-distribution.md](03-zero-prerequisite-npm-distribution.md)
 Review evidence: independent review, 2026-10-22 (probes below), plus the user's requirement decisions of the same date.
-Status: ready
+Status: in progress
+
+## Execution tracking
+
+- [~] Y1: pinned runtime provisioning and transactional dependencies.
+- [ ] Y2–Y6: deployment entry points, registration paths, optional assets and doctor.
+- [ ] Y7–Y9: static Linux assets, recorded client selection, workflow and README.
+- [ ] Linux acceptance, full suites, hygiene and independent review.
 
 Reviewed baseline: `255159fd002072c32ce4ef5283ad03d7fb9e97d2`.
 Reviewed completion: `29b43138894237b1f39236a637353faf97376614`.

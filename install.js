@@ -13,6 +13,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { logError, readErrors, DEFAULT_LOG_LIMIT } = require('./errors');
+const RUNTIME = require('./runtime');
 
 process.stdout.on('error', error => {
   if (error.code === 'EPIPE') process.exit();
@@ -47,15 +48,15 @@ const SHELL_STARTUP_FILES = {
 };
 const POSIX_PATH_COMMAND = 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac';
 const FISH_PATH_COMMAND = 'contains -- $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH';
-const NODE_RELEASE = `node-v22.20.0-${IS_WINDOWS ? 'win' : process.platform}-${process.arch}`;
-const NODE_DIR = path.join(ROOT, 'node22', NODE_RELEASE);
-const HOME_NODE_DIR = path.join(HOME_DIR, 'node22', NODE_RELEASE);
-const HOME_NODE = IS_WINDOWS ? path.join(HOME_NODE_DIR, 'node.exe') : path.join(HOME_NODE_DIR, 'bin', 'node');
-const CHECKOUT_NODE = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
-const NODE_BIN = process.execPath || (fs.existsSync(HOME_NODE) ? HOME_NODE : CHECKOUT_NODE);
-const NPM_CLI = IS_WINDOWS
-  ? path.join(NODE_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js')
-  : path.join(NODE_DIR, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+const NODE_VERSION = RUNTIME.NODE_VERSION;
+const CLIENT_SELECTION_FILE = RUNTIME.CLIENT_SELECTION_FILE;
+let NODE_ARCHIVE;
+let NODE_ARCHIVE_ERROR;
+try { NODE_ARCHIVE = RUNTIME.selectArchive(); }
+catch (error) { NODE_ARCHIVE_ERROR = error; }
+const DEPLOYMENT_RUNTIME = NODE_ARCHIVE ? RUNTIME.runtimePaths(HOME_DIR, NODE_ARCHIVE) : { node: '', npm: '' };
+const NODE_BIN = DEPLOYMENT_RUNTIME.node;
+const NPM_CLI = DEPLOYMENT_RUNTIME.npm;
 const EXPLORE_UI_DIR = path.join(ROOT, 'explore-ui');
 const EXPLORE_DIST = path.join(EXPLORE_UI_DIR, 'dist');
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
@@ -74,7 +75,6 @@ const ANTIGRAVITY_EVENTS = [
 ];
 const MODEL_SOURCE_DIR = path.join(ROOT, 'models', 'Xenova', 'all-MiniLM-L6-v2');
 const MODEL_DIR = path.join(HOME_DIR, 'models', 'Xenova', 'all-MiniLM-L6-v2');
-const SUPPORTED_NODE_MAJORS = new Set([20, 22, 24]);
 let AST_BINARY_SOURCE = null;
 
 // Claude Code hook events -> Caipira lifecycle events.
@@ -180,17 +180,12 @@ function isDevelopmentCheckout() {
 }
 
 function isNpmDistribution() {
-  if (isDevelopmentCheckout()) return false;
+  if (realPath(ROOT) === realPath(HOME_DIR) || isDevelopmentCheckout()) return false;
   try {
     return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).name === '@luismateusvargas/caipira';
   } catch {
     return false;
   }
-}
-
-function hasSupportedNodeMajor() {
-  const major = Number(String(process.versions?.node || '').split('.')[0]);
-  return SUPPORTED_NODE_MAJORS.has(major);
 }
 
 function readJson(file, fallback) {
@@ -287,47 +282,9 @@ function replaceDependencyDirectory(source, destination, validate) {
 }
 
 function installDependencies() {
-  const sourceModules = path.join(ROOT, 'node_modules');
-  const sourceMarker = path.join(sourceModules, 'better-sqlite3', 'package.json');
-  const deployedModules = path.join(HOME_DIR, 'node_modules');
-  const deployedMarker = path.join(deployedModules, 'better-sqlite3', 'package.json');
-  if (isNpmDistribution()) {
-    if (fs.existsSync(sourceModules)) {
-      fs.mkdirSync(HOME_DIR, { recursive: true });
-      copyMissingTree(sourceModules, deployedModules);
-    }
-    if (!fs.existsSync(sourceMarker)) {
-      if (fs.existsSync(deployedMarker)) {
-        ok('dependencies already installed');
-        return;
-      }
-      throw new Error('the npm-installed better-sqlite3 prebuild is missing; reinstall with Node.js 20, 22, or 24, or run caipira with the bundled Node 22 runtime');
-    }
-    if (!fs.existsSync(deployedMarker)) throw new Error(`better-sqlite3 could not be copied to ${deployedModules}`);
-    const sourceMetadata = JSON.parse(fs.readFileSync(sourceMarker, 'utf8'));
-    let deployedMetadata;
-    try { deployedMetadata = JSON.parse(fs.readFileSync(deployedMarker, 'utf8')); } catch {}
-    let deployedWorks = false;
-    if (deployedMetadata?.version === sourceMetadata.version) {
-      try { verifyNativeSqlite(); deployedWorks = true; } catch {}
-    }
-    if (!deployedWorks) {
-      replaceDependencyDirectory(path.dirname(sourceMarker), path.dirname(deployedMarker), verifyNativeSqlite);
-    }
-    ok('runtime dependencies synchronized');
-    return;
-  }
-  if (fs.existsSync(sourceMarker)) {
-    ok('dependencies already installed');
-    return;
-  }
-  log('  installing dependencies with the bundled Node 22 runtime...');
-  execFileSync(NODE_BIN, [NPM_CLI, 'install', '--omit=dev'], { cwd: ROOT, stdio: 'inherit' });
-  if (path.resolve(ROOT) !== path.resolve(HOME_DIR)) {
-    copyMissingTree(sourceModules, deployedModules);
-  }
-  if (!fs.existsSync(deployedMarker)) throw new Error(`better-sqlite3 was not installed under ${deployedModules}`);
-  ok('dependencies installed');
+  const nestedManifest = path.join(ROOT, 'runtime');
+  const manifestDirectory = fs.existsSync(path.join(nestedManifest, 'package.json')) ? nestedManifest : ROOT;
+  return RUNTIME.installDependencies(HOME_DIR, manifestDirectory, { paths: DEPLOYMENT_RUNTIME });
 }
 
 function installModelAssets() {
@@ -335,7 +292,7 @@ function installModelAssets() {
   const sourceModel = path.join(MODEL_SOURCE_DIR, 'onnx', 'model_quantized.onnx');
   const deployedModel = path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx');
   if (!fs.existsSync(sourceModel)) {
-    if (isNpmDistribution()) throw new Error('the bundled ONNX model is missing from the npm package');
+    warn('local ONNX model unavailable — semantic embeddings are disabled');
     return;
   }
   if (fs.existsSync(sourceRoot)) {
@@ -347,13 +304,7 @@ function installModelAssets() {
 }
 
 function verifyNativeSqlite() {
-  try {
-    const Database = require(path.join(HOME_DIR, 'node_modules', 'better-sqlite3'));
-    const database = new Database(':memory:');
-    database.close();
-  } catch (error) {
-    throw new Error(`better-sqlite3 cannot load under Node ${process.versions.node}; use Node 20, 22, or 24, or rerun through the bundled Node 22 runtime (${error.message})`, { cause: error });
-  }
+  RUNTIME.verifySqlite(HOME_DIR, DEPLOYMENT_RUNTIME);
 }
 
 function buildAstEngine() {
@@ -375,9 +326,8 @@ function buildAstEngine() {
   }
   const manifest = path.join(CRATE_DIR, 'Cargo.toml');
   if (!fs.existsSync(manifest)) {
-    if (isNpmDistribution()) throw new Error(`prebuilt caipira-ast is missing for ${process.platform}-${process.arch}`);
     journal('build AST', new Error('rust/caipira-ast not found'));
-    warn('rust/caipira-ast not found — AST symbol index unavailable');
+    warn(`prebuilt caipira-ast is missing for ${process.platform}-${process.arch} — AST symbol index unavailable`);
     return;
   }
   if (!isDevelopmentCheckout()) {
@@ -412,7 +362,7 @@ function buildExploreUi() {
     ok(`using prebuilt explore UI at ${EXPLORE_DIST}`);
     return;
   }
-  if (isNpmDistribution()) throw new Error('prebuilt explore-ui/dist/index.html is missing from the npm package');
+  if (isNpmDistribution()) warn('prebuilt explore-ui/dist/index.html is missing — caipira explore will serve the API only');
   if (!fs.existsSync(path.join(EXPLORE_UI_DIR, 'package.json'))) {
     journal('build explore UI', new Error('explore-ui not found'));
     warn('explore-ui not found — caipira explore will serve the API only');
@@ -454,13 +404,13 @@ function deployRuntime() {
     }
     return;
   }
-  const files = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspace.js',
+  const files = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'runtime.js', 'workspace.js',
     'migrate.js', 'compress.js', 'errors.js', 'explore-server.js', 'hooks/universal-hook.js',
-    'install.js', 'package.json', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd']
+    'install.js', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd', 'runtime/package.json', 'runtime/package-lock.json']
     .map(rel => ({ source: path.join(ROOT, rel), rel }));
   const ui = 'explore-ui/dist';
-  if (fs.existsSync(path.join(ROOT, ui))) files.push({ source: path.join(ROOT, ui), rel: ui });
-  else warn(`${ui} unavailable in checkout — existing deployed asset kept`);
+  if (fs.existsSync(path.join(ROOT, ui, 'index.html'))) files.push({ source: path.join(ROOT, ui), rel: ui });
+  else warn(`${ui}/index.html unavailable in checkout — existing deployed asset kept`);
   if (AST_BINARY_SOURCE) files.push({ source: AST_BINARY_SOURCE, rel: binary });
   else if (fs.existsSync(path.join(ROOT, binary))) files.push({ source: path.join(ROOT, binary), rel: binary });
   else warn(`${binary} unavailable in checkout — existing deployed asset kept`);
@@ -993,6 +943,7 @@ function unregister() {
   unregisterCodex();
   unregisterAntigravity();
   unregisterPath();
+  fs.rmSync(path.join(HOME_DIR, CLIENT_SELECTION_FILE), { force: true });
 
   const { DB_DIR } = require('./workspace');
   log(`\nCaipira data under ${DB_DIR} was left untouched.`);
@@ -1058,8 +1009,15 @@ function doctor() {
 
   log('\nCaipira doctor\n');
 
-  check(`bundled Node 22 at ${NODE_BIN}`, fs.existsSync(NODE_BIN), 'reinstall the node22 folder');
-  check('dependencies installed', fs.existsSync(path.join(ROOT, 'node_modules', 'better-sqlite3')), 'run: caipira install');
+  check(`bundled Node ${NODE_VERSION} at ${NODE_BIN}`, RUNTIME.runtimeWorks(NODE_BIN), 'run: caipira install');
+  try {
+    RUNTIME.verifySqlite(HOME_DIR, DEPLOYMENT_RUNTIME);
+    ok('native SQLite opens an in-memory database');
+  } catch (error) {
+    problems++;
+    fail(`runtime SQLite validation — ${error.message}; run: caipira install`);
+  }
+  check('dependencies installed', fs.existsSync(path.join(HOME_DIR, 'node_modules', 'better-sqlite3')), 'run: caipira install');
   check('embedding model present', fs.existsSync(path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx')));
   try {
     ok(`AST engine at ${require('./ast').resolveBinary()}`);
@@ -1085,8 +1043,14 @@ function doctor() {
     fail(`workspace registry — ${error.message}`);
   }
 
-  const detected = detectClients();
-  if (!detected.claude) warn('Claude Code not detected — checks skipped');
+  const recorded = readJson(path.join(HOME_DIR, CLIENT_SELECTION_FILE), null);
+  const detected = recorded && Array.isArray(recorded.clients)
+    ? Object.fromEntries(Object.keys(CLIENTS).map(key => [key, recorded.clients.includes(key)]))
+    : detectClients();
+  if (!detected.claude) {
+    if (recorded) log('  [skip] Claude Code not selected for this install');
+    else warn('Claude Code not detected — checks skipped');
+  }
   else {
     const config = readJson(CLAUDE_JSON, {});
     check('Claude Code MCP server registered in ~/.claude.json', Boolean(config.mcpServers?.caipira), 'run: caipira install');
@@ -1099,7 +1063,10 @@ function doctor() {
 
   // Matches registerCodex(): a machine without Codex is fine, not broken.
   const codexConfig = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : '';
-  if (!detected.codex) warn('Codex not detected — checks skipped');
+  if (!detected.codex) {
+    if (recorded) log('  [skip] Codex not selected for this install');
+    else warn('Codex not detected — checks skipped');
+  }
   else {
     check('Codex MCP server registered', /^\[mcp_servers\.caipira\]/m.test(codexConfig), 'run: caipira install');
     check('Codex free of cavemem references', !/cavemem/i.test(codexConfig), 'run: caipira install');
@@ -1120,7 +1087,10 @@ function doctor() {
     fail(`workspace registry — ${error.message}`);
   }
 
-  if (!detected.antigravity) warn('Antigravity not detected — checks skipped');
+  if (!detected.antigravity) {
+    if (recorded) log('  [skip] Antigravity not selected for this install');
+    else warn('Antigravity not detected — checks skipped');
+  }
   else {
     const antigravity = readJson(ANTIGRAVITY_MCP, {});
     check('Antigravity MCP registered', Boolean(antigravity.mcpServers?.caipira), 'run: caipira install');
@@ -1265,30 +1235,41 @@ function logs() {
 }
 
 async function install() {
-  if (!hasSupportedNodeMajor()) {
-    fail(`Node ${process.versions.node} is unsupported; use Node 20, 22, or 24, or install/run Caipira with the bundled Node 22 runtime.`);
+  let archive;
+  try { archive = RUNTIME.selectArchive(); }
+  catch (error) {
+    fail(error.message);
     process.exitCode = 1;
     return;
   }
   const options = await selectClients(process.argv.slice(3));
   if (!options) return;
-  if (realPath(HOME_DIR) !== realPath(ROOT) && isDevelopmentCheckout()) {
-    const missing = [HOME_NODE, path.join(HOME_DIR, 'node_modules', 'better-sqlite3', 'package.json')]
-      .filter(file => !fs.existsSync(file));
-    if (missing.length) {
-      for (const file of missing) fail(`deployment prerequisite missing: ${file}`);
-      fail(`Provision Node 22 and dependencies in ${HOME_DIR} before installing from a checkout.`);
-      process.exitCode = 1;
-      return;
-    }
-  }
   log('\nInstalling Caipira\n');
+
+  let deployedRuntime;
+  try { deployedRuntime = await RUNTIME.provisionRuntime(HOME_DIR, archive); }
+  catch (error) {
+    fail(`Node ${NODE_VERSION} provisioning — ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (realPath(process.execPath) !== realPath(deployedRuntime.node)) {
+    const args = [path.join(ROOT, 'install.js'), ...process.argv.slice(2)];
+    const result = require('child_process').spawnSync(deployedRuntime.node, args, {
+      stdio: 'inherit', timeout: RUNTIME.DEPENDENCY_TIMEOUT_MS + RUNTIME.DOWNLOAD_TIMEOUT_MS + RUNTIME.EXTRACT_TIMEOUT_MS + 300_000, windowsHide: true
+    });
+    if (result.error) fail(`could not restart installer with bundled Node ${NODE_VERSION}: ${result.error.message}`);
+    process.exitCode = typeof result.status === 'number' ? result.status : 1;
+    return;
+  }
+
   installDependencies();
   verifyNativeSqlite();
   installModelAssets();
   buildAstEngine();
   buildExploreUi();
   deployRuntime();
+  writeJsonAtomic(path.join(HOME_DIR, CLIENT_SELECTION_FILE), { clients: Object.keys(CLIENTS).filter(key => options[key]) });
   ensureDirectories();
   registerPath();
   registerMcpServer(options);
@@ -1296,6 +1277,7 @@ async function install() {
   registerCodex(options);
   registerAntigravity(options);
   registerAntigravityHooks(options);
+  RUNTIME.removeSupersededRuntimes(HOME_DIR, warn);
   log('\nRestart the configured clients to load the MCP server and hooks.');
   log('Verify any time with: caipira doctor\n');
 }
@@ -1317,7 +1299,10 @@ const commands = {
   })
 };
 
-if (!commands[command]) {
+if (NODE_ARCHIVE_ERROR) {
+  process.stderr.write(`[FAIL] ${NODE_ARCHIVE_ERROR.message}\n`);
+  process.exitCode = 1;
+} else if (!commands[command]) {
   log(`Usage: caipira <install [--clients <list>] [--accept-risk]|uninstall|doctor|prune [--apply]|status|logs [--limit N] [--clear]|mode <lite|full|ultra>|explore [--port 4777] [--host 127.0.0.1] [--workspace <path>] [--no-open]>`);
   process.exitCode = 1;
 } else {

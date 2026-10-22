@@ -5,14 +5,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const RUNTIME = require('../runtime');
 
-const NODE_VERSION = '22.20.0';
+const NODE_VERSION = RUNTIME.NODE_VERSION;
 
-function bundledNodePath(homeDir, platform = process.platform, arch = process.arch) {
-  const releasePlatform = platform === 'win32' ? 'win' : platform;
-  const releaseDir = `node-v${NODE_VERSION}-${releasePlatform}-${arch}`;
-  const executable = platform === 'win32' ? 'node.exe' : path.join('bin', 'node');
-  return path.join(homeDir, 'node22', releaseDir, executable);
+function bundledNodePath(homeDir, platform = process.platform, arch = process.arch, report = process.report.getReport()) {
+  return RUNTIME.runtimePaths(homeDir, RUNTIME.selectArchive(platform, arch, report)).node;
 }
 
 function resolveBundledNode(homeDir, platform = process.platform, arch = process.arch) {
@@ -29,20 +27,36 @@ function main(args = process.argv.slice(2)) {
   const homeDir = process.env.CAIPIRA_HOME
     ? path.resolve(process.env.CAIPIRA_HOME)
     : path.join(os.homedir(), '.caipira');
-  const bundledNode = resolveBundledNode(homeDir);
-  const installScript = path.join(__dirname, '..', 'install.js');
-
-  const hostMajor = Number(String(process.versions.node).split('.')[0]);
-  // better-sqlite3 prebuilds are Node-ABI-specific. Keep Node 20 and 24 on
-  // the host runtime that npm installed for; the bundled runtime is Node 22.
-  if (!bundledNode || hostMajor !== 22) {
-    require('../install');
+  if (args[0] === 'install' || !args.length) {
+    const result = spawnSync(process.execPath, [path.join(__dirname, '..', 'install.js'), ...(args.length ? args : ['install'])], { stdio: 'inherit' });
+    if (result.error) {
+      console.error(`[caipira] could not start installer with host Node: ${result.error.message}`);
+      process.exitCode = 1;
+    } else process.exitCode = typeof result.status === 'number' ? result.status : 1;
     return;
   }
 
+  let bundledNode;
+  try { bundledNode = resolveBundledNode(homeDir); }
+  catch (error) {
+    console.error(`[caipira] ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!bundledNode || !RUNTIME.runtimeWorks(bundledNode)) {
+    console.error('[caipira] deployment runtime is missing or invalid; run caipira install first');
+    process.exitCode = 1;
+    return;
+  }
+  const installScript = path.join(homeDir, 'install.js');
+  if (!fs.existsSync(installScript)) {
+    console.error('[caipira] deployment is incomplete; run caipira install first');
+    process.exitCode = 1;
+    return;
+  }
   const result = spawnSync(bundledNode, [installScript, ...args], { stdio: 'inherit' });
   if (result.error) {
-    console.error(`[caipira] could not start bundled Node 22 at ${bundledNode}: ${result.error.message}`);
+    console.error(`[caipira] could not start bundled Node ${NODE_VERSION} at ${bundledNode}: ${result.error.message}`);
     process.exitCode = 1;
     return;
   }

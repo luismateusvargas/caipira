@@ -18,11 +18,11 @@ jobs:
         include:
           - target: linux-x64
             runner: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            cross: false
+            rust_target: x86_64-unknown-linux-musl
+            cross: true
           - target: linux-arm64
             runner: ubuntu-latest
-            rust_target: aarch64-unknown-linux-gnu
+            rust_target: aarch64-unknown-linux-musl
             cross: true
           - target: darwin-arm64
             runner: macos-15
@@ -36,6 +36,8 @@ jobs:
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             cross: false
+    env:
+      NODE_PATH: ${{ github.workspace }}/runtime/node_modules
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -47,17 +49,31 @@ jobs:
           tool: cross
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: '22.23.4'
       - run: cargo test --manifest-path rust/caipira-ast/Cargo.toml
       - run: cargo build --release --manifest-path rust/caipira-ast/Cargo.toml
-      - run: npm ci --no-audit --no-fund
+      - run: npm --prefix runtime ci --omit=dev --no-audit --no-fund
       - run: npm test
       - run: npm --prefix explore-ui ci --no-audit --no-fund
       - run: npm --prefix explore-ui run build
-      - name: Cross-build Linux ARM64
+      - name: Cross-build static Linux binary
         if: matrix.cross
-        run: cross build --release --manifest-path rust/caipira-ast/Cargo.toml --target ${{ matrix.rust_target }}
-      - name: Stage cross-built Linux ARM64 binary
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cross build --locked --release --manifest-path rust/caipira-ast/Cargo.toml --target ${{ matrix.rust_target }}
+      - name: Reject dynamically linked Linux binaries
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="rust/caipira-ast/target/${{ matrix.rust_target }}/release/caipira-ast"
+          headers="$(readelf --program-headers "$binary")"
+          dynamic="$(readelf --dynamic "$binary")"
+          if [[ "$headers" == *INTERP* || "$dynamic" == *'(NEEDED)'* ]]; then
+            printf '%s\n' "Linux AST binary is dynamically linked: $binary" >&2
+            exit 1
+          fi
+      - name: Stage static Linux binary
         if: matrix.cross
         run: |
           mkdir -p artifact
@@ -82,33 +98,31 @@ jobs:
           path: artifact/caipira-ast-*
           if-no-files-found: error
 
-  node-compatibility:
-    name: Verify Node ${{ matrix.node }}
+  node-runtime:
+    name: Verify pinned Node 22 runtime
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node: [20, 22, 24]
+    env:
+      NODE_PATH: ${{ github.workspace }}/runtime/node_modules
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
+          node-version: '22.23.4'
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --manifest-path rust/caipira-ast/Cargo.toml
-      - run: npm ci --no-audit --no-fund
+      - run: npm --prefix runtime ci --omit=dev --no-audit --no-fund
       - run: node -e "const Db = require('better-sqlite3'); const db = new Db(':memory:'); db.close();"
       - run: npm test
 
   publish:
     name: Assemble and publish scoped package
     runs-on: ubuntu-latest
-    needs: [build-assets, node-compatibility]
+    needs: [build-assets, node-runtime]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: '22.23.4'
           registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v8
         with:
@@ -142,7 +156,7 @@ jobs:
       - name: Verify npm package contents
         run: |
           npm pack --dry-run --json > pack-manifest.json
-          node -e "const fs=require('fs'); const manifest=JSON.parse(fs.readFileSync('pack-manifest.json','utf8')); const pack=Array.isArray(manifest)?manifest[0]:Object.values(manifest)[0]; if(!pack) throw new Error('npm pack returned an empty manifest'); const files=new Set(pack.files.map(file=>file.path)); const expected=['bin/caipira-cli.js','bin/caipira-ast-linux-x64','bin/caipira-ast-linux-arm64','bin/caipira-ast-darwin-arm64','bin/caipira-ast-darwin-x64','bin/caipira-ast-win32-x64.exe','caipira.sh','caipira.cmd','hooks/universal-hook.js','explore-ui/dist/index.html','models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx']; const missing=expected.filter(file=>!files.has(file)); if(missing.length) throw new Error('npm pack omitted: '+missing.join(', ')); if([...files].some(file=>file.startsWith('rust/')||file.startsWith('test/')||file.includes('node_modules/'))) throw new Error('npm package includes development files');"
+          node -e "const fs=require('fs'); const manifest=JSON.parse(fs.readFileSync('pack-manifest.json','utf8')); const pack=Array.isArray(manifest)?manifest[0]:Object.values(manifest)[0]; if(!pack) throw new Error('npm pack returned an empty manifest'); const files=new Set(pack.files.map(file=>file.path)); const expected=['runtime.js','runtime/package.json','runtime/package-lock.json','bin/caipira-cli.js','bin/caipira-ast-linux-x64','bin/caipira-ast-linux-arm64','bin/caipira-ast-darwin-arm64','bin/caipira-ast-darwin-x64','bin/caipira-ast-win32-x64.exe','caipira.sh','caipira.cmd','hooks/universal-hook.js','explore-ui/dist/index.html','models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx']; const missing=expected.filter(file=>!files.has(file)); if(missing.length) throw new Error('npm pack omitted: '+missing.join(', ')); if([...files].some(file=>file.startsWith('rust/')||file.startsWith('test/')||file.includes('node_modules/'))) throw new Error('npm package includes development files');"
       - name: Verify tag matches package version
         run: |
           tag_version="v$(node -p 'require("./package.json").version')"
