@@ -12,7 +12,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { logError, readErrors } = require('./errors');
+const { logError, readErrors, DEFAULT_LOG_LIMIT } = require('./errors');
+
+process.stdout.on('error', error => {
+  if (error.code === 'EPIPE') process.exit(0);
+  throw error;
+});
 
 function journal(operation, error) {
   logError({ component: 'install', operation, error });
@@ -551,7 +556,6 @@ function aggregateWorkspaces() {
     try {
       counts = workspaceCounts(row.db_file);
     } catch (error) {
-      journal('read workspace counts', error);
       broken.push({ row, error });
       continue;
     }
@@ -581,7 +585,6 @@ function doctor() {
   try {
     ok(`AST engine at ${require('./ast').resolveBinary()}`);
   } catch (error) {
-    journal('doctor AST', error);
     warn('caipira-ast not built — AST symbol index unavailable (run: caipira install with cargo on PATH)');
   }
   if (fs.existsSync(path.join(EXPLORE_DIST, 'index.html'))) ok(`explore UI at ${EXPLORE_DIST}`);
@@ -600,7 +603,6 @@ function doctor() {
     if (missing.length) warn(`${missing.length} registered workspace database(s) missing — re-created on next use`);
   } catch (error) {
     problems++;
-    journal('doctor workspace registry', error);
     fail(`workspace registry — ${error.message}`);
   }
 
@@ -632,7 +634,6 @@ function doctor() {
       `${dangling.length} row(s) whose root is gone — run: caipira prune --apply`);
   } catch (error) {
     problems++;
-    journal('doctor dangling workspaces', error);
     fail(`workspace registry — ${error.message}`);
   }
 
@@ -755,7 +756,7 @@ function status() {
  * @throws {Error} For invalid flags or an unreadable journal.
  */
 function logs() {
-  let limit = 20;
+  let limit = DEFAULT_LOG_LIMIT;
   let clear = false;
   const args = process.argv.slice(3);
   for (let i = 0; i < args.length; i++) {

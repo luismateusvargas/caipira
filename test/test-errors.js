@@ -121,7 +121,7 @@ test('doctor and status report zero errors and warn when the journal is non-empt
   assert.match(cli('status').stdout, /recent errors:\s+1/);
   assert.match(cli('doctor').stdout, /\[warn\] 1 recent logged error\(s\)/);
 });
-test('AST subprocess failures are journaled at the bridge with the matching reproduction operation', () => {
+test('AST subprocess failures name the missing absolute binary in the reproduction command', () => {
   readErrors({ clear: true });
   const child = spawnSync(process.execPath, ['-e', `
     try { require('./ast').parseFileAst(process.cwd(), 'errors.js'); }
@@ -132,7 +132,92 @@ test('AST subprocess failures are journaled at the bridge with the matching repr
   assert.equal(entries.length, 1);
   assert.equal(entries[0].component, 'ast');
   assert.equal(entries[0].error.code, 'binary_missing');
-  assert.match(entries[0].repro, /caipira-ast parse-file.*--file src\/example.js/);
+  const quoted = `'${path.join(home, 'missing-parser').replace(/'/g, "'\\''")}'`;
+  assert.ok(entries[0].repro.startsWith(quoted + ' parse-file '), entries[0].repro);
+  assert.match(entries[0].repro, /--file src\/example.js/);
+  assert.equal(entries[0].repro.includes('--db /tmp/'), false);
+});
+test('AST reproduction commands retain a resolved executable and quote spaces and apostrophes', () => {
+  readErrors({ clear: true });
+  const parser = path.join(home, "parser's executable");
+  fs.copyFileSync(process.execPath, parser);
+  fs.chmodSync(parser, 0o755);
+  const child = spawnSync(process.execPath, ['-e', `
+    const ast = require('./ast');
+    try { ast.parseFileAst(process.cwd(), 'errors.js'); } catch { }
+    try { ast.syncWorkspaceAst(process.cwd(), process.env.CAIPIRA_HOME + '/repro.db'); } catch { }
+    try { ast.updateFileAst(process.cwd(), process.env.CAIPIRA_HOME + '/repro.db', 'errors.js'); } catch { }
+  `], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, CAIPIRA_AST_BIN: parser }, timeout: 10000 });
+  assert.equal(child.status, 0, child.stderr);
+  const entries = readErrors();
+  assert.equal(entries.length, 3);
+  const executable = `'${parser.replace(/'/g, "'\\''")}'`;
+  for (const entry of entries) {
+    assert.ok(entry.repro.startsWith(executable + ' '), entry.repro);
+    assert.equal(entry.repro.includes('--db /tmp/'), false);
+    if (entry.operation !== 'parse-file') assert.ok(entry.repro.includes('--db /path/to/repro.db'), entry.repro);
+    if (process.platform !== 'win32') {
+      const syntax = spawnSync('/bin/sh', ['-n'], { input: entry.repro, encoding: 'utf8' });
+      assert.equal(syntax.status, 0, syntax.stderr);
+    }
+  }
+});
+test('doctor probes do not create errors for a missing optional AST engine', () => {
+  readErrors({ clear: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = cliWith({ CAIPIRA_AST_BIN: path.join(home, 'missing-parser') }, 'doctor');
+    assert.match(child.stdout, /\[warn\].*caipira-ast not built/);
+    assert.match(child.stdout, /0 recent logged errors/);
+    assert.deepEqual(readErrors(), []);
+  }
+});
+test('status lists a corrupt workspace database without increasing journal counts', () => {
+  readErrors({ clear: true });
+  const workspaceHome = path.join(home, 'corrupt-workspace');
+  fs.mkdirSync(workspaceHome);
+  const setup = spawnSync(process.execPath, ['-e', `
+    const fs = require('fs');
+    const ws = require('./workspace').ensureWorkspace(process.cwd());
+    for (const suffix of ['-wal', '-shm']) fs.rmSync(ws.dbFile + suffix, {force: true});
+    fs.writeFileSync(ws.dbFile, 'corrupt workspace database');
+  `], { cwd: ROOT, encoding: 'utf8', env: { ...process.env, CAIPIRA_HOME: workspaceHome }, timeout: 10000 });
+  assert.equal(setup.status, 0, setup.stderr);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = cliWith({ CAIPIRA_HOME: workspaceHome }, 'status');
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /recent errors:\s+0/);
+    assert.match(child.stdout, /\[warn\].*unreadable/);
+    assert.equal(fs.existsSync(path.join(workspaceHome, 'logs', 'errors.jsonl')), false);
+  }
+});
+test('doctor reports a corrupt registry inline without journaling its probes', () => {
+  const corruptHome = path.join(home, 'corrupt-registry');
+  fs.mkdirSync(path.join(corruptHome, 'database'), { recursive: true });
+  fs.writeFileSync(path.join(corruptHome, 'database', 'master.db'), 'corrupt registry');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const child = cliWith({ CAIPIRA_HOME: corruptHome }, 'doctor');
+    assert.equal(child.status, 1);
+    assert.match(child.stdout, /\[FAIL\].*workspace registry/);
+    assert.match(child.stdout, /0 recent logged errors/);
+    assert.equal(fs.existsSync(path.join(corruptHome, 'logs', 'errors.jsonl')), false);
+  }
+});
+test('logs defaults to 20 entries and quietly accepts a closed output pipe', () => {
+  readErrors({ clear: true });
+  for (let i = 0; i < 25; i++) record('pipe entry ' + i);
+  assert.equal(readErrors().length, 20);
+  assert.equal(cli('logs').stdout.split('\n').filter(line => line.includes('Reproduce:')).length, 20);
+  if (process.platform !== 'win32') {
+    // A real head consumer closes its pipe after one line. The producer's
+    // individual status is saved by bash's PIPESTATUS rather than hidden by head.
+    const child = spawnSync('/bin/bash', ['-c',
+      '"$1" "$2" logs | head -1; exit "${PIPESTATUS[0]}"', 'pipe-check', process.execPath, path.join(ROOT, 'install.js')], {
+      encoding: 'utf8', env: process.env, timeout: 10000
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stderr, '');
+  }
+  assert.equal(readErrors({ limit: 100 }).length, 25);
 });
 test('installer command failures are journaled without running installation steps', () => {
   readErrors({ clear: true });

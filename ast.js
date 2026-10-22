@@ -24,6 +24,7 @@ const MAX_BUFFER = 256 * 1024 * 1024;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 500;
 const MAX_TEXT = 500;
+const SYNC_FAILURE_SAMPLES = 3;
 
 const ENGINE_CODES = new Set(['invalid_argument', 'unsupported', 'io', 'database', 'parse']);
 const UPDATE_STATUSES = new Set(['added', 'updated', 'unchanged', 'removed', 'ignored']);
@@ -82,6 +83,16 @@ function resolveBinary() {
     throw new AstEngineError('binary_missing', `caipira-ast not found (looked in ${candidates.join(', ')}) — run: caipira install`);
   }
   return found;
+}
+
+// Readers do not launch an engine, but their diagnostic should still name
+// the executable the bridge would resolve. Failed resolution keeps its candidate.
+function journal(operation, error, binary) {
+  if (!binary) {
+    try { binary = resolveBinary(); }
+    catch { binary = process.env.CAIPIRA_AST_BIN || INSTALLED_BIN; }
+  }
+  logError({ component: 'ast', operation, error, binary: path.resolve(binary) });
 }
 
 function engineFailure(error) {
@@ -202,19 +213,20 @@ function prepareDb(dbFile) {
  * @throws {AstEngineError}
  */
 function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
+  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('dbFile', dbFile);
     prepareDb(dbFile);
-    const stats = checkStats(runEngine(['index', '--workspace', workspaceRoot, '--db', dbFile], opts));
+    binary = path.resolve(opts.bin || resolveBinary());
+    const stats = checkStats(runEngine(['index', '--workspace', workspaceRoot, '--db', dbFile], { ...opts, bin: binary }));
     if (stats.failed) {
-      const sample = (Array.isArray(stats.failures) ? stats.failures : []).slice(0, 3);
-      logError({ component: 'ast', operation: 'index partial',
-        error: new AstEngineError('io', `${stats.failed} unreadable path(s): ${JSON.stringify(sample)}`) });
+      const sample = (Array.isArray(stats.failures) ? stats.failures : []).slice(0, SYNC_FAILURE_SAMPLES);
+      journal('index partial', new AstEngineError('io', `${stats.failed} unreadable path(s): ${JSON.stringify(sample)}`), binary);
     }
     return stats;
   } catch (error) {
-    logError({ component: 'ast', operation: 'index', error });
+    journal('index', error, binary);
     throw error;
   }
 }
@@ -235,16 +247,18 @@ function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
  *   through a symlink, io when it is missing and was never indexed.
  */
 function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
+  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('dbFile', dbFile);
     requireText('filePath', filePath);
     prepareDb(dbFile);
     const args = ['update-file', '--workspace', workspaceRoot, '--db', dbFile, '--file', filePath];
-    return checkUpdate(runEngine(args, opts));
+    binary = path.resolve(opts.bin || resolveBinary());
+    return checkUpdate(runEngine(args, { ...opts, bin: binary }));
   } catch (error) {
     // Non-source and previously unindexed missing files are normal tool edits.
-    if (error.code !== 'unsupported' && error.code !== 'io') logError({ component: 'ast', operation: 'update-file', error });
+    if (error.code !== 'unsupported' && error.code !== 'io') journal('update-file', error, binary);
     throw error;
   }
 }
@@ -258,14 +272,16 @@ function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
  * @throws {AstEngineError} invalid_argument for a path through a symlink.
  */
 function parseFileAst(workspaceRoot, filePath, opts = {}) {
+  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('filePath', filePath);
-    const snapshot = runEngine(['parse-file', '--workspace', workspaceRoot, '--file', filePath], opts);
+    binary = path.resolve(opts.bin || resolveBinary());
+    const snapshot = runEngine(['parse-file', '--workspace', workspaceRoot, '--file', filePath], { ...opts, bin: binary });
     if (!snapshot || !Array.isArray(snapshot.symbols) || !Array.isArray(snapshot.edges)) throw badOutput('snapshot');
     return snapshot;
   } catch (error) {
-    logError({ component: 'ast', operation: 'parse-file', error });
+    journal('parse-file', error, binary);
     throw error;
   }
 }
@@ -293,7 +309,7 @@ const SYMBOL_COLUMNS = ['id', 'path', 'name', 'qualified_name', 'kind', 'is_publ
 function rowToSymbol(row) {
   let params = [];
   try { params = JSON.parse(row.params_json); } catch (error) {
-    logError({ component: 'ast', operation: 'decode parameters', error });
+    journal('decode parameters', error);
   }
   const { params_json: _, ...rest } = row;
   return { ...rest, is_public: row.is_public === 1, params };

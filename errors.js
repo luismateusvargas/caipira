@@ -7,6 +7,8 @@ const { version } = require('./package.json');
 
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_TEXT = 16000;
+const DEFAULT_LOG_LIMIT = 20;
+const REPRO_WORD_MAX_CHARS = 80;
 const recorded = new WeakMap();
 
 function privateText(value) {
@@ -44,8 +46,9 @@ function shellQuote(value) {
 
 // Only synthetic payloads enter a reproduction command. Never persist a prompt,
 // tool result, session id, credential, or arbitrary caller-supplied shell text.
-function reproduction({ component, client, event, operation, payload }) {
-  const word = value => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_/-]{0,79}$/.test(value) ? value : 'unknown';
+function reproduction({ component, client, event, operation, payload, binary }) {
+  const word = value => typeof value === 'string' && value.length <= REPRO_WORD_MAX_CHARS &&
+    /^[a-zA-Z][a-zA-Z0-9_/-]*$/.test(value) ? value : 'unknown';
   const node = shellQuote(process.execPath);
   if (component === 'hook') {
     const c = ['codex', 'claude-code', 'antigravity'].includes(client) ? client : 'unknown';
@@ -68,7 +71,7 @@ function reproduction({ component, client, event, operation, payload }) {
   }
   if (component === 'ast') {
     const subcommand = ['parse-file', 'update-file'].includes(operation) ? operation : 'index';
-    return `caipira-ast ${subcommand} --workspace /path/to/workspace${subcommand === 'parse-file' ? '' : ' --db /tmp/caipira-repro.db'}${subcommand === 'index' ? '' : ' --file src/example.js'}`;
+    return `${shellQuote(binary)} ${subcommand} --workspace /path/to/workspace${subcommand === 'parse-file' ? '' : ' --db /path/to/repro.db'}${subcommand === 'index' ? '' : ' --file src/example.js'}`;
   }
   const command = component === 'explore' ? 'explore --no-open --workspace /path/to/workspace'
     : ['install', 'uninstall', 'doctor', 'status', 'prune', 'logs'].includes(operation) ? operation
@@ -81,7 +84,8 @@ function reproduction({ component, client, event, operation, payload }) {
  * itself is deliberately ignored so diagnostics never break a client protocol.
  * The same Error reported by several boundaries is recorded only once.
  * @param {{component: 'hook'|'mcp'|'ast'|'explore'|'install', operation: string,
- *   client?: string, event?: string, error: unknown, payload?: object, args?: string[]}} details
+ *   client?: string, event?: string, error: unknown, payload?: object, args?: string[],
+ *   binary?: string}} details Absolute AST executable path when component is ast.
  * @returns {object|null} The saved record, or null if the journal is unavailable.
  */
 function logError(details) {
@@ -123,7 +127,7 @@ function logError(details) {
  * @throws {RangeError} For an invalid limit.
  * @throws {Error} When existing journals cannot be read or cleared.
  */
-function readErrors({ limit = 20, clear = false } = {}) {
+function readErrors({ limit = DEFAULT_LOG_LIMIT, clear = false } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError('limit must be a non-negative integer');
   const files = [journalPath(), `${journalPath()}.1`];
   const entries = [];
@@ -144,4 +148,4 @@ function readErrors({ limit = 20, clear = false } = {}) {
   return entries.slice(0, limit);
 }
 
-module.exports = { logError, readErrors };
+module.exports = { logError, readErrors, DEFAULT_LOG_LIMIT };

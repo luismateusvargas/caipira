@@ -17,6 +17,9 @@ try {
   ({ ensureWorkspace, openWorkspaceDb, machineId, listWorkspaces, canonicalKey } = require('./workspace'));
   ({ FactStore, searchWorkspaces } = require('./facts'));
   ({ syncWorkspaceAst, updateFileAst, queryWorkspaceSymbols, inspectSymbol } = require('./ast'));
+  // Force the lazy native binding load inside this guarded startup boundary.
+  const Database = require('better-sqlite3');
+  new Database(':memory:').close();
 } catch (error) {
   moduleFailure = error;
   journal('load modules', error);

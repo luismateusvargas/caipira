@@ -740,9 +740,12 @@ console.log('\n23. native dependency and process failures always acknowledge and
   const preload = path.join(scratch, 'failures.cjs');
   fs.writeFileSync(preload, `
     const mode = process.env.CAIPIRA_TEST_FAILURE;
-    const failure = () => Object.assign(new Error('synthetic ' + mode + ' <private>hidden</private>'),
+    const failure = () => Object.assign(new Error('synthetic ' + mode +
+      (mode === 'native' ? ' NODE_MODULE_VERSION 127 requires NODE_MODULE_VERSION 147' : '') + ' <private>hidden</private>'),
       { code: mode === 'missing' ? 'MODULE_NOT_FOUND' : mode === 'native' ? 'ERR_DLOPEN_FAILED' : 'EIO' });
-    if (mode === 'native' || mode === 'missing') {
+    if (mode === 'native') {
+      process.dlopen = () => { throw failure(); };
+    } else if (mode === 'missing') {
       const Module = require('module'), load = Module._load;
       Module._load = function(id, ...args) {
         if (id === 'better-sqlite3') throw failure();
@@ -773,6 +776,7 @@ console.log('\n23. native dependency and process failures always acknowledge and
       const entries = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
       check(`${mode}, ${client}: one structured, redacted error`, entries.length === 1 && entries[0].component === 'hook' &&
         entries[0].client === client && entries[0].env.abi === process.versions.modules &&
+        (mode !== 'native' || entries[0].error.message.includes('NODE_MODULE_VERSION')) &&
         !JSON.stringify(entries).includes('hidden') && entries[0].repro.includes('--client ' + client), JSON.stringify(entries));
     }
   }

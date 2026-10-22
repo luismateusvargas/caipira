@@ -14,6 +14,10 @@ function loadModules() {
   ({ buildInjection, buildDriftNotice, selectFacts, renderInjection, PROMPT_BUDGET_CHARS, STARTUP_BUDGET_CHARS } = require('../inject'));
   ({ FactStore, AstRefreshScope } = require('../facts'));
   ({ syncWorkspaceAst, updateFileAst } = require('../ast'));
+  // The addon loads on construction, not require(): probe it before workspace
+  // fallback can obscure the original native ABI error with a second failure.
+  const Database = require('better-sqlite3');
+  new Database(':memory:').close();
 }
 
 let activeEvent = '';

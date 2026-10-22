@@ -395,24 +395,25 @@ const { call, tool } = server;
   console.log('\n10. native module failure leaves MCP discovery and JSON-RPC errors usable');
   const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-native-'));
   const preload = path.join(nativeHome, 'native.cjs');
-  fs.writeFileSync(preload, `const Module = require('module'), load = Module._load;
-    Module._load = function(id, ...args) {
-      if (id === 'better-sqlite3') throw Object.assign(new Error('synthetic ABI failure <private>hidden</private>'), {code: 'ERR_DLOPEN_FAILED'});
-      return load.call(this, id, ...args);
+  fs.writeFileSync(preload, `process.dlopen = () => {
+      throw Object.assign(new Error('NODE_MODULE_VERSION 127 requires NODE_MODULE_VERSION 147 <private>hidden</private>'), {code: 'ERR_DLOPEN_FAILED'});
     };`);
   const broken = startServer({ CAIPIRA_HOME: nativeHome, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, CAIPIRA_DEBUG: '1' });
   try {
     const init = await broken.call('initialize', INITIALIZE);
     check('native failure still initializes MCP', init.result?.serverInfo.version === require('../package.json').version, JSON.stringify(init));
-    const response = await broken.call('tools/call', { name: 'list_sessions', arguments: {} });
-    check('native failure returns a protocol error', response.jsonrpc === '2.0' && response.error?.code === -32000, JSON.stringify(response));
-    check('native failure keeps dependency details out of the client response', !JSON.stringify(response).includes('hidden') &&
-      response.error.message.includes('caipira logs'), JSON.stringify(response));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await broken.call('tools/call', { name: 'list_sessions', arguments: {} });
+      check(`native failure call ${attempt + 1} returns a protocol error`, response.jsonrpc === '2.0' && response.error?.code === -32000, JSON.stringify(response));
+      check(`native failure call ${attempt + 1} keeps dependency details out of the client response`,
+        response.error?.message === 'Caipira storage unavailable; inspect caipira logs', JSON.stringify(response));
+    }
     const ping = await broken.call('ping', {});
     check('native failure keeps the server responsive', Boolean(ping.result), JSON.stringify(ping));
     const entries = fs.readFileSync(path.join(nativeHome, 'logs', 'errors.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     check('native failure is journaled once with sanitized metadata', entries.length === 1 && entries[0].component === 'mcp' &&
-      entries[0].error.code === 'ERR_DLOPEN_FAILED' && !JSON.stringify(entries).includes('hidden'), JSON.stringify(entries));
+      entries[0].error.code === 'ERR_DLOPEN_FAILED' && entries[0].error.message.includes('NODE_MODULE_VERSION') &&
+      !JSON.stringify(entries).includes('hidden'), JSON.stringify(entries));
     const logs = require('child_process').spawnSync(NODE, [ROOT + '/install.js', 'logs'], {
       encoding: 'utf8', env: { ...process.env, CAIPIRA_HOME: nativeHome, NODE_OPTIONS: `--require=${preload}` }, timeout: 10000
     });

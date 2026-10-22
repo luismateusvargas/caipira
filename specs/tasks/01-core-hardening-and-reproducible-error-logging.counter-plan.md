@@ -2,7 +2,7 @@
 
 Original task spec: [01-core-hardening-and-reproducible-error-logging.md](01-core-hardening-and-reproducible-error-logging.md)
 Review evidence: independent review, 2026-10-22 (findings and probes below).
-Status: ready
+Status: implemented — pending independent review
 
 Reviewed baseline: `3fb1c54debdfad3e04ea69d67db928a7d2d481d9`.
 Reviewed completion: `ebdb66528e87b567d0242c24927a2ce048d65eba`.
@@ -73,3 +73,16 @@ Rust and UI checks are not needed, since neither changes. Completion means F1–
 ## Blockers
 
 None.
+
+## Implementation evidence
+
+- Baseline checkpoint: `78f228eb0e67f939341f04ea022936e22387e9fa`.
+- C1: hook and MCP startup now open and close an in-memory SQLite database inside their existing guarded loader. The native fixtures throw from `process.dlopen`; the missing-module hook fixture still throws at require time. The MCP fixture calls `list_sessions` twice and checks the exact safe error response and one journal entry.
+- Before the fix, the journal/CLI regressions had six failures and MCP had three; the real system Node v26.10.0 / ABI 147 probe produced two entries per hook run and three MCP entries, including raw tool errors. After the fix, all three hook clients return the expected acknowledgement with exit 0 and one entry containing `NODE_MODULE_VERSION`. MCP initializes, answers ping, returns the safe storage error twice, and retains one ABI entry after the idle backfill timer. Both real-runtime probes used disposable homes; normal execution remains on bundled Node 22.
+- C2: removed only the four specified diagnostic-probe journal calls. Twice-run missing-AST doctor, corrupt-workspace status, and corrupt-registry doctor scenarios keep zero retained errors while preserving their inline warning/failure output. The existing non-zero warning check also passes.
+- C3: AST boundaries pass their absolute resolved executable (or the missing override/installed candidate) as `binary`; reproduction commands shell-quote it and use `/path/to/repro.db`. Tests cover missing and resolved executables, spaces/apostrophes, all three write/parse operations, and `/bin/sh -n`. The temporary executable itself can live under `/var/tmp`; checks reject temporary database arguments rather than rejecting a legitimate executable path.
+- C4: the CLI stdout handler exits quietly with code 0 for EPIPE and rethrows other stdout errors. A real `logs | head -1` check captures the producer's own status, checks empty stderr, and verifies the retained journal count is unchanged.
+- C5: `DEFAULT_LOG_LIMIT` is shared by the journal reader and CLI; `SYNC_FAILURE_SAMPLES` and `REPRO_WORD_MAX_CHARS` name the existing sample and word limits. Defaults remain 20 entries, three sample paths, and 80 characters per word.
+- Final verification: `TMPDIR=/var/tmp NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **848 checks, 0 failures** (18/33/87/100/90/167/21/141/191). `git diff --check` also passed.
+- Changed runtime/test paths: `ast.js`, `errors.js`, `hooks/universal-hook.js`, `install.js`, `mcp.js`, `test/test-errors.js`, `test/test-hook.js`, and `test/test-mcp.js`. No implementation scope deviations; this evidence section records the handoff. Rust/UI checks were not needed for these JavaScript changes.
+- Limits: Linux execution verified; Windows/macOS and live runtime deployment remain untested. Independent review is still required; no approval tag is claimed by the implementation checkpoint.
