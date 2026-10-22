@@ -28,6 +28,16 @@ const ARCHIVES = Object.freeze(Object.fromEntries([
   const base = target.endsWith('-musl') ? 'https://unofficial-builds.nodejs.org/download/release' : 'https://nodejs.org/dist';
   return [target, Object.freeze({ target, release, file, sha256, url: `${base}/v${NODE_VERSION}/${file}` })];
 })));
+const SUPPORTED_BINARY_TARGETS = new Set([
+  'linux-x64', 'linux-arm64', 'darwin-arm64', 'darwin-x64', 'win32-x64'
+]);
+
+/** @param {string} [platform] Host platform. @param {string} [arch] Host architecture. @returns {string|null} Packaged caipira-ast asset name, or null when none ships. */
+function platformBinaryName(platform = process.platform, arch = process.arch) {
+  const target = `${platform}-${arch}`;
+  if (!SUPPORTED_BINARY_TARGETS.has(target)) return null;
+  return `caipira-ast-${target}${platform === 'win32' ? '.exe' : ''}`;
+}
 
 /**
  * Selects the exact supported archive before any filesystem writes.
@@ -217,5 +227,5 @@ function removeSupersededRuntimes(home, warn) {
 }
 
 module.exports = { NODE_VERSION, ARCHIVES, DOWNLOAD_TIMEOUT_MS, EXTRACT_TIMEOUT_MS, DEPENDENCY_TIMEOUT_MS,
-  PROBE_TIMEOUT_MS, CLIENT_SELECTION_FILE, selectArchive, runtimePaths, runtimeWorks, provisionRuntime,
+  PROBE_TIMEOUT_MS, CLIENT_SELECTION_FILE, platformBinaryName, selectArchive, runtimePaths, runtimeWorks, provisionRuntime,
   verifySqlite, installDependencies, removeSupersededRuntimes };

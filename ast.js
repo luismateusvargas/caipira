@@ -14,11 +14,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { ROOT, openWorkspaceDb } = require('./workspace');
 const { logError } = require('./errors');
+// Dependency-free, so install can name packaged assets before dependencies exist.
+const { platformBinaryName } = require('./runtime');
 
 const BIN_NAME = process.platform === 'win32' ? 'caipira-ast.exe' : 'caipira-ast';
-const SUPPORTED_BINARY_TARGETS = new Set([
-  'linux-x64', 'linux-arm64', 'darwin-arm64', 'darwin-x64', 'win32-x64'
-]);
 const CRATE_DIR = path.join(__dirname, 'rust', 'caipira-ast');
 const INSTALLED_BIN = path.join(ROOT, 'bin', BIN_NAME);
 const LOCAL_BIN = path.join(__dirname, 'bin', BIN_NAME);
@@ -60,12 +59,6 @@ function isExecutable(file) {
   } catch {
     return false;
   }
-}
-
-function platformBinaryName(platform = process.platform, arch = process.arch) {
-  const target = `${platform}-${arch}`;
-  if (!SUPPORTED_BINARY_TARGETS.has(target)) return null;
-  return `caipira-ast-${target}${platform === 'win32' ? '.exe' : ''}`;
 }
 
 /**

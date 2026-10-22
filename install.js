@@ -120,7 +120,8 @@ function detectClients() {
 /**
  * Validates selection and obtains consent before any install writes.
  * @param {string[]} args Install arguments.
- * @returns {Promise<object|null>} Enabled clients, or null when consent was refused.
+ * @returns {Promise<{clients: object, interactiveConsent: boolean}|null>} Enabled clients and whether
+ *   the user agreed at the prompt, or null when consent was refused.
  * @throws {Error} For unknown arguments or client names.
  */
 async function selectClients(args) {
@@ -141,9 +142,9 @@ async function selectClients(args) {
     }
   }
   const enabled = selected || detected;
+  let agreed = false;
   if (Object.keys(CLIENTS).some(key => enabled[key] && !detected[key]) && !acceptRisk) {
     log(RISK_NOTICE);
-    let agreed = false;
     if (process.stdin.isTTY && process.stdout.isTTY) {
       const readline = require('readline');
       const input = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -160,7 +161,7 @@ async function selectClients(args) {
   for (const key of Object.keys(CLIENTS)) {
     if (!enabled[key] && !detected[key]) log(`  [skip] ${CLIENTS[key]} not detected (use --clients ${CLIENT_NAMES[key]} --accept-risk to force)`);
   }
-  return enabled;
+  return { clients: enabled, interactiveConsent: agreed };
 }
 
 /**
@@ -249,38 +250,6 @@ function copyMissingTree(source, destination) {
   fs.cpSync(source, destination, { recursive: true, dereference: true, force: false, errorOnExist: false });
 }
 
-function replaceDependencyDirectory(source, destination, validate) {
-  const staging = fs.mkdtempSync(path.join(path.dirname(destination), '.caipira-dependency-'));
-  const replacement = path.join(staging, path.basename(destination));
-  const backup = path.join(staging, 'previous');
-  let backupMoved = false;
-  let replacementPromoted = false;
-  let keepRecovery = false;
-  try {
-    fs.cpSync(source, replacement, { recursive: true, dereference: true });
-    if (fs.existsSync(destination)) {
-      fs.renameSync(destination, backup);
-      backupMoved = true;
-    }
-    fs.renameSync(replacement, destination);
-    replacementPromoted = true;
-    validate();
-  } catch (error) {
-    try {
-      if (replacementPromoted) fs.rmSync(destination, { recursive: true, force: true });
-      if (backupMoved) fs.renameSync(backup, destination);
-    } catch (rollbackError) {
-      keepRecovery = true;
-      throw new Error(`dependency refresh and rollback failed; recovery files retained at ${staging}`, {
-        cause: new AggregateError([error, rollbackError])
-      });
-    }
-    throw error;
-  } finally {
-    if (!keepRecovery) fs.rmSync(staging, { recursive: true, force: true });
-  }
-}
-
 function installDependencies() {
   const nestedManifest = path.join(ROOT, 'runtime');
   const manifestDirectory = fs.existsSync(path.join(nestedManifest, 'package.json')) ? nestedManifest : ROOT;
@@ -307,11 +276,12 @@ function verifyNativeSqlite() {
   RUNTIME.verifySqlite(HOME_DIR, DEPLOYMENT_RUNTIME);
 }
 
+// Runs before dependencies exist at ROOT, so it must not load ./ast.
 function buildAstEngine() {
-  const { CRATE_DIR, platformBinaryName } = require('./ast');
+  const CRATE_DIR = path.join(ROOT, 'rust', 'caipira-ast');
   const genericName = IS_WINDOWS ? 'caipira-ast.exe' : 'caipira-ast';
   const genericBinary = path.join(ROOT, 'bin', genericName);
-  const platformName = platformBinaryName();
+  const platformName = RUNTIME.platformBinaryName();
   const platformBinary = platformName ? path.join(ROOT, 'bin', platformName) : null;
   const packaged = [platformBinary, genericBinary].filter(Boolean).find(file => {
     try {
@@ -1242,8 +1212,9 @@ async function install() {
     process.exitCode = 1;
     return;
   }
-  const options = await selectClients(process.argv.slice(3));
-  if (!options) return;
+  const selection = await selectClients(process.argv.slice(3));
+  if (!selection) return;
+  const options = selection.clients;
   log('\nInstalling Caipira\n');
 
   let deployedRuntime;
@@ -1260,6 +1231,8 @@ async function install() {
       return;
     }
     const args = [path.join(ROOT, 'install.js'), ...process.argv.slice(2)];
+    // The child shares this terminal; carry the consent given here instead of prompting again.
+    if (selection.interactiveConsent && !args.includes('--accept-risk')) args.push('--accept-risk');
     const result = require('child_process').spawnSync(deployedRuntime.node, args, {
       env: { ...process.env, CAIPIRA_REEXEC_GUARD: '1' },
       stdio: 'inherit', timeout: RUNTIME.DEPENDENCY_TIMEOUT_MS + RUNTIME.DOWNLOAD_TIMEOUT_MS + RUNTIME.EXTRACT_TIMEOUT_MS + 300_000, windowsHide: true

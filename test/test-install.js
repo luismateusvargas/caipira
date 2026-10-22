@@ -325,6 +325,7 @@ for (const [platform, arch, expected] of [
   ['win32', 'x64', 'caipira-ast-win32-x64.exe']
 ]) check(`AST asset name resolves ${platform}-${arch}`, astApi.platformBinaryName(platform, arch) === expected);
 check('AST asset name rejects unsupported platforms', astApi.platformBinaryName('win32', 'arm64') === null);
+check('AST asset names come from the dependency-free runtime module', astApi.platformBinaryName === require(ROOT + '/runtime.js').platformBinaryName);
 const cliApi = require(ROOT + '/bin/caipira-cli.js');
 const cliHome = path.join(HOME, 'npm-cli-home');
 const bundledNode = cliApi.bundledNodePath(cliHome);
@@ -342,6 +343,9 @@ console.log('\n4b. npm distribution installs without checkout prerequisites');
 const npmPackage = installFixture([], { provisionDeployment: false });
 fs.rmSync(path.join(npmPackage.source, '.git'), { recursive: true, force: true });
 fs.rmSync(path.join(npmPackage.source, 'rust'), { recursive: true, force: true });
+// A published package has no dependencies of its own; only the deployment has node_modules.
+fs.rmSync(path.join(npmPackage.source, 'node_modules'), { recursive: true, force: true });
+delete npmPackage.env.NODE_PATH;
 const npmManifest = JSON.parse(fs.readFileSync(path.join(npmPackage.source, 'package.json'), 'utf8'));
 npmManifest.name = '@luismateusvargas/caipira';
 fs.writeFileSync(path.join(npmPackage.source, 'package.json'), `${JSON.stringify(npmManifest, null, 2)}\n`);
@@ -395,6 +399,7 @@ for (const missing of [['node22', 'node_modules'], ['node22'], ['node_modules']]
 }
 const checkoutBootstrap = installFixture(['.claude'], { provisionDeployment: false });
 for (const name of ['node22', 'node_modules']) fs.rmSync(path.join(checkoutBootstrap.source, name), { recursive: true, force: true });
+delete checkoutBootstrap.env.NODE_PATH;
 const checkoutInstall = spawnSync(NODE, [path.join(checkoutBootstrap.source, 'bin/caipira-cli.js'), 'install'], {
   env: checkoutBootstrap.env, encoding: 'utf8', timeout: 30000
 });
@@ -1026,6 +1031,23 @@ async function remainingChecks() {
     reexecCall[2].env.CAIPIRA_REEXEC_GUARD === '1' && reexecCall[2].stdio === 'inherit' &&
     reexecCall[2].timeout >= require(ROOT + '/runtime.js').DEPENDENCY_TIMEOUT_MS &&
     reexecContext.process.exitCode === 0 && registered(reexecFixture).every(value => !value));
+  for (const extra of [[], ['--accept-risk']]) {
+    const consentFixture = installFixture();
+    const consentArgs = [path.join(consentFixture.source, 'install.js'), 'install', '--clients', 'antigravity', ...extra];
+    let prompts = 0, consentCall;
+    const consentContext = installerContext(consentFixture, {
+      process: { execPath: hostNode, argv: [hostNode, ...consentArgs], stdout: { on() {}, write() {}, isTTY: true }, stdin: { isTTY: true } },
+      readline: { createInterface: () => ({ once() {}, question: (text, callback) => { prompts++; callback('y'); }, close() {} }) },
+      './runtime': { ...require(ROOT + '/runtime.js'), provisionRuntime: async home => deploymentRuntimePaths(home) },
+      child_process: { ...require('child_process'), spawnSync: (...args) => { consentCall = args; return { status: 0 }; } }
+    });
+    await vm.runInContext('install()', consentContext);
+    const forwarded = consentCall?.[1] || [];
+    check(extra.length ? 'explicit --accept-risk is forwarded once without a prompt'
+      : 'interactive consent is forwarded so the re-executed installer does not prompt again',
+    prompts === (extra.length ? 0 : 1) && forwarded.filter(arg => arg === '--accept-risk').length === 1 &&
+      JSON.stringify(forwarded.slice(0, consentArgs.length)) === JSON.stringify(consentArgs), JSON.stringify(forwarded));
+  }
   const guardedFixture = installFixture(['.claude']);
   let guardedOutput = '', guardedSpawns = 0;
   const guardedContext = installerContext(guardedFixture, {
@@ -1229,7 +1251,7 @@ async function remainingChecks() {
   if (unsupportedAst) fs.rmSync(path.join(compatibilityFixture.source, 'bin', unsupportedAst), { force: true });
   let cargoCalls = 0, astBuildOutput = '';
   const noCheckoutBuild = installerContext(compatibilityFixture, {
-    './ast': { CRATE_DIR: path.join(compatibilityFixture.source, 'rust/caipira-ast'), platformBinaryName: () => null },
+    './runtime': { ...require(ROOT + '/runtime.js'), platformBinaryName: () => null },
     child_process: { execFileSync: () => { cargoCalls++; throw new Error('cargo should not run'); } },
     process: { stdout: { on() {}, write: message => { astBuildOutput += message; }, isTTY: false } }
   });
