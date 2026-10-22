@@ -1,14 +1,24 @@
 @echo off
-REM Caipira launcher — always uses the bundled Node 22 runtime.
-REM better-sqlite3 is compiled against Node 22's ABI; the system Node 24 will not load it.
+REM Caipira launcher — uses bundled Node 22 when its SQLite addon loads, else Node on PATH.
 setlocal
 set "CAIPIRA_DIR=%~dp0"
 set "CAIPIRA_ARCH=x64"
 if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "CAIPIRA_ARCH=arm64"
 set "CAIPIRA_NODE=%CAIPIRA_DIR%node22\node-v22.20.0-win-%CAIPIRA_ARCH%\node.exe"
-if not exist "%CAIPIRA_NODE%" (
-  echo [caipira] bundled Node 22 runtime not found at "%CAIPIRA_NODE%".
-  exit /b 1
+if exist "%CAIPIRA_NODE%" (
+  pushd "%CAIPIRA_DIR%"
+  "%CAIPIRA_NODE%" -e "require('better-sqlite3')" >nul 2>nul
+  if errorlevel 1 set "CAIPIRA_NODE="
+  popd
+)
+if not exist "%CAIPIRA_NODE%" set "CAIPIRA_NODE="
+if not defined CAIPIRA_NODE (
+  where node >nul 2>nul
+  if errorlevel 1 (
+    echo [caipira] Node.js 20, 22, or 24 is required; install Node.js or restore the bundled Node 22 runtime.
+    exit /b 1
+  )
+  set "CAIPIRA_NODE=node"
 )
 "%CAIPIRA_NODE%" "%CAIPIRA_DIR%install.js" %*
 endlocal

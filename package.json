@@ -1,15 +1,45 @@
 {
-  "name": "caipira",
+  "name": "@luismateusvargas/caipira",
   "version": "2.1.0",
   "description": "Local-first cross-client memory, polyglot Rust AST symbol engine, prose compression, and interactive graph inspector.",
   "license": "GPL-3.0-only",
   "type": "commonjs",
   "main": "store.js",
+  "bin": {
+    "caipira": "bin/caipira-cli.js"
+  },
+  "files": [
+    "ast.js",
+    "compress.js",
+    "errors.js",
+    "explore-server.js",
+    "facts.js",
+    "inject.js",
+    "install.js",
+    "mcp.js",
+    "migrate.js",
+    "store.js",
+    "workspace.js",
+    "active",
+    "caipira.sh",
+    "caipira.cmd",
+    "hooks/**",
+    "bin/**",
+    "explore-ui/dist/**",
+    "models/**",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^20 || ^22 || ^24"
+  },
   "scripts": {
     "test": "node test/run-all.js"
   },
   "dependencies": {
-    "@xenova/transformers": "^2.17.2",
-    "better-sqlite3": "^11.5.0"
+    "@xenova/transformers": "^2.17.2"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "12.9.0"
   }
 }

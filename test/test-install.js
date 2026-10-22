@@ -188,7 +188,7 @@ check('caipira.sh does not set CAIPIRA_HOME', !/CAIPIRA_HOME/.test(sh), sh);
 // Builds are deliberately unavailable: these checks need no network or cargo.
 const CORE = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspace.js',
   'migrate.js', 'compress.js', 'errors.js', 'explore-server.js', 'hooks/universal-hook.js',
-  'install.js', 'package.json', 'caipira.sh', 'caipira.cmd'];
+  'install.js', 'package.json', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd'];
 const NODE_MODULES = path.dirname(path.dirname(require.resolve('better-sqlite3/package.json')));
 const NODE_RELEASE = `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`;
 const MCP_SESSION_PROBE_TIMEOUT_MS = 10_000;
@@ -202,6 +202,12 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.copyFileSync(path.join(ROOT, rel), dest);
   }
+  const fixturePackage = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
+  fixturePackage.name = 'caipira';
+  fs.writeFileSync(path.join(source, 'package.json'), `${JSON.stringify(fixturePackage, null, 2)}\n`);
+  fs.mkdirSync(path.join(source, '.git'));
+  fs.mkdirSync(path.join(source, 'rust', 'caipira-ast'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'rust', 'caipira-ast', 'Cargo.toml'), '[package]\nname = "fixture"\nversion = "0.0.0"\n');
   for (const dir of provisionDeployment ? [source, live] : [source]) {
     fs.mkdirSync(path.join(dir, 'node22', NODE_RELEASE, process.platform === 'win32' ? '' : 'bin'), { recursive: true });
     const node = path.join(dir, 'node22', NODE_RELEASE, IS_WINDOWS ? 'node.exe' : 'bin/node');
@@ -216,7 +222,10 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
   fs.writeFileSync(path.join(source, 'explore-ui', 'dist', 'index.html'), '<html>fixture UI</html>');
   fs.mkdirSync(path.join(source, 'bin'), { recursive: true });
   // A missing optional index still lets explore serve its memory API.
-  fs.writeFileSync(path.join(source, 'bin', `caipira-ast${process.platform === 'win32' ? '.exe' : ''}`), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const fakeAst = '#!/bin/sh\nexit 1\n';
+  fs.writeFileSync(path.join(source, 'bin', `caipira-ast${process.platform === 'win32' ? '.exe' : ''}`), fakeAst, { mode: 0o755 });
+  const targetAst = require(ROOT + '/ast.js').platformBinaryName();
+  if (targetAst) fs.writeFileSync(path.join(source, 'bin', targetAst), fakeAst, { mode: 0o755 });
   for (const marker of markers) {
     const dest = path.join(home, marker);
     if (marker.endsWith('.json') || marker.endsWith('.toml')) {
@@ -232,6 +241,67 @@ function installFixture(markers = [], { provisionDeployment = true } = {}) {
   };
   return { home, source, live, env, run };
 }
+
+console.log('\n4. npm packaging contract and host runtime entrypoint');
+const packageJson = require(ROOT + '/package.json');
+const requiredFiles = ['ast.js', 'compress.js', 'errors.js', 'explore-server.js', 'facts.js', 'inject.js',
+  'install.js', 'mcp.js', 'migrate.js', 'store.js', 'workspace.js', 'hooks/**', 'bin/**', 'explore-ui/dist/**', 'models/**'];
+check('scoped package exposes a global caipira command', packageJson.name === '@luismateusvargas/caipira' && packageJson.bin?.caipira === 'bin/caipira-cli.js');
+check('package supports Node 20/22/24 and keeps SQLite optional', packageJson.engines?.node === '^20 || ^22 || ^24' &&
+  packageJson.optionalDependencies?.['better-sqlite3'] === '12.9.0' && !packageJson.dependencies?.['better-sqlite3']);
+check('npm files whitelist covers runtime, CLI, UI and model assets', requiredFiles.every(file => packageJson.files.includes(file)) &&
+  packageJson.files.includes('caipira.sh') && packageJson.files.includes('caipira.cmd'));
+const astApi = require(ROOT + '/ast.js');
+for (const [platform, arch, expected] of [
+  ['linux', 'x64', 'caipira-ast-linux-x64'], ['linux', 'arm64', 'caipira-ast-linux-arm64'],
+  ['darwin', 'arm64', 'caipira-ast-darwin-arm64'], ['darwin', 'x64', 'caipira-ast-darwin-x64'],
+  ['win32', 'x64', 'caipira-ast-win32-x64.exe']
+]) check(`AST asset name resolves ${platform}-${arch}`, astApi.platformBinaryName(platform, arch) === expected);
+check('AST asset name rejects unsupported platforms', astApi.platformBinaryName('win32', 'arm64') === null);
+const cliApi = require(ROOT + '/bin/caipira-cli.js');
+const cliHome = path.join(HOME, 'npm-cli-home');
+const bundledNode = cliApi.bundledNodePath(cliHome);
+check('npm CLI selects the deployment Node 22 path for the host', bundledNode.includes(path.join('node22', `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`)));
+check('npm CLI falls back when the bundled runtime is absent', cliApi.resolveBundledNode(cliHome) === null);
+fs.mkdirSync(path.dirname(bundledNode), { recursive: true });
+fs.writeFileSync(bundledNode, 'runtime fixture', { mode: 0o755 });
+check('npm CLI recognizes an installed bundled runtime', cliApi.resolveBundledNode(cliHome) === bundledNode);
+const hostCli = spawnSync(NODE, [path.join(ROOT, 'bin/caipira-cli.js'), '__invalid_command__'], {
+  encoding: 'utf8', env: { ...process.env, HOME: cliHome, USERPROFILE: cliHome, CAIPIRA_HOME: path.join(cliHome, '.caipira') }
+});
+check('npm CLI executes install.js under the host Node fallback', hostCli.status === 1 && /Usage: caipira/.test(hostCli.stdout || ''));
+
+console.log('\n4b. npm distribution installs without checkout prerequisites');
+const npmPackage = installFixture([], { provisionDeployment: false });
+fs.rmSync(path.join(npmPackage.source, '.git'), { recursive: true, force: true });
+fs.rmSync(path.join(npmPackage.source, 'rust'), { recursive: true, force: true });
+const npmManifest = JSON.parse(fs.readFileSync(path.join(npmPackage.source, 'package.json'), 'utf8'));
+npmManifest.name = '@luismateusvargas/caipira';
+fs.writeFileSync(path.join(npmPackage.source, 'package.json'), `${JSON.stringify(npmManifest, null, 2)}\n`);
+const npmInstall = npmPackage.run('install');
+check('npm install works without a preinstalled deployment Node or dependencies', npmInstall.code === 0 &&
+  fs.existsSync(path.join(npmPackage.live, 'node_modules/better-sqlite3/package.json')), npmInstall.out);
+check('npm install deploys the prebuilt AST, UI and model without cargo or frontend builds',
+  fs.existsSync(path.join(npmPackage.live, 'bin', `caipira-ast${IS_WINDOWS ? '.exe' : ''}`)) &&
+  fs.existsSync(path.join(npmPackage.live, 'explore-ui/dist/index.html')) &&
+  fs.existsSync(path.join(npmPackage.live, 'models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx')) &&
+  /using prebuilt caipira-ast/.test(npmInstall.out) && /using prebuilt explore UI/.test(npmInstall.out), npmInstall.out);
+const deployedSqlitePackage = path.join(npmPackage.live, 'node_modules/better-sqlite3/package.json');
+const sourceSqlitePackage = path.join(npmPackage.source, 'node_modules/better-sqlite3/package.json');
+const staleSqliteMetadata = JSON.parse(fs.readFileSync(deployedSqlitePackage, 'utf8'));
+staleSqliteMetadata.version = '0.0.0-stale-fixture';
+fs.writeFileSync(deployedSqlitePackage, `${JSON.stringify(staleSqliteMetadata)}\n`);
+const transformerPackage = path.join(npmPackage.live, 'node_modules/@xenova/transformers/package.json');
+const sourceTransformerPackage = path.join(npmPackage.source, 'node_modules/@xenova/transformers/package.json');
+if (fs.existsSync(transformerPackage) && fs.existsSync(sourceTransformerPackage)) fs.rmSync(transformerPackage);
+const deployedModelConfig = path.join(npmPackage.live, 'models/Xenova/all-MiniLM-L6-v2/config.json');
+const sourceModelConfig = path.join(npmPackage.source, 'models/Xenova/all-MiniLM-L6-v2/config.json');
+fs.writeFileSync(sourceModelConfig, '{"model":"fixture"}\n');
+fs.rmSync(deployedModelConfig, { force: true });
+const npmUpgrade = npmPackage.run('install');
+check('npm reinstall refreshes stale SQLite and restores missing runtime dependencies', npmUpgrade.code === 0 &&
+  JSON.parse(fs.readFileSync(deployedSqlitePackage, 'utf8')).version === JSON.parse(fs.readFileSync(sourceSqlitePackage, 'utf8')).version &&
+  fs.existsSync(transformerPackage) && fs.readFileSync(deployedModelConfig, 'utf8') === fs.readFileSync(sourceModelConfig, 'utf8'), npmUpgrade.out);
 
 function registered(fixture) {
   return ['.claude.json', '.codex/config.toml', '.gemini/config/mcp_config.json'].map(rel => fs.existsSync(path.join(fixture.home, rel)));
@@ -311,7 +381,9 @@ const forcedCodex = fs.readFileSync(path.join(forced.home, '.codex/config.toml')
 check('Codex MCP preserves model path without registering CAIPIRA_HOME', !forcedCodex.includes('CAIPIRA_HOME') &&
   forcedCodex.includes(`env = { CAIPIRA_MODEL_PATH = ${JSON.stringify(path.join(forced.live, 'models'))} }`), forcedCodex);
 check('Codex SessionEnd keeps 3s timeout', /session-end[^\n]*\ntimeout = 3/.test(forcedCodex), forcedCodex);
-check('Codex TOML quotes paths containing apostrophes', forcedCodex.includes(`command = ${JSON.stringify(path.join(forced.live, 'node22', NODE_RELEASE, process.platform === 'win32' ? 'node.exe' : 'bin/node'))}`), forcedCodex);
+check('Codex MCP uses the runtime that executed installation', forcedCodex.includes(`command = ${JSON.stringify(NODE)}`), forcedCodex);
+check('Codex TOML quotes deployment paths containing apostrophes',
+  forcedCodex.includes(`args = [${JSON.stringify(path.join(forced.live, 'mcp.js'))}]`), forcedCodex);
 r = forced.run('doctor');
 check('doctor verifies all forced clients', r.code === 0 && !r.out.includes('[FAIL]'), r.out);
 r = forced.run('install', '--clients', 'all');
@@ -835,7 +907,9 @@ async function remainingChecks() {
   const unchanged = installFixture();
   unchanged.run('install');
   fs.rmSync(path.join(unchanged.source, 'explore-ui/dist'), { recursive: true });
-  fs.rmSync(path.join(unchanged.source, 'bin'), { recursive: true });
+  fs.rmSync(path.join(unchanged.source, AST_REL), { force: true });
+  const targetAst = require(ROOT + '/ast.js').platformBinaryName();
+  if (targetAst) fs.rmSync(path.join(unchanged.source, 'bin', targetAst), { force: true });
   r = unchanged.run('install');
   check('missing optional build assets retain previous deployment', r.code === 0 && fs.existsSync(path.join(unchanged.live, 'explore-ui/dist/index.html')) && fs.existsSync(path.join(unchanged.live, AST_REL)), r.out);
   const sameHome = installFixture();
@@ -938,6 +1012,36 @@ async function remainingChecks() {
       await exited;
     }
   }
+
+  console.log('\n10. supported Node runtime contract');
+  const compatibilityFixture = installFixture([], { provisionDeployment: false });
+  for (const major of [20, 22, 24]) {
+    const context = installerContext(compatibilityFixture, { process: { versions: { node: `${major}.0.0` } } });
+    check(`Node ${major} is supported`, vm.runInContext('hasSupportedNodeMajor()', context));
+  }
+  let incompatibleOutput = '';
+  const incompatible = installerContext(compatibilityFixture, {
+    process: {
+      versions: { node: '26.0.0' },
+      stdout: { on() {}, write: message => { incompatibleOutput += message; }, isTTY: false }
+    }
+  });
+  await vm.runInContext('install()', incompatible);
+  check('unsupported Node exits before writing deployment files', incompatible.process.exitCode === 1 &&
+    /Node 26\.0\.0 is unsupported; use Node 20, 22, or 24/.test(incompatibleOutput) && !fs.existsSync(compatibilityFixture.live));
+
+  fs.rmSync(path.join(compatibilityFixture.source, '.git'), { recursive: true, force: true });
+  fs.rmSync(path.join(compatibilityFixture.source, AST_REL), { force: true });
+  const unsupportedAst = require(ROOT + '/ast.js').platformBinaryName();
+  if (unsupportedAst) fs.rmSync(path.join(compatibilityFixture.source, 'bin', unsupportedAst), { force: true });
+  let cargoCalls = 0, astBuildOutput = '';
+  const noCheckoutBuild = installerContext(compatibilityFixture, {
+    './ast': { CRATE_DIR: path.join(compatibilityFixture.source, 'rust/caipira-ast'), platformBinaryName: () => null },
+    child_process: { execFileSync: () => { cargoCalls++; throw new Error('cargo should not run'); } },
+    process: { stdout: { on() {}, write: message => { astBuildOutput += message; }, isTTY: false } }
+  });
+  vm.runInContext('buildAstEngine()', noCheckoutBuild);
+  check('Cargo fallback is limited to development checkouts', cargoCalls === 0 && /builds are limited to development checkouts/.test(astBuildOutput), astBuildOutput);
 }
 
 remainingChecks().catch(error => { check('integration checks complete', false, error.stack); }).finally(() => {

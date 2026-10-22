@@ -1,6 +1,5 @@
 #!/usr/bin/env sh
-# Caipira launcher — always uses the bundled Node 22 runtime.
-# better-sqlite3 is compiled against Node 22's ABI; a system Node of another major will not load it.
+# Caipira launcher — uses bundled Node 22 when its SQLite addon loads, else Node on PATH.
 CAIPIRA_SCRIPT="$0"
 while [ -L "$CAIPIRA_SCRIPT" ]; do
   CAIPIRA_PARENT="$(cd -P "$(dirname "$CAIPIRA_SCRIPT")" && pwd)" || exit 1
@@ -19,9 +18,15 @@ case "$(uname -m)" in
   *) echo '[caipira] unsupported architecture' >&2; exit 1 ;;
 esac
 CAIPIRA_NODE="$CAIPIRA_DIR/node22/node-v22.20.0-$CAIPIRA_OS-$CAIPIRA_ARCH/bin/node"
-if [ ! -x "$CAIPIRA_NODE" ]; then
-  echo "[caipira] bundled Node 22 runtime not found at \"$CAIPIRA_NODE\"." >&2
-  exit 1
+if [ -x "$CAIPIRA_NODE" ] && ! NODE_PATH="$CAIPIRA_DIR/node_modules${NODE_PATH:+:$NODE_PATH}" "$CAIPIRA_NODE" -e "require('better-sqlite3')" >/dev/null 2>&1; then
+  CAIPIRA_NODE=''
+fi
+if [ -z "$CAIPIRA_NODE" ] || [ ! -x "$CAIPIRA_NODE" ]; then
+  CAIPIRA_NODE="$(command -v node 2>/dev/null || true)"
+  if [ -z "$CAIPIRA_NODE" ]; then
+    echo '[caipira] Node.js 20, 22, or 24 is required; install Node.js or restore the bundled Node 22 runtime.' >&2
+    exit 1
+  fi
 fi
 case "$1" in
   explore)

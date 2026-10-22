@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // caipira/install.js — installs and wires Caipira into detected coding clients.
 //
-// Run with the BUNDLED Node 22 runtime, never the system Node 24:
+// npm installs use the active supported host Node; checkout launchers use bundled Node 22:
 //   Windows: .\node22\node-v22.20.0-win-x64\node.exe install.js  (caipira.cmd)
 //   Linux:   ./node22/node-v22.20.0-linux-x64/bin/node install.js  (caipira.sh)
 //
@@ -49,7 +49,10 @@ const POSIX_PATH_COMMAND = 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) expo
 const FISH_PATH_COMMAND = 'contains -- $HOME/.local/bin $PATH; or set -gx PATH $HOME/.local/bin $PATH';
 const NODE_RELEASE = `node-v22.20.0-${IS_WINDOWS ? 'win' : process.platform}-${process.arch}`;
 const NODE_DIR = path.join(ROOT, 'node22', NODE_RELEASE);
-const NODE_BIN = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
+const HOME_NODE_DIR = path.join(HOME_DIR, 'node22', NODE_RELEASE);
+const HOME_NODE = IS_WINDOWS ? path.join(HOME_NODE_DIR, 'node.exe') : path.join(HOME_NODE_DIR, 'bin', 'node');
+const CHECKOUT_NODE = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
+const NODE_BIN = process.execPath || (fs.existsSync(HOME_NODE) ? HOME_NODE : CHECKOUT_NODE);
 const NPM_CLI = IS_WINDOWS
   ? path.join(NODE_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js')
   : path.join(NODE_DIR, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
@@ -69,7 +72,10 @@ const ANTIGRAVITY_EVENTS = [
   ['PostInvocation', 'post-invocation', false],
   ['Stop', 'stop', false]
 ];
-const MODEL_DIR = path.join(ROOT, 'models', 'Xenova', 'all-MiniLM-L6-v2');
+const MODEL_SOURCE_DIR = path.join(ROOT, 'models', 'Xenova', 'all-MiniLM-L6-v2');
+const MODEL_DIR = path.join(HOME_DIR, 'models', 'Xenova', 'all-MiniLM-L6-v2');
+const SUPPORTED_NODE_MAJORS = new Set([20, 22, 24]);
+let AST_BINARY_SOURCE = null;
 
 // Claude Code hook events -> Caipira lifecycle events.
 const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop'];
@@ -163,10 +169,28 @@ async function selectClients(args) {
  */
 function runtimePaths() {
   return {
-    node: path.join(HOME_DIR, 'node22', NODE_RELEASE, IS_WINDOWS ? 'node.exe' : 'bin/node'),
+    node: NODE_BIN,
     mcp: path.join(HOME_DIR, 'mcp.js'), hook: path.join(HOME_DIR, 'hooks', 'universal-hook.js'),
     models: path.join(HOME_DIR, 'models')
   };
+}
+
+function isDevelopmentCheckout() {
+  return fs.existsSync(path.join(ROOT, 'rust', 'caipira-ast', 'Cargo.toml')) && fs.existsSync(path.join(ROOT, '.git'));
+}
+
+function isNpmDistribution() {
+  if (isDevelopmentCheckout()) return false;
+  try {
+    return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).name === '@luismateusvargas/caipira';
+  } catch {
+    return false;
+  }
+}
+
+function hasSupportedNodeMajor() {
+  const major = Number(String(process.versions?.node || '').split('.')[0]);
+  return SUPPORTED_NODE_MAJORS.has(major);
 }
 
 function readJson(file, fallback) {
@@ -211,26 +235,153 @@ function isCaipiraHook(entry) {
 
 // ── steps ──
 
+function copyMissingTree(source, destination) {
+  const sourceInfo = fs.statSync(source);
+  if (sourceInfo.isDirectory()) {
+    try {
+      if (!fs.statSync(destination).isDirectory()) return;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    fs.mkdirSync(destination, { recursive: true });
+    for (const entry of fs.readdirSync(source)) {
+      copyMissingTree(path.join(source, entry), path.join(destination, entry));
+    }
+    return;
+  }
+  if (fs.existsSync(destination)) return;
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.cpSync(source, destination, { recursive: true, dereference: true, force: false, errorOnExist: false });
+}
+
+function replaceDependencyDirectory(source, destination, validate) {
+  const staging = fs.mkdtempSync(path.join(path.dirname(destination), '.caipira-dependency-'));
+  const replacement = path.join(staging, path.basename(destination));
+  const backup = path.join(staging, 'previous');
+  let backupMoved = false;
+  let replacementPromoted = false;
+  let keepRecovery = false;
+  try {
+    fs.cpSync(source, replacement, { recursive: true, dereference: true });
+    if (fs.existsSync(destination)) {
+      fs.renameSync(destination, backup);
+      backupMoved = true;
+    }
+    fs.renameSync(replacement, destination);
+    replacementPromoted = true;
+    validate();
+  } catch (error) {
+    try {
+      if (replacementPromoted) fs.rmSync(destination, { recursive: true, force: true });
+      if (backupMoved) fs.renameSync(backup, destination);
+    } catch (rollbackError) {
+      keepRecovery = true;
+      throw new Error(`dependency refresh and rollback failed; recovery files retained at ${staging}`, {
+        cause: new AggregateError([error, rollbackError])
+      });
+    }
+    throw error;
+  } finally {
+    if (!keepRecovery) fs.rmSync(staging, { recursive: true, force: true });
+  }
+}
+
 function installDependencies() {
-  const marker = path.join(ROOT, 'node_modules', 'better-sqlite3', 'package.json');
-  if (fs.existsSync(marker)) {
+  const sourceModules = path.join(ROOT, 'node_modules');
+  const sourceMarker = path.join(sourceModules, 'better-sqlite3', 'package.json');
+  const deployedModules = path.join(HOME_DIR, 'node_modules');
+  const deployedMarker = path.join(deployedModules, 'better-sqlite3', 'package.json');
+  if (isNpmDistribution()) {
+    if (fs.existsSync(sourceModules)) {
+      fs.mkdirSync(HOME_DIR, { recursive: true });
+      copyMissingTree(sourceModules, deployedModules);
+    }
+    if (!fs.existsSync(sourceMarker)) {
+      if (fs.existsSync(deployedMarker)) {
+        ok('dependencies already installed');
+        return;
+      }
+      throw new Error('the npm-installed better-sqlite3 prebuild is missing; reinstall with Node.js 20, 22, or 24, or run caipira with the bundled Node 22 runtime');
+    }
+    if (!fs.existsSync(deployedMarker)) throw new Error(`better-sqlite3 could not be copied to ${deployedModules}`);
+    const sourceMetadata = JSON.parse(fs.readFileSync(sourceMarker, 'utf8'));
+    let deployedMetadata;
+    try { deployedMetadata = JSON.parse(fs.readFileSync(deployedMarker, 'utf8')); } catch {}
+    let deployedWorks = false;
+    if (deployedMetadata?.version === sourceMetadata.version) {
+      try { verifyNativeSqlite(); deployedWorks = true; } catch {}
+    }
+    if (!deployedWorks) {
+      replaceDependencyDirectory(path.dirname(sourceMarker), path.dirname(deployedMarker), verifyNativeSqlite);
+    }
+    ok('runtime dependencies synchronized');
+    return;
+  }
+  if (fs.existsSync(sourceMarker)) {
     ok('dependencies already installed');
     return;
   }
-  log('  installing dependencies with bundled Node 22...');
+  log('  installing dependencies with the bundled Node 22 runtime...');
   execFileSync(NODE_BIN, [NPM_CLI, 'install', '--omit=dev'], { cwd: ROOT, stdio: 'inherit' });
+  if (path.resolve(ROOT) !== path.resolve(HOME_DIR)) {
+    copyMissingTree(sourceModules, deployedModules);
+  }
+  if (!fs.existsSync(deployedMarker)) throw new Error(`better-sqlite3 was not installed under ${deployedModules}`);
   ok('dependencies installed');
 }
 
-// The AST symbol index is optional: without cargo, or when the build fails,
-// memory and facts keep working and the hooks skip symbol updates.
+function installModelAssets() {
+  const sourceRoot = path.join(ROOT, 'models');
+  const sourceModel = path.join(MODEL_SOURCE_DIR, 'onnx', 'model_quantized.onnx');
+  const deployedModel = path.join(MODEL_DIR, 'onnx', 'model_quantized.onnx');
+  if (!fs.existsSync(sourceModel)) {
+    if (isNpmDistribution()) throw new Error('the bundled ONNX model is missing from the npm package');
+    return;
+  }
+  if (fs.existsSync(sourceRoot)) {
+    fs.mkdirSync(HOME_DIR, { recursive: true });
+    copyMissingTree(sourceRoot, path.join(HOME_DIR, 'models'));
+  }
+  if (!fs.existsSync(deployedModel)) throw new Error(`the ONNX model could not be copied to ${MODEL_DIR}`);
+  ok(`local embedding model available at ${MODEL_DIR}`);
+}
+
+function verifyNativeSqlite() {
+  try {
+    const Database = require(path.join(HOME_DIR, 'node_modules', 'better-sqlite3'));
+    const database = new Database(':memory:');
+    database.close();
+  } catch (error) {
+    throw new Error(`better-sqlite3 cannot load under Node ${process.versions.node}; use Node 20, 22, or 24, or rerun through the bundled Node 22 runtime (${error.message})`, { cause: error });
+  }
+}
+
 function buildAstEngine() {
-  const { CRATE_DIR } = require('./ast');
-  const INSTALLED_BIN = path.join(ROOT, 'bin', IS_WINDOWS ? 'caipira-ast.exe' : 'caipira-ast');
+  const { CRATE_DIR, platformBinaryName } = require('./ast');
+  const genericName = IS_WINDOWS ? 'caipira-ast.exe' : 'caipira-ast';
+  const genericBinary = path.join(ROOT, 'bin', genericName);
+  const platformName = platformBinaryName();
+  const platformBinary = platformName ? path.join(ROOT, 'bin', platformName) : null;
+  const packaged = [platformBinary, genericBinary].filter(Boolean).find(file => {
+    try {
+      fs.accessSync(file, IS_WINDOWS ? fs.constants.F_OK : fs.constants.X_OK);
+      return fs.statSync(file).isFile();
+    } catch { return false; }
+  });
+  if (packaged) {
+    AST_BINARY_SOURCE = packaged;
+    ok(`using prebuilt caipira-ast at ${packaged}`);
+    return;
+  }
   const manifest = path.join(CRATE_DIR, 'Cargo.toml');
   if (!fs.existsSync(manifest)) {
+    if (isNpmDistribution()) throw new Error(`prebuilt caipira-ast is missing for ${process.platform}-${process.arch}`);
     journal('build AST', new Error('rust/caipira-ast not found'));
     warn('rust/caipira-ast not found — AST symbol index unavailable');
+    return;
+  }
+  if (!isDevelopmentCheckout()) {
+    warn('caipira-ast build skipped — cargo builds are limited to development checkouts');
     return;
   }
   try {
@@ -248,27 +399,20 @@ function buildAstEngine() {
     warn(`caipira-ast build failed — ${error.message}`);
     return;
   }
-  const built = path.join(CRATE_DIR, 'target', 'release', path.basename(INSTALLED_BIN));
-  // Copy then rename, so a hook running the old binary never sees a half-written file.
-  fs.mkdirSync(path.dirname(INSTALLED_BIN), { recursive: true });
-  const tmp = `${INSTALLED_BIN}.caipira-tmp`;
-  try {
-    fs.copyFileSync(built, tmp);
-    fs.chmodSync(tmp, 0o755);
-    fs.renameSync(tmp, INSTALLED_BIN);
-  } catch (error) {
-    journal('deploy AST', error);
-    try { fs.rmSync(tmp, { force: true }); } catch {}
-    warn(`caipira-ast could not be installed at ${INSTALLED_BIN} — ${error.message}`);
-    return;
-  }
-  ok(`caipira-ast installed at ${INSTALLED_BIN}`);
+  AST_BINARY_SOURCE = path.join(CRATE_DIR, 'target', 'release', genericName);
+  if (!fs.existsSync(AST_BINARY_SOURCE)) throw new Error(`cargo build completed without creating ${AST_BINARY_SOURCE}`);
+  ok(`built caipira-ast at ${AST_BINARY_SOURCE}`);
 }
 
 // The explorer UI is optional like the AST engine: when its first npm
 // install has no network, or the build fails, `caipira explore` still serves
 // the API and says the UI is missing.
 function buildExploreUi() {
+  if (fs.existsSync(path.join(EXPLORE_DIST, 'index.html'))) {
+    ok(`using prebuilt explore UI at ${EXPLORE_DIST}`);
+    return;
+  }
+  if (isNpmDistribution()) throw new Error('prebuilt explore-ui/dist/index.html is missing from the npm package');
   if (!fs.existsSync(path.join(EXPLORE_UI_DIR, 'package.json'))) {
     journal('build explore UI', new Error('explore-ui not found'));
     warn('explore-ui not found — caipira explore will serve the API only');
@@ -298,25 +442,39 @@ function realPath(target) {
 // Stage the complete set before replacing any live file. Each file is promoted
 // by rename; directory swaps and failed promotions restore the previous set.
 function deployRuntime() {
-  if (realPath(HOME_DIR) === realPath(ROOT)) return;
+  const sameRoot = realPath(HOME_DIR) === realPath(ROOT);
+  const binary = `bin/caipira-ast${IS_WINDOWS ? '.exe' : ''}`;
+  if (sameRoot) {
+    if (AST_BINARY_SOURCE && path.resolve(AST_BINARY_SOURCE) !== path.join(ROOT, binary)) {
+      fs.mkdirSync(path.dirname(path.join(ROOT, binary)), { recursive: true });
+      const tmp = `${path.join(ROOT, binary)}.caipira-tmp-${process.pid}`;
+      fs.copyFileSync(AST_BINARY_SOURCE, tmp);
+      fs.chmodSync(tmp, 0o755);
+      fs.renameSync(tmp, path.join(ROOT, binary));
+    }
+    return;
+  }
   const files = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspace.js',
     'migrate.js', 'compress.js', 'errors.js', 'explore-server.js', 'hooks/universal-hook.js',
-    'install.js', 'package.json', 'caipira.sh', 'caipira.cmd'];
-  const binary = `bin/caipira-ast${IS_WINDOWS ? '.exe' : ''}`;
-  for (const optional of ['explore-ui/dist', binary]) {
-    if (fs.existsSync(path.join(ROOT, optional))) files.push(optional);
-    else warn(`${optional} unavailable in checkout — existing deployed asset kept`);
-  }
+    'install.js', 'package.json', 'bin/caipira-cli.js', 'caipira.sh', 'caipira.cmd']
+    .map(rel => ({ source: path.join(ROOT, rel), rel }));
+  const ui = 'explore-ui/dist';
+  if (fs.existsSync(path.join(ROOT, ui))) files.push({ source: path.join(ROOT, ui), rel: ui });
+  else warn(`${ui} unavailable in checkout — existing deployed asset kept`);
+  if (AST_BINARY_SOURCE) files.push({ source: AST_BINARY_SOURCE, rel: binary });
+  else if (fs.existsSync(path.join(ROOT, binary))) files.push({ source: path.join(ROOT, binary), rel: binary });
+  else warn(`${binary} unavailable in checkout — existing deployed asset kept`);
   fs.mkdirSync(HOME_DIR, { recursive: true });
   const staging = fs.mkdtempSync(path.join(HOME_DIR, '.runtime-'));
   const promoted = [];
   const movedDirectories = [];
   let keepRecovery = false;
   try {
-    for (const rel of files) {
+    for (const { source, rel } of files) {
       const live = path.join(HOME_DIR, rel), staged = path.join(staging, 'new', rel);
       fs.mkdirSync(path.dirname(staged), { recursive: true });
-      fs.cpSync(path.join(ROOT, rel), staged, { recursive: true, dereference: true });
+      fs.cpSync(source, staged, { recursive: true, dereference: true });
+      if (rel === binary || rel === 'bin/caipira-cli.js') fs.chmodSync(staged, 0o755);
       if (fs.existsSync(live)) {
         const backup = path.join(staging, 'old', rel);
         fs.mkdirSync(path.dirname(backup), { recursive: true });
@@ -324,7 +482,7 @@ function deployRuntime() {
       }
     }
     fs.chmodSync(path.join(staging, 'new', 'caipira.sh'), 0o755);
-    for (const rel of files) {
+    for (const { rel } of files) {
       const live = path.join(HOME_DIR, rel);
       fs.mkdirSync(path.dirname(live), { recursive: true });
       if (fs.existsSync(live) && fs.statSync(live).isDirectory()) {
@@ -1107,10 +1265,15 @@ function logs() {
 }
 
 async function install() {
+  if (!hasSupportedNodeMajor()) {
+    fail(`Node ${process.versions.node} is unsupported; use Node 20, 22, or 24, or install/run Caipira with the bundled Node 22 runtime.`);
+    process.exitCode = 1;
+    return;
+  }
   const options = await selectClients(process.argv.slice(3));
   if (!options) return;
-  if (realPath(HOME_DIR) !== realPath(ROOT)) {
-    const missing = [runtimePaths().node, path.join(HOME_DIR, 'node_modules', 'better-sqlite3', 'package.json')]
+  if (realPath(HOME_DIR) !== realPath(ROOT) && isDevelopmentCheckout()) {
+    const missing = [HOME_NODE, path.join(HOME_DIR, 'node_modules', 'better-sqlite3', 'package.json')]
       .filter(file => !fs.existsSync(file));
     if (missing.length) {
       for (const file of missing) fail(`deployment prerequisite missing: ${file}`);
@@ -1121,6 +1284,8 @@ async function install() {
   }
   log('\nInstalling Caipira\n');
   installDependencies();
+  verifyNativeSqlite();
+  installModelAssets();
   buildAstEngine();
   buildExploreUi();
   deployRuntime();

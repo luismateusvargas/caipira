@@ -61,7 +61,9 @@ Caipira separates **what happened** from **what is currently true**:
 
 ## Runtime Layout & Prerequisites
 
-Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v22.20.0** runtime, compiled `caipira-ast` binary, built `explore-ui/dist` bundle, and local ONNX model:
+The npm package includes the global `caipira` command, five prebuilt AST binaries, the production Explorer UI, and the local ONNX model. Install with Node.js 20, 22, or 24; npm installs the matching `better-sqlite3` prebuild for those versions. No Rust toolchain, frontend build, or manual model download is needed.
+
+The installer keeps the deployed runtime and user data under `~/.caipira`:
 
 ```text
 ~/.caipira/
@@ -81,25 +83,30 @@ Caipira is typically installed at `~/.caipira` alongside its bundled **Node.js v
 ├── hooks/
 │   └── universal-hook.js       # Cross-client lifecycle hook adapter (AST deltas & session digests)
 ├── bin/
-│   └── caipira-ast             # Compiled Rust tree-sitter AST indexer binary
-├── rust/
-│   └── caipira-ast/            # Rust crate source for the polyglot AST engine
+│   └── caipira-ast             # Prebuilt Rust tree-sitter AST indexer for this host
 ├── explore-ui/
-│   ├── src/                    # React 19 + TypeScript source for the graph & symbol inspector
-│   └── dist/                   # Compiled production UI bundle served by explore-server.js
-├── node22/                     # Bundled Node 22.20.0 runtime (ABI-matched to better-sqlite3)
+│   └── dist/                   # Prebuilt production UI bundle served by explore-server.js
+├── node_modules/               # Runtime dependencies copied from the npm package
 └── models/
     └── Xenova/all-MiniLM-L6-v2/ # Local quantized ONNX embedding model
 ```
 
-> **Important**: Always run Caipira via `caipira.sh` / `caipira.cmd` or the bundled Node 22 binary (`~/.caipira/node22/node-v22.20.0-linux-x64/bin/node` on Linux, `node22\node-v22.20.0-win-x64\node.exe` on Windows). `better-sqlite3` is compiled against Node 22's native ABI and will refuse to load under a different system Node major version (such as Node 24).
+The launchers use an existing bundled Node 22 runtime when its SQLite addon loads, then fall back to Node on `PATH`. The npm CLI stays on Node 20 and 24 when those versions installed the matching native prebuild. Other Node majors receive a compatibility message; rerun with Node 20, 22, or 24.
 
 ---
 
 ## Installation
 
-1. **Place or sync the repository into `~/.caipira`** (ensuring `node22/` and `models/` are present in `~/.caipira`, and `cargo` is on `PATH` to compile the Rust AST engine).
-2. **Run the installer**:
+Install the package globally and run its installer:
+
+```sh
+npm install --global @luismateusvargas/caipira
+caipira install
+```
+
+The package supports Node.js 20, 22, and 24 and includes the platform AST binary, built UI, and local embedding model. Existing source checkouts can still be installed with their checkout launcher and provisioned runtime.
+
+For existing source checkouts, run the installer:
 
    **Linux / macOS:**
    ```sh
@@ -124,12 +131,12 @@ On Linux and macOS, installation creates `~/.local/bin/caipira` and, when that d
 
 `caipira uninstall` removes Caipira's marked startup blocks, deleting regular startup files left empty only when the install created them. It also removes the Caipira-owned fish startup file when empty. Other pre-existing empty files are preserved with their permissions. Symlinks and their targets are kept, including empty targets; unwritable startup files produce a warning while uninstall continues. On Windows it removes only the matching deployment entry from User PATH and broadcasts the change again. Missing entries and unmarked files are left alone.
 
-Installing from a separate checkout synchronizes the core JavaScript runtime, hooks, installer, launchers, package metadata, built UI, and AST executable into `~/.caipira` (or `CAIPIRA_HOME`). Provision the bundled Node 22, dependencies, and model in both the build checkout and deployment first; downloading and packaging these prerequisites is separate from runtime synchronization. If the deployment interpreter or native dependency package is missing, installation exits with code 1 before deployment, launcher or client configuration writes and names the missing paths. Existing databases, logs, models, and dependencies are preserved.
+Installing from a separate checkout synchronizes the core JavaScript runtime, hooks, installer, launchers, package metadata, built UI, and AST executable into `~/.caipira` (or `CAIPIRA_HOME`). Checkout installs retain their provisioned Node 22 and dependency requirements. npm installs copy the runtime dependencies and local model into the deployment, fill missing packaged files, and refresh the SQLite package when its version or native load is incompatible. Existing databases, logs, and model files are preserved.
 
 ### What `install` Does
-- Installs root npm dependencies (`better-sqlite3`, `@xenova/transformers`) using the bundled Node 22 runtime if not already present.
-- Compiles the release Rust AST binary (`cargo build --release --manifest-path rust/caipira-ast/Cargo.toml`) and installs it atomically to `bin/caipira-ast` (degrades gracefully with a warning if `cargo` is not installed).
-- Installs `explore-ui` dependencies and builds the production Vite bundle at `explore-ui/dist`.
+- Synchronizes runtime dependencies from the npm package and verifies that the native SQLite addon loads under the active Node runtime.
+- Installs the matching prebuilt `caipira-ast` asset without `cargo`; source checkouts continue to build it with `cargo build --release` when no packaged binary is present.
+- Copies the packaged Explorer UI and ONNX model into the deployment. Source checkouts can still build the UI when no prebuilt bundle is present.
 - Stages the complete checkout runtime before promoting files by rename, restores the previous runtime if promotion fails, and replaces the UI bundle without leaving obsolete assets. Optional UI/AST assets unavailable in the checkout retain their deployed copies. A failed rollback retains recovery files and reports their location.
 - Creates runtime directories (`logs/`).
 - Installs the user PATH launcher and atomically registers the `caipira` stdio MCP server and lifecycle hooks for detected or explicitly selected clients (saving a `.caipira-backup` copy before modifying any file):

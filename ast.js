@@ -16,6 +16,9 @@ const { ROOT, openWorkspaceDb } = require('./workspace');
 const { logError } = require('./errors');
 
 const BIN_NAME = process.platform === 'win32' ? 'caipira-ast.exe' : 'caipira-ast';
+const SUPPORTED_BINARY_TARGETS = new Set([
+  'linux-x64', 'linux-arm64', 'darwin-arm64', 'darwin-x64', 'win32-x64'
+]);
 const CRATE_DIR = path.join(__dirname, 'rust', 'caipira-ast');
 const INSTALLED_BIN = path.join(ROOT, 'bin', BIN_NAME);
 const LOCAL_BIN = path.join(__dirname, 'bin', BIN_NAME);
@@ -59,10 +62,16 @@ function isExecutable(file) {
   }
 }
 
+function platformBinaryName(platform = process.platform, arch = process.arch) {
+  const target = `${platform}-${arch}`;
+  if (!SUPPORTED_BINARY_TARGETS.has(target)) return null;
+  return `caipira-ast-${target}${platform === 'win32' ? '.exe' : ''}`;
+}
+
 /**
  * The caipira-ast binary to run: CAIPIRA_AST_BIN when set, else the
- * installed copy under <CAIPIRA_HOME>/bin, else a release or debug build in
- * rust/caipira-ast/target.
+ * matching package asset, the installed copy under <CAIPIRA_HOME>/bin, or a
+ * release or debug build in rust/caipira-ast/target.
  * @returns {string}
  * @throws {AstEngineError} binary_missing when none exists.
  */
@@ -72,12 +81,14 @@ function resolveBinary() {
     if (isExecutable(override)) return override;
     throw new AstEngineError('binary_missing', `CAIPIRA_AST_BIN does not point at an executable: ${override}`);
   }
+  const packagedName = platformBinaryName();
   const candidates = [...new Set([
+    packagedName && path.join(__dirname, 'bin', packagedName),
     INSTALLED_BIN,
     LOCAL_BIN,
     path.join(CRATE_DIR, 'target', 'release', BIN_NAME),
     path.join(CRATE_DIR, 'target', 'debug', BIN_NAME)
-  ])];
+  ].filter(Boolean))];
   const found = candidates.find(isExecutable);
   if (!found) {
     throw new AstEngineError('binary_missing', `caipira-ast not found (looked in ${candidates.join(', ')}) — run: caipira install`);
@@ -548,6 +559,7 @@ module.exports = {
   INSTALLED_BIN,
   CRATE_DIR,
   resolveBinary,
+  platformBinaryName,
   syncWorkspaceAst,
   updateFileAst,
   // The acceptance criteria's name for updateFileAst.
