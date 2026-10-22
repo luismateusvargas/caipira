@@ -1,10 +1,14 @@
-import { useEffect, useEffectEvent, useRef, useState } from 'react';
-import type { KeyboardEvent, PointerEvent } from 'react';
-import { Crosshair, Maximize2, Minus, Plus } from 'lucide-react';
-import type { EdgeKind, GraphNode, GraphPayload, GraphView } from '../../api/schemas';
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent, MouseEvent, PointerEvent } from 'react';
+import { Crosshair, Maximize2, Minus, PanelLeftClose, PanelLeftOpen, Plus, X } from 'lucide-react';
+import type { GraphNode, GraphPayload, GraphView } from '../../api/schemas';
 import { evidenceNotChecked } from '../../api/schemas';
-import { bounds, createSimulation, isSettled, reheat, tick } from './forceLayout';
-import type { Simulation } from './forceLayout';
+import type { LinkKind, Palette, Scene, Viewport } from './mapDraw';
+import { LINK_KINDS, STAND_IN_PX, buildScene, describeRegion, drawMap, drawMinimap, drawPulse, labelReadable, minimapTransform, readPalette, rowsHittable } from './mapDraw';
+import type { Box, MapItem, MapRegion } from './mapLayout';
+import { REGION_HEAD, buildRegionTree, contains, hitTest, inHiddenRegion, layoutMap } from './mapLayout';
+import type { Layers } from './MapPanel';
+import { DEFAULT_LAYERS, MapPanel } from './MapPanel';
 
 /** Props for {@link GraphCanvas}. */
 export interface GraphCanvasProps {
@@ -22,8 +26,6 @@ export interface GraphCanvasProps {
   canFocus: boolean;
 }
 
-type NodeType = GraphNode['type'];
-
 const VIEW_PILLS: readonly { view: GraphView; label: string }[] = [
   { view: 'unified', label: 'Unified Graph' },
   { view: 'architecture', label: 'Code Architecture' },
@@ -31,497 +33,331 @@ const VIEW_PILLS: readonly { view: GraphView; label: string }[] = [
   { view: 'impact', label: 'Blast Radius' }
 ];
 
-const LEGEND: readonly { type: NodeType; label: string }[] = [
-  { type: 'file', label: 'Files' },
-  { type: 'symbol', label: 'Symbols' },
-  { type: 'fact', label: 'Facts' },
-  { type: 'session', label: 'Sessions' }
-];
-
-const TYPE_KINDS = new Set(['struct', 'class', 'interface', 'trait', 'enum', 'type', 'union']);
-
-// Canvas cannot read CSS custom properties per draw, so the tokens are read
-// once at mount with these as fallbacks.
-const TOKEN_NAMES = [
-  '--bg-canvas', '--bg-elevated', '--bg-hover', '--border-subtle', '--border-crimson',
-  '--accent-red-dark', '--accent-red-primary', '--accent-red-bright', '--accent-red-glow', '--accent-red-soft',
-  '--text-primary', '--text-secondary', '--text-muted', '--slate-node', '--slate-edge'
-] as const;
-
-type Palette = Record<(typeof TOKEN_NAMES)[number], string>;
-
-const TOKEN_FALLBACKS: Palette = {
-  '--bg-canvas': '#0d0e11',
-  '--bg-elevated': '#1c1f26',
-  '--bg-hover': '#252932',
-  '--border-subtle': '#262a34',
-  '--border-crimson': '#5c191d',
-  '--accent-red-dark': '#7f1d1d',
-  '--accent-red-primary': '#b91c1c',
-  '--accent-red-bright': '#dc2626',
-  '--accent-red-glow': 'rgba(220, 38, 38, 0.28)',
-  '--accent-red-soft': '#fca5a5',
-  '--text-primary': '#f3f4f6',
-  '--text-secondary': '#9ca3af',
-  '--text-muted': '#6b7280',
-  '--slate-node': '#334155',
-  '--slate-edge': '#3f4654'
-};
-
-function readPalette(element: Element): Palette {
-  const style = getComputedStyle(element);
-  const palette: Palette = { ...TOKEN_FALLBACKS };
-  for (const name of TOKEN_NAMES) {
-    const value = style.getPropertyValue(name).trim();
-    if (value) palette[name] = value;
-  }
-  return palette;
-}
-
-function edgeStyle(kind: EdgeKind, palette: Palette): { color: string; dash: number[]; width: number } {
-  switch (kind) {
-    case 'calls': return { color: palette['--slate-edge'], dash: [], width: 1 };
-    case 'imports': return { color: palette['--border-subtle'], dash: [4, 4], width: 1 };
-    case 'defines': return { color: palette['--border-subtle'], dash: [], width: 0.8 };
-    case 'uses_type': return { color: palette['--text-muted'], dash: [2, 3], width: 1 };
-    case 'extends': return { color: palette['--text-secondary'], dash: [], width: 1.4 };
-    case 'evidences': return { color: palette['--accent-red-primary'], dash: [], width: 1.3 };
-    case 'supersedes': return { color: palette['--accent-red-bright'], dash: [6, 4], width: 1.3 };
-    case 'touched': return { color: palette['--text-muted'], dash: [2, 5], width: 0.9 };
-  }
-}
-
-function nodeRadius(node: GraphNode): number {
-  switch (node.type) {
-    case 'file': return 9;
-    case 'symbol': return 4 + Math.min(9, Math.sqrt(node.callers) * 2);
-    case 'fact': return 10;
-    case 'session': return 6;
-  }
-}
-
-interface Scene {
-  sim: Simulation;
-  nodes: GraphNode[];
-  edges: { source: number; target: number; kind: EdgeKind }[];
-  neighbors: Map<string, Set<string>>;
-  hasDrift: boolean;
-}
-
-interface Viewport {
-  x: number;
-  y: number;
-  k: number;
-}
+const MAX_ZOOM = 4;
+const MINIMAP = { width: 200, height: 136 };
+const FLY_MS = 450;
+// Zoom at which a card's title and its symbols' names read comfortably.
+const READ_ZOOM = 1;
 
 interface Drag {
   pointerId: number;
-  index: number | null;
   startX: number;
   startY: number;
-  originX: number;
-  originY: number;
+  origin: Viewport;
   moved: boolean;
 }
 
-function buildScene(graph: GraphPayload, previous: Scene | null): Scene {
-  const positions = new Map<string, { x: number; y: number }>();
-  for (const node of previous?.sim.nodes ?? []) positions.set(node.id, { x: node.x, y: node.y });
-  const sim = createSimulation(graph.nodes.map(node => ({ id: node.id, radius: nodeRadius(node) })), graph.edges, positions);
-  const neighbors = new Map<string, Set<string>>();
-  const link = (a: string, b: string) => {
-    const set = neighbors.get(a) ?? new Set<string>();
-    set.add(b);
-    neighbors.set(a, set);
-  };
-  const edges: Scene['edges'] = [];
-  for (const edge of graph.edges) {
-    const source = sim.index.get(edge.source);
-    const target = sim.index.get(edge.target);
-    if (source === undefined || target === undefined) continue;
-    edges.push({ source, target, kind: edge.kind });
-    link(edge.source, edge.target);
-    link(edge.target, edge.source);
+interface Flight {
+  from: Viewport;
+  to: Viewport;
+  start: number;
+}
+
+function layerAllows(node: GraphNode, layers: Layers): boolean {
+  if (!layers[node.type]) return false;
+  if (node.type === 'file' && !node.indexed && !layers.unindexed) return false;
+  return !(node.type === 'fact' && node.state === 'superseded' && !layers.superseded);
+}
+
+const ease = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
+
+// Capture fails when the pointer is already gone; the gesture then simply ends early.
+function capture(element: Element, pointerId: number): void {
+  try {
+    element.setPointerCapture?.(pointerId);
+  } catch {
+    // Nothing to capture.
   }
-  return { sim, nodes: graph.nodes, edges, neighbors, hasDrift: graph.nodes.some(node => node.type === 'fact' && node.drifted) };
-}
-
-function polygon(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, sides: number, rotation: number): void {
-  ctx.beginPath();
-  for (let i = 0; i < sides; i++) {
-    const angle = rotation + (i * 2 * Math.PI) / sides;
-    const px = x + r * Math.cos(angle);
-    const py = y + r * Math.sin(angle);
-    if (i === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
-  }
-  ctx.closePath();
-}
-
-function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
-function truncate(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
-
-interface DrawState {
-  viewport: Viewport;
-  width: number;
-  height: number;
-  dpr: number;
-  time: number;
-  hoverId: string | null;
-  selectedId: string | null;
-  hidden: ReadonlySet<NodeType>;
-  palette: Palette;
-  animate: boolean;
-}
-
-function draw(ctx: CanvasRenderingContext2D, scene: Scene, state: DrawState): void {
-  const { viewport, palette } = state;
-  ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
-  ctx.fillStyle = palette['--bg-canvas'];
-  ctx.fillRect(0, 0, state.width, state.height);
-  ctx.translate(state.width / 2 + viewport.x, state.height / 2 + viewport.y);
-  ctx.scale(viewport.k, viewport.k);
-
-  const { sim, nodes } = scene;
-  const visible = (i: number) => {
-    const node = nodes[i];
-    return node !== undefined && !state.hidden.has(node.type);
-  };
-  const anchor = state.hoverId ?? state.selectedId;
-  const focus = anchor && scene.neighbors.has(anchor) ? new Set([anchor, ...(scene.neighbors.get(anchor) ?? [])]) : anchor ? new Set([anchor]) : null;
-
-  // Directory hulls behind everything else.
-  const groups = new Map<string, number[]>();
-  nodes.forEach((node, i) => {
-    if (node.type !== 'file' || !visible(i)) return;
-    const list = groups.get(node.group) ?? [];
-    list.push(i);
-    groups.set(node.group, list);
-  });
-  ctx.setLineDash([]);
-  for (const [group, members] of groups) {
-    if (members.length < 2) continue;
-    let cx = 0;
-    let cy = 0;
-    for (const i of members) { cx += sim.nodes[i]?.x ?? 0; cy += sim.nodes[i]?.y ?? 0; }
-    cx /= members.length;
-    cy /= members.length;
-    let radius = 0;
-    for (const i of members) radius = Math.max(radius, Math.hypot((sim.nodes[i]?.x ?? 0) - cx, (sim.nodes[i]?.y ?? 0) - cy));
-    radius += 36;
-    ctx.globalAlpha = focus ? 0.25 : 0.55;
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(28, 31, 38, 0.35)';
-    ctx.fill();
-    ctx.strokeStyle = palette['--border-subtle'];
-    ctx.lineWidth = 1 / viewport.k;
-    ctx.stroke();
-    if (viewport.k > 0.35) {
-      ctx.fillStyle = palette['--text-muted'];
-      ctx.font = `${11 / Math.max(viewport.k, 0.6)}px ui-monospace, monospace`;
-      ctx.textAlign = 'center';
-      ctx.fillText(truncate(group, 40), cx, cy - radius - 4);
-    }
-  }
-
-  // Edges with arrowheads at the target's rim.
-  for (const edge of scene.edges) {
-    if (!visible(edge.source) || !visible(edge.target)) continue;
-    const a = sim.nodes[edge.source];
-    const b = sim.nodes[edge.target];
-    const sourceNode = nodes[edge.source];
-    const targetNode = nodes[edge.target];
-    if (!a || !b || !sourceNode || !targetNode) continue;
-    const lit = focus ? focus.has(sourceNode.id) && focus.has(targetNode.id) : false;
-    const style = edgeStyle(edge.kind, palette);
-    ctx.globalAlpha = focus ? (lit ? 0.95 : 0.05) : edge.kind === 'defines' ? 0.22 : 0.5;
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    const ux = dx / dist;
-    const uy = dy / dist;
-    const x1 = a.x + ux * a.radius;
-    const y1 = a.y + uy * a.radius;
-    const x2 = b.x - ux * (b.radius + 2);
-    const y2 = b.y - uy * (b.radius + 2);
-    ctx.strokeStyle = lit && edge.kind === 'calls' ? palette['--accent-red-soft'] : style.color;
-    ctx.lineWidth = (lit ? style.width * 1.6 : style.width) / Math.max(viewport.k, 0.5);
-    ctx.setLineDash(style.dash);
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-    if (edge.kind !== 'defines' && dist > a.radius + b.radius + 8) {
-      const size = 5;
-      ctx.setLineDash([]);
-      ctx.fillStyle = ctx.strokeStyle;
-      ctx.beginPath();
-      ctx.moveTo(x2, y2);
-      ctx.lineTo(x2 - ux * size - uy * size * 0.6, y2 - uy * size + ux * size * 0.6);
-      ctx.lineTo(x2 - ux * size + uy * size * 0.6, y2 - uy * size - ux * size * 0.6);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-  ctx.setLineDash([]);
-
-  // Nodes.
-  const pulse = state.animate ? (Math.sin(state.time / 280) + 1) / 2 : 0.5;
-  nodes.forEach((node, i) => {
-    const point = sim.nodes[i];
-    if (!point || !visible(i)) return;
-    const { x, y, radius: r } = point;
-    ctx.globalAlpha = focus && !focus.has(node.id) ? 0.16 : 1;
-    ctx.lineWidth = 1.4 / Math.max(viewport.k, 0.6);
-    switch (node.type) {
-      case 'file':
-        roundedRect(ctx, x - r * 1.5, y - r * 0.8, r * 3, r * 1.6, r * 0.8);
-        ctx.fillStyle = palette['--bg-elevated'];
-        ctx.fill();
-        ctx.setLineDash(node.indexed ? [] : [3, 2]);
-        ctx.strokeStyle = palette['--text-muted'];
-        ctx.stroke();
-        ctx.setLineDash([]);
-        break;
-      case 'symbol':
-        if (TYPE_KINDS.has(node.kind)) roundedRect(ctx, x - r, y - r, r * 2, r * 2, Math.min(3, r / 2));
-        else { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); }
-        ctx.fillStyle = TYPE_KINDS.has(node.kind) ? palette['--bg-hover'] : palette['--slate-node'];
-        ctx.fill();
-        ctx.strokeStyle = node.isPublic ? palette['--accent-red-primary'] : palette['--slate-edge'];
-        ctx.stroke();
-        break;
-      case 'fact':
-        if (node.drifted) {
-          ctx.beginPath();
-          ctx.arc(x, y, r + 4 + pulse * 5, 0, Math.PI * 2);
-          ctx.strokeStyle = palette['--accent-red-bright'];
-          ctx.globalAlpha *= 0.35 + (1 - pulse) * 0.5;
-          ctx.lineWidth = 2.2 / Math.max(viewport.k, 0.6);
-          ctx.stroke();
-          ctx.globalAlpha = focus && !focus.has(node.id) ? 0.16 : 1;
-        }
-        polygon(ctx, x, y, r, 8, Math.PI / 8);
-        ctx.fillStyle = node.state === 'superseded' ? palette['--bg-hover'] : palette['--accent-red-dark'];
-        ctx.fill();
-        ctx.strokeStyle = node.drifted ? palette['--accent-red-soft'] : palette['--accent-red-bright'];
-        ctx.lineWidth = 1.4 / Math.max(viewport.k, 0.6);
-        // Dashed, like a file the index has not read: evidence not checked.
-        ctx.setLineDash(evidenceNotChecked(node) ? [3, 2] : []);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        break;
-      case 'session':
-        polygon(ctx, x, y, r * 1.2, 4, 0);
-        ctx.fillStyle = palette['--bg-hover'];
-        ctx.fill();
-        ctx.strokeStyle = palette['--text-muted'];
-        ctx.stroke();
-        break;
-    }
-    if (node.id === state.selectedId) {
-      ctx.beginPath();
-      ctx.arc(x, y, r + 6, 0, Math.PI * 2);
-      ctx.strokeStyle = palette['--accent-red-bright'];
-      ctx.lineWidth = 2.5 / Math.max(viewport.k, 0.6);
-      ctx.shadowColor = palette['--accent-red-glow'];
-      ctx.shadowBlur = 16;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-    }
-  });
-
-  // Labels: everything when zoomed in, otherwise only what is in focus.
-  const visibleCount = nodes.reduce((n, _node, i) => n + (visible(i) ? 1 : 0), 0);
-  const showAll = viewport.k >= 1.15 && visibleCount <= 700;
-  ctx.font = `${11 / Math.max(viewport.k, 0.75)}px Inter, system-ui, sans-serif`;
-  ctx.textAlign = 'center';
-  nodes.forEach((node, i) => {
-    const point = sim.nodes[i];
-    if (!point || !visible(i)) return;
-    const inFocus = focus?.has(node.id) ?? false;
-    const prominent = (node.type === 'file' && viewport.k > 0.7) || (node.type === 'fact' && viewport.k > 0.55);
-    if (!showAll && !inFocus && !prominent) return;
-    if (focus && !inFocus) return;
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = node.type === 'fact' ? palette['--accent-red-soft'] : node.id === anchor ? palette['--text-primary'] : palette['--text-secondary'];
-    ctx.fillText(truncate(node.label, 32), point.x, point.y + point.radius + 13 / Math.max(viewport.k, 0.75));
-  });
-  ctx.globalAlpha = 1;
 }
 
 /**
- * The interactive force-directed graph: zoom with the wheel or +/-, pan by
- * dragging the background or with the arrow keys, drag nodes, hover to light
- * a node's neighbourhood, click to select.
+ * The graph as an explorable map: regions for directories, knowledge and
+ * sessions; file cards listing their symbols; routes between regions from
+ * afar and each node's own links on hover. Drag to pan, wheel or +/- to
+ * zoom, double-click to travel into a region or card, and use the minimap
+ * or the region tree to jump.
  */
 export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, canFocus }: GraphCanvasProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const minimapRef = useRef<HTMLCanvasElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<Scene | null>(null);
   const viewportRef = useRef<Viewport>({ x: 0, y: 0, k: 1 });
   const sizeRef = useRef({ width: 0, height: 0 });
-  const hoverRef = useRef<string | null>(null);
-  const selectedRef = useRef<string | null>(selectedId);
-  const hiddenRef = useRef<ReadonlySet<NodeType>>(new Set());
+  const hoverItemRef = useRef<MapItem | null>(null);
+  const hoverRegionRef = useRef<MapRegion | null>(null);
+  const selectedRef = useRef<MapItem | null>(null);
+  const kindsRef = useRef<ReadonlySet<LinkKind>>(new Set(LINK_KINDS));
+  const routesRef = useRef(false);
+  const allLinksRef = useRef(view === 'impact');
   const dirtyRef = useRef(true);
-  // A new layout is fitted early (once it has cooled a little) and again
-  // when it settles, unless the user has panned, zoomed or dragged by then.
-  const fitPhaseRef = useRef<'early' | 'settle' | 'done'>('early');
+  const flightRef = useRef<Flight | null>(null);
   const userMovedRef = useRef(false);
   const dragRef = useRef<Drag | null>(null);
-  const [hidden, setHidden] = useState<ReadonlySet<NodeType>>(() => new Set());
-  const [hoverLabel, setHoverLabel] = useState<string | null>(null);
+  const minimapDragRef = useRef<number | null>(null);
+  // A selection made on the canvas is already in view; one from search is flown to.
+  const selectedHereRef = useRef(false);
+  const trailKeyRef = useRef('');
+  const reducedMotionRef = useRef(false);
+  // The pointer over the map, so the hover follows the map as it moves underneath.
+  const pointerRef = useRef<{ x: number; y: number } | null>(null);
+  const hoveredAtRef = useRef<Viewport | null>(null);
+
+  const [layers, setLayers] = useState<Layers>(DEFAULT_LAYERS);
+  const [kinds, setKinds] = useState<ReadonlySet<LinkKind>>(() => new Set(LINK_KINDS));
+  const [routes, setRoutes] = useState(false);
+  const [hiddenRegions, setHiddenRegions] = useState<ReadonlySet<string>>(() => new Set());
+  const [panelOpen, setPanelOpen] = useState(() => typeof window === 'undefined' || window.innerWidth >= 1200);
+  const [hoverText, setHoverText] = useState<string | null>(null);
+  const [trail, setTrail] = useState<MapRegion[]>([]);
+  const [noticeDismissed, setNoticeDismissed] = useState(false);
+
+  const shown = useMemo(() => graph.nodes.filter(node => layerAllows(node, layers) && !inHiddenRegion(node, hiddenRegions)), [graph, layers, hiddenRegions]);
+  const scene = useMemo(() => buildScene(layoutMap(shown), graph.edges), [shown, graph.edges]);
+  const tree = useMemo(() => buildRegionTree(graph.nodes.filter(node => layerAllows(node, layers))), [graph, layers]);
+
+  const zoomLimits = () => {
+    const { width, height } = sizeRef.current;
+    const box = sceneRef.current?.layout.bounds ?? { x: 0, y: 0, w: 1, h: 1 };
+    const fit = Math.min((width - 80) / box.w, (height - 112) / box.h);
+    return { min: Math.min(0.02, Math.max(0.001, fit * 0.6)), max: MAX_ZOOM };
+  };
+
+  /**
+   * @returns The viewport that shows `box` whole, centred below the trail at
+   *   the top of the stage, within the zoom limits.
+   */
+  const viewportFor = (box: Box, zoom?: number): Viewport => {
+    const { width, height } = sizeRef.current;
+    const limits = zoomLimits();
+    const k = Math.min(limits.max, Math.max(limits.min, zoom ?? Math.min((width - 80) / box.w, (height - 112) / box.h)));
+    return { k, x: width / 2 - (box.x + box.w / 2) * k, y: (height + 32) / 2 - (box.y + box.h / 2) * k };
+  };
+
+  /** @returns The viewport that brings an item close enough to read, centred on it. */
+  const viewportForItem = (item: MapItem): Viewport => {
+    const card = item.card ?? item;
+    const { width, height } = sizeRef.current;
+    const fit = Math.min((width - 80) / card.w, (height - 112) / card.h);
+    return viewportFor(item, Math.max(READ_ZOOM * 0.9, Math.min(1.4, fit)));
+  };
+
+  const travel = (to: Viewport) => {
+    userMovedRef.current = true;
+    if (reducedMotionRef.current) {
+      viewportRef.current = to;
+      flightRef.current = null;
+    } else {
+      flightRef.current = { from: viewportRef.current, to, start: performance.now() };
+    }
+    dirtyRef.current = true;
+  };
 
   const fit = () => {
-    const scene = sceneRef.current;
-    const { width, height } = sizeRef.current;
-    if (!scene || width === 0 || height === 0) return;
-    const box = bounds(scene.sim);
-    const k = Math.min(2, Math.max(0.08, Math.min(width / (box.maxX - box.minX + 120), height / (box.maxY - box.minY + 120))));
-    viewportRef.current = { k, x: -((box.minX + box.maxX) / 2) * k, y: -((box.minY + box.maxY) / 2) * k };
+    const layout = sceneRef.current?.layout;
+    if (!layout || sizeRef.current.width === 0) return;
+    flightRef.current = null;
+    viewportRef.current = viewportFor(layout.bounds);
     dirtyRef.current = true;
   };
 
   const zoomBy = (factor: number, screenX?: number, screenY?: number) => {
     userMovedRef.current = true;
+    flightRef.current = null;
     const viewport = viewportRef.current;
     const { width, height } = sizeRef.current;
-    const k = Math.min(6, Math.max(0.05, viewport.k * factor));
-    const px = (screenX ?? width / 2) - width / 2;
-    const py = (screenY ?? height / 2) - height / 2;
-    viewportRef.current = {
-      k,
-      x: px - ((px - viewport.x) * k) / viewport.k,
-      y: py - ((py - viewport.y) * k) / viewport.k
-    };
+    const limits = zoomLimits();
+    const k = Math.min(limits.max, Math.max(limits.min, viewport.k * factor));
+    const px = screenX ?? width / 2;
+    const py = screenY ?? height / 2;
+    viewportRef.current = { k, x: px - ((px - viewport.x) * k) / viewport.k, y: py - ((py - viewport.y) * k) / viewport.k };
     dirtyRef.current = true;
+  };
+
+  const flyToRegion = (regionId: string) => {
+    const region = sceneRef.current?.layout.regionById.get(regionId);
+    if (region) travel(viewportFor(region));
   };
 
   // The animation loop and wheel listener live in a mount-once effect; these
-  // read the latest viewport through refs.
-  const fitFromLoop = useEffectEvent(() => fit());
+  // read the latest state through refs.
+  const fitFromEffect = useEffectEvent(() => fit());
   const zoomFromWheel = useEffectEvent((factor: number, screenX: number, screenY: number) => zoomBy(factor, screenX, screenY));
+  const updateTrail = useEffectEvent((regions: MapRegion[]) => setTrail(regions));
+  const hoverFromLoop = useEffectEvent(() => {
+    hoveredAtRef.current = viewportRef.current;
+    const pointer = pointerRef.current;
+    if (!pointer || dragRef.current) return;
+    const hit = pick(pointer.x, pointer.y);
+    setHover(hit.item, hit.region);
+  });
 
   const toWorld = (screenX: number, screenY: number) => {
     const viewport = viewportRef.current;
-    const { width, height } = sizeRef.current;
-    return { x: (screenX - width / 2 - viewport.x) / viewport.k, y: (screenY - height / 2 - viewport.y) / viewport.k };
+    return { x: (screenX - viewport.x) / viewport.k, y: (screenY - viewport.y) / viewport.k };
   };
 
-  const hitTest = (screenX: number, screenY: number): number | null => {
-    const scene = sceneRef.current;
-    if (!scene) return null;
+  /**
+   * What a screen point is on: a region too small to show its content stands
+   * in for everything inside it; otherwise the item under the point, else the
+   * region whose header it is on.
+   */
+  const pick = (screenX: number, screenY: number): { item: MapItem | null; region: MapRegion | null } => {
+    const layout = sceneRef.current?.layout;
+    if (!layout) return { item: null, region: null };
+    const k = viewportRef.current.k;
     const point = toWorld(screenX, screenY);
-    const slop = 4 / viewportRef.current.k;
-    for (let i = scene.sim.nodes.length - 1; i >= 0; i--) {
-      const node = scene.sim.nodes[i];
-      const graphNode = scene.nodes[i];
-      if (!node || !graphNode || hiddenRef.current.has(graphNode.type)) continue;
-      const reach = (graphNode.type === 'file' ? node.radius * 1.5 : node.radius) + slop;
-      if (Math.hypot(point.x - node.x, point.y - node.y) <= reach) return i;
-    }
-    return null;
+    const hit = hitTest(layout, point.x, point.y, rowsHittable(k));
+    if (!hit.region) return { item: null, region: null };
+    const standIn = hit.region.chain.find(region => Math.max(region.w, region.h) * k < STAND_IN_PX);
+    if (standIn) return { item: null, region: standIn };
+    if (hit.item) return { item: hit.item, region: null };
+    const onHeader = (point.y - hit.region.y) * k <= Math.max(REGION_HEAD * k, 22);
+    return { item: null, region: onHeader ? hit.region : null };
   };
 
-  // A new graph keeps the positions of nodes it shares with the old one.
+  // A new layout keeps the view on the region it was showing, when it can.
   useEffect(() => {
     const previous = sceneRef.current;
-    sceneRef.current = buildScene(graph, previous);
-    fitPhaseRef.current = 'early';
-    userMovedRef.current = false;
+    sceneRef.current = scene;
+    hoverItemRef.current = null;
+    hoverRegionRef.current = null;
+    selectedRef.current = selectedId ? scene.layout.byId.get(selectedId) ?? null : null;
+    setHoverText(null);
     dirtyRef.current = true;
-  }, [graph]);
+    const { width, height } = sizeRef.current;
+    if (!previous || !userMovedRef.current || width === 0) {
+      fitFromEffect();
+      return;
+    }
+    const viewport = viewportRef.current;
+    const centre = { x: (width / 2 - viewport.x) / viewport.k, y: (height / 2 - viewport.y) / viewport.k };
+    const before = previous.layout.regions.filter(region => contains(region, centre.x, centre.y)).pop();
+    const after = before ? scene.layout.regionById.get(before.id) : undefined;
+    if (!before || !after) {
+      fitFromEffect();
+      return;
+    }
+    const x = after.x + Math.min(after.w, centre.x - before.x);
+    const y = after.y + Math.min(after.h, centre.y - before.y);
+    viewportRef.current = { k: viewport.k, x: width / 2 - x * viewport.k, y: height / 2 - y * viewport.k };
+  }, [scene]);
 
+  // Travel to a selection made elsewhere, such as from search.
   useEffect(() => {
-    hiddenRef.current = hidden;
+    const item = selectedId ? sceneRef.current?.layout.byId.get(selectedId) ?? null : null;
+    selectedRef.current = item;
     dirtyRef.current = true;
-  }, [hidden]);
-
-  // Keep the selection on screen when it was chosen outside the canvas.
-  useEffect(() => {
-    selectedRef.current = selectedId;
-    dirtyRef.current = true;
-    const scene = sceneRef.current;
-    const index = selectedId ? scene?.sim.index.get(selectedId) : undefined;
-    const node = index === undefined ? undefined : scene?.sim.nodes[index];
-    if (!node) return;
+    const here = selectedHereRef.current;
+    selectedHereRef.current = false;
+    if (!item || here) return;
     const viewport = viewportRef.current;
     const { width, height } = sizeRef.current;
-    const sx = node.x * viewport.k + viewport.x;
-    const sy = node.y * viewport.k + viewport.y;
-    if (Math.abs(sx) > width / 2 - 40 || Math.abs(sy) > height / 2 - 40) {
-      userMovedRef.current = true;
-      viewportRef.current = { ...viewport, x: -node.x * viewport.k, y: -node.y * viewport.k };
-    }
+    const sx = (item.x + item.w / 2) * viewport.k + viewport.x;
+    const sy = (item.y + item.h / 2) * viewport.k + viewport.y;
+    const inView = sx > 40 && sx < width - 40 && sy > 40 && sy < height - 40;
+    if (!inView || !labelReadable(item, viewport.k)) travel(viewportForItem(item));
   }, [selectedId]);
+
+  useEffect(() => {
+    kindsRef.current = kinds;
+    routesRef.current = routes;
+    // A blast radius is small enough to show every link in it.
+    allLinksRef.current = view === 'impact';
+    dirtyRef.current = true;
+  }, [kinds, routes, view]);
 
   // The animation loop, canvas sizing and the non-passive wheel handler.
   useEffect(() => {
     const canvas = canvasRef.current;
-    const container = containerRef.current;
-    if (!canvas || !container) return undefined;
+    const stage = stageRef.current;
+    const minimap = minimapRef.current;
+    if (!canvas || !stage) return undefined;
     const ctx = canvas.getContext('2d');
-    const palette = readPalette(container);
-    const reducedMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const miniCtx = minimap?.getContext('2d') ?? null;
+    // The map is drawn once per change into a cached copy; frames between
+    // changes only redraw the pulse of facts that need review.
+    const base = document.createElement('canvas');
+    const baseCtx = base.getContext('2d');
+    const palette: Palette = readPalette(stage);
+    reducedMotionRef.current = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     const resize = () => {
-      const rect = container.getBoundingClientRect();
+      const rect = stage.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
+      const first = sizeRef.current.width === 0;
       sizeRef.current = { width: rect.width, height: rect.height };
-      canvas.width = Math.max(1, Math.round(rect.width * dpr));
-      canvas.height = Math.max(1, Math.round(rect.height * dpr));
+      for (const target of [canvas, base]) {
+        target.width = Math.max(1, Math.round(rect.width * dpr));
+        target.height = Math.max(1, Math.round(rect.height * dpr));
+      }
       canvas.style.width = `${rect.width}px`;
       canvas.style.height = `${rect.height}px`;
+      if (minimap) {
+        minimap.width = Math.round(MINIMAP.width * dpr);
+        minimap.height = Math.round(MINIMAP.height * dpr);
+      }
+      if (first || !userMovedRef.current) fitFromEffect();
       dirtyRef.current = true;
     };
     resize();
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(resize) : null;
-    observer?.observe(container);
+    observer?.observe(stage);
 
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      zoomFromWheel(Math.exp(-event.deltaY * 0.0015), event.clientX - rect.left, event.clientY - rect.top);
+      zoomFromWheel(Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.0015)), event.clientX - rect.left, event.clientY - rect.top);
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
 
     let frame = 0;
+    let pulsing = false;
     const loop = (time: number) => {
       const scene = sceneRef.current;
-      if (scene && ctx) {
-        if (!isSettled(scene.sim)) {
-          const steps = reducedMotion ? 400 : scene.nodes.length < 900 ? 2 : 1;
-          for (let i = 0; i < steps && !isSettled(scene.sim); i++) tick(scene.sim);
-          dirtyRef.current = true;
-          if (!userMovedRef.current && fitPhaseRef.current === 'early' && scene.sim.alpha < 0.3) {
-            fitPhaseRef.current = 'settle';
-            fitFromLoop();
-          }
-          if (!userMovedRef.current && fitPhaseRef.current === 'settle' && isSettled(scene.sim)) {
-            fitPhaseRef.current = 'done';
-            fitFromLoop();
-          }
-        }
-        if (dirtyRef.current || (scene.hasDrift && !reducedMotion)) {
-          draw(ctx, scene, {
-            viewport: viewportRef.current, width: sizeRef.current.width, height: sizeRef.current.height,
-            dpr: window.devicePixelRatio || 1, time, hoverId: hoverRef.current, selectedId: selectedRef.current,
-            hidden: hiddenRef.current, palette, animate: !reducedMotion
+      const flight = flightRef.current;
+      if (flight) {
+        const t = Math.min(1, (time - flight.start) / FLY_MS);
+        const e = ease(Math.max(0, t));
+        const k = Math.exp(Math.log(flight.from.k) + (Math.log(flight.to.k) - Math.log(flight.from.k)) * e);
+        // Interpolate the world point at the centre, so the zoom does not swing sideways.
+        const { width, height } = sizeRef.current;
+        const fromCentre = { x: (width / 2 - flight.from.x) / flight.from.k, y: (height / 2 - flight.from.y) / flight.from.k };
+        const toCentre = { x: (width / 2 - flight.to.x) / flight.to.k, y: (height / 2 - flight.to.y) / flight.to.k };
+        const cx = fromCentre.x + (toCentre.x - fromCentre.x) * e;
+        const cy = fromCentre.y + (toCentre.y - fromCentre.y) * e;
+        viewportRef.current = { k, x: width / 2 - cx * k, y: height / 2 - cy * k };
+        if (t >= 1) flightRef.current = null;
+        dirtyRef.current = true;
+      }
+      if (scene && hoveredAtRef.current !== viewportRef.current) hoverFromLoop();
+      if (scene && ctx && baseCtx) {
+        const { width, height } = sizeRef.current;
+        const dpr = window.devicePixelRatio || 1;
+        const viewport = viewportRef.current;
+        const dirty = dirtyRef.current;
+        if (dirty) {
+          drawMap(baseCtx, scene, {
+            viewport, width, height, dpr, palette,
+            hoverItem: hoverItemRef.current, hoverRegion: hoverRegionRef.current, selected: selectedRef.current,
+            kinds: kindsRef.current, routes: routesRef.current, allLinks: allLinksRef.current
           });
+          if (miniCtx) drawMinimap(miniCtx, scene.layout, viewport, { width, height }, MINIMAP, dpr, palette);
+          const centre = { x: (width / 2 - viewport.x) / viewport.k, y: (height / 2 - viewport.y) / viewport.k };
+          const regions = scene.layout.regions.filter(region => contains(region, centre.x, centre.y)
+            && (region.w * viewport.k >= width * 0.3 || region.h * viewport.k >= height * 0.3));
+          const key = regions.map(region => region.id).join('|');
+          if (key !== trailKeyRef.current) {
+            trailKeyRef.current = key;
+            updateTrail(regions);
+          }
           dirtyRef.current = false;
+        }
+        if (dirty || pulsing) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.drawImage(base, 0, 0);
+          pulsing = !reducedMotionRef.current && drawPulse(ctx, scene, viewport, width, height, dpr, time, palette);
         }
       }
       frame = window.requestAnimationFrame(loop);
@@ -535,71 +371,88 @@ export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, c
     };
   }, []);
 
-  const localPoint = (event: PointerEvent<HTMLCanvasElement>) => {
+  const localPoint = (event: PointerEvent<HTMLElement> | MouseEvent<HTMLElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   };
 
+  const setHover = (item: MapItem | null, region: MapRegion | null) => {
+    if (item === hoverItemRef.current && region === hoverRegionRef.current) return;
+    hoverItemRef.current = item;
+    hoverRegionRef.current = region;
+    dirtyRef.current = true;
+    setHoverText(item ? describeNode(item.node) : region ? describeRegion(region) : null);
+  };
+
+  const placeTooltip = (x: number, y: number) => {
+    const tooltip = tooltipRef.current;
+    if (!tooltip) return;
+    const { width, height } = sizeRef.current;
+    tooltip.style.left = `${x}px`;
+    tooltip.style.top = `${y}px`;
+    tooltip.style.transform = `translate(${x > width * 0.6 ? 'calc(-100% - 14px)' : '14px'}, ${y > height * 0.75 ? 'calc(-100% - 14px)' : '14px'})`;
+  };
+
   const onPointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
     const point = localPoint(event);
-    const index = hitTest(point.x, point.y);
-    const scene = sceneRef.current;
-    const node = index === null ? undefined : scene?.sim.nodes[index];
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    if (node) node.pinned = true;
-    dragRef.current = {
-      pointerId: event.pointerId, index, startX: point.x, startY: point.y,
-      originX: viewportRef.current.x, originY: viewportRef.current.y, moved: false
-    };
+    capture(event.currentTarget, event.pointerId);
+    flightRef.current = null;
+    dragRef.current = { pointerId: event.pointerId, startX: point.x, startY: point.y, origin: viewportRef.current, moved: false };
   };
 
   const onPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
     const point = localPoint(event);
     const drag = dragRef.current;
-    const scene = sceneRef.current;
     if (drag && drag.pointerId === event.pointerId) {
       if (Math.hypot(point.x - drag.startX, point.y - drag.startY) > 3) drag.moved = true;
       if (!drag.moved) return;
       userMovedRef.current = true;
-      const node = drag.index === null ? undefined : scene?.sim.nodes[drag.index];
-      if (node && scene) {
-        const world = toWorld(point.x, point.y);
-        node.x = world.x;
-        node.y = world.y;
-        reheat(scene.sim, 0.12);
-      } else {
-        viewportRef.current = { ...viewportRef.current, x: drag.originX + point.x - drag.startX, y: drag.originY + point.y - drag.startY };
-      }
+      viewportRef.current = { ...drag.origin, x: drag.origin.x + point.x - drag.startX, y: drag.origin.y + point.y - drag.startY };
       dirtyRef.current = true;
       return;
     }
-    const index = hitTest(point.x, point.y);
-    const hovered = index === null ? null : scene?.nodes[index] ?? null;
-    if ((hovered?.id ?? null) !== hoverRef.current) {
-      hoverRef.current = hovered?.id ?? null;
-      dirtyRef.current = true;
-      setHoverLabel(hovered ? describeNode(hovered) : null);
-    }
+    pointerRef.current = point;
+    hoveredAtRef.current = viewportRef.current;
+    const hit = pick(point.x, point.y);
+    setHover(hit.item, hit.region);
+    placeTooltip(point.x, point.y);
   };
 
   const endDrag = (event: PointerEvent<HTMLCanvasElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
+    // Capture ends by itself after pointerup or pointercancel.
     dragRef.current = null;
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
-    const scene = sceneRef.current;
-    const node = drag.index === null ? undefined : scene?.sim.nodes[drag.index];
-    if (node) node.pinned = false;
-    if (!drag.moved) onSelect(drag.index === null ? null : scene?.nodes[drag.index] ?? null);
+    if (drag.moved || event.type === 'pointercancel') return;
+    const { item, region } = pick(drag.startX, drag.startY);
+    // A click on a region too small to show its content travels into it.
+    if (!item && region && Math.max(region.w, region.h) * viewportRef.current.k < STAND_IN_PX) {
+      travel(viewportFor(region));
+      return;
+    }
+    selectedHereRef.current = item !== null;
+    onSelect(item?.node ?? null);
+  };
+
+  const onDoubleClick = (event: MouseEvent<HTMLCanvasElement>) => {
+    const point = localPoint(event);
+    const layout = sceneRef.current?.layout;
+    if (!layout) return;
+    const world = toWorld(point.x, point.y);
+    const hit = hitTest(layout, world.x, world.y, rowsHittable(viewportRef.current.k));
+    if (hit.item) travel(viewportForItem(hit.item));
+    else if (hit.region) travel(viewportFor(hit.region));
+    else travel(viewportFor(layout.bounds));
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLCanvasElement>) => {
-    const step = 60;
+    const step = 80;
     const viewport = viewportRef.current;
     const pans: Record<string, [number, number]> = { ArrowLeft: [step, 0], ArrowRight: [-step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] };
     const pan = pans[event.key];
     if (pan) {
       userMovedRef.current = true;
+      flightRef.current = null;
       viewportRef.current = { ...viewport, x: viewport.x + pan[0], y: viewport.y + pan[1] };
       dirtyRef.current = true;
     } else if (event.key === '+' || event.key === '=') zoomBy(1.25);
@@ -610,21 +463,32 @@ export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, c
     event.preventDefault();
   };
 
-  const toggleType = (type: NodeType) => {
-    setHidden(current => {
-      const next = new Set(current);
-      if (next.has(type)) next.delete(type);
-      else next.add(type);
-      return next;
-    });
+  const minimapTo = (event: PointerEvent<HTMLCanvasElement>) => {
+    const layout = sceneRef.current?.layout;
+    if (!layout) return;
+    const point = localPoint(event);
+    const t = minimapTransform(layout, MINIMAP.width, MINIMAP.height);
+    const world = { x: (point.x - t.offsetX) / t.scale, y: (point.y - t.offsetY) / t.scale };
+    const { width, height } = sizeRef.current;
+    const k = viewportRef.current.k;
+    userMovedRef.current = true;
+    flightRef.current = null;
+    viewportRef.current = { k, x: width / 2 - world.x * k, y: height / 2 - world.y * k };
+    dirtyRef.current = true;
   };
-
-  const typeCounts: Record<NodeType, number> = { file: 0, symbol: 0, fact: 0, session: 0 };
-  for (const node of graph.nodes) typeCounts[node.type]++;
 
   return (
     <section className="graph" aria-label="Graph">
       <div className="graph__toolbar">
+        <button
+          type="button"
+          className="icon-button"
+          aria-label={panelOpen ? 'Hide map controls' : 'Show map controls'}
+          aria-expanded={panelOpen}
+          onClick={() => setPanelOpen(!panelOpen)}
+        >
+          {panelOpen ? <PanelLeftClose size={16} aria-hidden="true" /> : <PanelLeftOpen size={16} aria-hidden="true" />}
+        </button>
         <div className="pill-group" role="toolbar" aria-label="Graph views">
           {VIEW_PILLS.map(pill => {
             const disabled = pill.view === 'impact' && !canFocus && view !== 'impact';
@@ -651,56 +515,80 @@ export function GraphCanvas({ graph, selectedId, onSelect, view, onViewChange, c
         </div>
       </div>
 
-      <div ref={containerRef} className="graph__stage">
-        <canvas
-          ref={canvasRef}
-          className="graph__canvas"
-          tabIndex={0}
-          role="application"
-          aria-roledescription="graph canvas"
-          aria-label={`Graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges`}
-          aria-describedby="graph-help"
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
-          onPointerLeave={() => {
-            if (hoverRef.current !== null) {
-              hoverRef.current = null;
-              dirtyRef.current = true;
-              setHoverLabel(null);
-            }
-          }}
-          onKeyDown={onKeyDown}
-        />
-        <p id="graph-help" className="visually-hidden">
-          Arrow keys pan, plus and minus zoom, 0 fits the graph, Escape clears the selection.
-          Press Control K to search for a node.
-        </p>
-        {hoverLabel && <div className="graph__hover" aria-live="polite">{hoverLabel}</div>}
-        {graph.stats.truncated && (
-          <p className="graph__notice" role="status">
-            Showing the {graph.nodes.length} most connected nodes of a larger graph. Narrow it with a view or filter.
-          </p>
+      <div className="graph__body">
+        {panelOpen && (
+          <MapPanel
+            graph={graph}
+            layers={layers}
+            onLayersChange={setLayers}
+            kinds={kinds}
+            onKindsChange={setKinds}
+            routes={routes}
+            onRoutesChange={setRoutes}
+            tree={tree}
+            hidden={hiddenRegions}
+            onHiddenChange={setHiddenRegions}
+            onFlyTo={flyToRegion}
+          />
         )}
-      </div>
 
-      <ul className="legend" aria-label="Node types">
-        {LEGEND.map(item => (
-          <li key={item.type}>
-            <button
-              type="button"
-              className={`legend__item legend__item--${item.type}`}
-              aria-pressed={!hidden.has(item.type)}
-              onClick={() => toggleType(item.type)}
-            >
-              <span className="legend__swatch" aria-hidden="true" />
-              {item.label}
-              <span className="legend__count">{typeCounts[item.type]}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
+        <div ref={stageRef} className="graph__stage">
+          <canvas
+            ref={canvasRef}
+            className={`graph__canvas${hoverText ? ' graph__canvas--pointing' : ''}`}
+            tabIndex={0}
+            role="application"
+            aria-roledescription="graph map"
+            aria-label={`Map of ${shown.length} nodes in ${scene.layout.regions.length} regions, with ${graph.edges.length} edges`}
+            aria-describedby="graph-help"
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            onPointerLeave={() => {
+              pointerRef.current = null;
+              setHover(null, null);
+            }}
+            onDoubleClick={onDoubleClick}
+            onKeyDown={onKeyDown}
+          />
+          <p id="graph-help" className="visually-hidden">
+            Arrow keys pan, plus and minus zoom, 0 fits the map, Escape clears the selection.
+            Press Control K to search for a node. The Regions list in the map controls travels to a region.
+          </p>
+          <nav className="graph__trail" aria-label="You are here">
+            {trail.length === 0 ? <span className="muted">Overview</span> : trail.map((region, i) => (
+              <span key={region.id} className="graph__trail-step">
+                {i > 0 && <span aria-hidden="true">›</span>}
+                <button type="button" className="link-button" onClick={() => flyToRegion(region.id)}>{region.label}</button>
+              </span>
+            ))}
+          </nav>
+          <div ref={tooltipRef} className="graph__hover" aria-live="polite" hidden={!hoverText}>{hoverText}</div>
+          {shown.length === 0 && <p className="graph__empty">Every node here is hidden by the map controls. Turn a layer or region back on.</p>}
+          {graph.stats.truncated && !noticeDismissed && (
+            <p className="graph__notice" role="status">
+              Showing the {graph.nodes.length.toLocaleString()} most connected nodes of a larger graph. Narrow it with a path prefix.
+              <button type="button" className="icon-button graph__notice-close" aria-label="Dismiss" onClick={() => setNoticeDismissed(true)}>
+                <X size={14} aria-hidden="true" />
+              </button>
+            </p>
+          )}
+          <canvas
+            ref={minimapRef}
+            className="graph__minimap"
+            style={{ width: MINIMAP.width, height: MINIMAP.height }}
+            aria-label="Minimap: click or drag to move the view"
+            onPointerDown={event => {
+              capture(event.currentTarget, event.pointerId);
+              minimapDragRef.current = event.pointerId;
+              minimapTo(event);
+            }}
+            onPointerMove={event => { if (minimapDragRef.current === event.pointerId) minimapTo(event); }}
+            onPointerUp={() => { minimapDragRef.current = null; }}
+          />
+        </div>
+      </div>
     </section>
   );
 }

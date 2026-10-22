@@ -58,7 +58,7 @@ describe('App', () => {
     const api = fakeApi();
     render(<App api={api} />);
 
-    await screen.findByRole('application', { name: /Graph with 4 nodes/ });
+    await screen.findByRole('application', { name: /Map of 4 nodes/ });
     fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
     const input = await screen.findByRole('combobox', { name: 'Search symbols, files and facts' });
     fireEvent.change(input, { target: { value: 'addUser' } });

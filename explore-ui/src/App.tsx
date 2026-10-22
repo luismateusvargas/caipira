@@ -68,6 +68,9 @@ interface GraphFilters {
 
 const SYMBOL_KINDS = ['function', 'method', 'component', 'class', 'struct', 'interface', 'trait', 'enum', 'type', 'union', 'const', 'variable'];
 
+// The map draws thousands of nodes legibly, so it asks for the server's maximum.
+const GRAPH_NODE_LIMIT = 5000;
+
 function symbolIdOf(nodeId: string | null): number | null {
   const match = nodeId?.match(/^symbol:(\d+)$/);
   return match?.[1] ? Number(match[1]) : null;
@@ -103,6 +106,7 @@ function Explorer({ api, workspaceId, workspaces, onWorkspaceChange }: ExplorerP
     graphKey,
     signal => api.getGraph({
       workspaceId, view, depth,
+      limit: GRAPH_NODE_LIMIT,
       symbolId: focus ?? undefined,
       pathPrefix: filters.pathPrefix || undefined,
       kind: filters.kind || undefined,
@@ -333,34 +337,47 @@ function GraphFiltersForm({ filters, onApply }: { filters: GraphFilters; onApply
     event.preventDefault();
     onApply({ ...draft, pathPrefix: draft.pathPrefix.trim() });
   };
+  const active = filters.pathPrefix !== '' || filters.kind !== '' || filters.category !== '';
+  const clear = () => {
+    const none: GraphFilters = { pathPrefix: '', kind: '', category: '' };
+    setDraft(none);
+    onApply(none);
+  };
   return (
     <form className="filters" aria-label="Graph filters" onSubmit={submit}>
-      <label htmlFor={`${id}-path`} className="visually-hidden">Path prefix</label>
-      <input
-        id={`${id}-path`}
-        type="text"
-        placeholder="Path prefix, e.g. src/api"
-        value={draft.pathPrefix}
-        onChange={event => setDraft(current => ({ ...current, pathPrefix: event.target.value }))}
-      />
-      <label htmlFor={`${id}-kind`} className="visually-hidden">Symbol kind</label>
-      <select id={`${id}-kind`} value={draft.kind} onChange={event => setDraft(current => ({ ...current, kind: event.target.value }))}>
-        <option value="">All symbol kinds</option>
-        {SYMBOL_KINDS.map(kind => <option key={kind} value={kind}>{kind}</option>)}
-      </select>
-      <label htmlFor={`${id}-category`} className="visually-hidden">Fact category</label>
-      <select
-        id={`${id}-category`}
-        value={draft.category}
-        onChange={event => {
-          const value = event.target.value;
-          if (value === '' || isFactCategory(value)) setDraft(current => ({ ...current, category: value }));
-        }}
-      >
-        <option value="">All fact kinds</option>
-        {FACT_CATEGORIES.map(kind => <option key={kind} value={kind}>{kind}</option>)}
-      </select>
+      <div className="filters__field filters__field--grow">
+        <label htmlFor={`${id}-path`} className="filters__label">Path prefix</label>
+        <input
+          id={`${id}-path`}
+          type="text"
+          placeholder="e.g. src/api"
+          value={draft.pathPrefix}
+          onChange={event => setDraft(current => ({ ...current, pathPrefix: event.target.value }))}
+        />
+      </div>
+      <div className="filters__field">
+        <label htmlFor={`${id}-kind`} className="filters__label">Symbol kind</label>
+        <select id={`${id}-kind`} value={draft.kind} onChange={event => setDraft(current => ({ ...current, kind: event.target.value }))}>
+          <option value="">All symbol kinds</option>
+          {SYMBOL_KINDS.map(kind => <option key={kind} value={kind}>{kind}</option>)}
+        </select>
+      </div>
+      <div className="filters__field">
+        <label htmlFor={`${id}-category`} className="filters__label">Fact category</label>
+        <select
+          id={`${id}-category`}
+          value={draft.category}
+          onChange={event => {
+            const value = event.target.value;
+            if (value === '' || isFactCategory(value)) setDraft(current => ({ ...current, category: value }));
+          }}
+        >
+          <option value="">All fact kinds</option>
+          {FACT_CATEGORIES.map(kind => <option key={kind} value={kind}>{kind}</option>)}
+        </select>
+      </div>
       <button type="submit" className="button button--ghost">Apply</button>
+      {active && <button type="button" className="button button--ghost" onClick={clear}>Clear</button>}
     </form>
   );
 }
