@@ -56,6 +56,7 @@ Outside scope: cloud sync, remote or paid LLM calls, multi-tenant or external ve
   - Deployment state: `.caipira-clients.json` records the selected clients and `.caipira-startup-files.json` the shell startup files Caipira owns.
   - The deployed code, `node22/`, `node_modules/`, `models/`, `bin/caipira-ast`, and `explore-ui/dist/`.
   - Uninstall removes registrations and leaves `database/` untouched.
+  - `prune --apply` removes registry rows whose root is no longer found, and moves their databases and any unclaimed `.db` files into `database/archive/<timestamp>/`. `doctor` reports such rows as a warning, not a failure.
 - **Writes outside `CAIPIRA_HOME` (installer only).**
   - Client configuration for selected clients: `~/.claude.json`, `~/.claude/settings.json`, `~/.codex/config.toml`, `~/.gemini/config/mcp_config.json`, `~/.gemini/config/hooks.json`. Each write is atomic and first saves a `.caipira-backup` copy.
   - The POSIX launcher `~/.local/bin/caipira`, plus one marked PATH block in the shell startup file when `~/.local/bin` is not on PATH.
@@ -86,6 +87,7 @@ Outside scope: cloud sync, remote or paid LLM calls, multi-tenant or external ve
 9. **Consent and writes.** Client selection and consent come before any filesystem write. Runtime and dependency upgrades are staged and promoted by rename, and they keep or restore the previous copy on failure. A failed rollback keeps the recovery files and reports where they are. Superseded Node releases are removed only after a successful install.
 10. **Optional assets never block install.** A missing AST binary, UI bundle, or model produces a warning and keeps any deployed copy. It never prevents client registration.
 11. **Single release version.** `package.json`, `package-lock.json`, `runtime/package.json`, and `runtime/package-lock.json` always carry the same version, and a release tag `vX.Y.Z` must equal it. `test/test-runtime.js` checks the runtime manifest and lockfile against the root version. The release workflow rejects a tag that differs from either `package.json`.
+12. **Never delete memory.** No command deletes workspace databases, facts, or observations. A moved, renamed, or unmounted project is indistinguishable from a deleted one, so cleanup archives files instead of removing them, and only the user deletes the archive. Housekeeping findings in `doctor` are warnings, not failures. (User decision, 2026-10-22.)
 
 ## Logging policy
 

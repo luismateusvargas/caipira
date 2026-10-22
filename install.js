@@ -1049,8 +1049,12 @@ function doctor() {
     const master = openMaster();
     const dangling = danglingWorkspaces(master);
     master.close();
-    check('no dangling workspace registry rows', dangling.length === 0,
-      `${dangling.length} row(s) whose root is gone — run: caipira prune --apply`);
+    // Housekeeping, not breakage: the root may only be moved or unmounted.
+    if (!dangling.length) ok('no dangling workspace registry rows');
+    else {
+      const roots = dangling.slice(0, 3).map(row => row.root_path).join(', ') + (dangling.length > 3 ? ', …' : '');
+      warn(`${dangling.length} workspace root(s) no longer found (${roots}) — caipira prune --apply archives their databases`);
+    }
   } catch (error) {
     problems++;
     fail(`workspace registry — ${error.message}`);
@@ -1090,9 +1094,26 @@ function danglingWorkspaces(master) {
   return master.prepare('SELECT * FROM workspaces').all().filter(isDangling);
 }
 
+// Pruning never deletes memory: a moved, renamed or unmounted project looks
+// gone too, so its database is moved into database/archive/ instead.
+function archiveDatabase(file, archiveDir) {
+  let moved = 0;
+  for (const suffix of ['', '-wal', '-shm']) {
+    const source = file + suffix;
+    if (!fs.existsSync(source)) continue;
+    const target = path.join(archiveDir, path.basename(source));
+    if (fs.existsSync(target)) throw new Error(`archive target already exists: ${target}`);
+    fs.mkdirSync(archiveDir, { recursive: true });
+    fs.renameSync(source, target);
+    moved++;
+  }
+  return moved;
+}
+
 function prune() {
   const { openMaster, DB_DIR } = require('./workspace');
   const apply = process.argv.includes('--apply');
+  const archiveDir = path.join(DB_DIR, 'archive', new Date().toISOString().replace(/[:.]/g, '-'));
   const master = openMaster();
   const rows = master.prepare('SELECT * FROM workspaces').all();
   const dangling = rows.filter(isDangling);
@@ -1110,34 +1131,29 @@ function prune() {
   let files = 0;
   const owned = new Set(rows.map(row => path.basename(row.db_file)));
   for (const row of dangling) {
-    log(`  ${apply ? 'drop ' : 'would'} #${row.id} ${row.root_path} -> ${path.basename(row.db_file)}`);
+    log(`  ${apply ? 'archive' : 'would archive'} #${row.id} ${row.root_path} -> ${path.basename(row.db_file)}`);
     if (!apply) continue;
-    // Registry row first: if this throws, the files are still there and a
-    // rerun is a clean retry. The other order strands a live row pointing at
-    // a database that no longer exists.
+    // Registry row first: if archiving then fails, the files stay unclaimed
+    // under database/ and a rerun archives them. The other order strands a
+    // live row pointing at a database that is no longer there.
     master.transaction(() => {
       master.prepare('DELETE FROM workspace_links WHERE from_id = ? OR to_id = ?').run(row.id, row.id);
       master.prepare('DELETE FROM workspaces WHERE id = ?').run(row.id);
     })();
-    for (const suffix of ['', '-wal', '-shm']) {
-      const file = row.db_file + suffix;
-      if (fs.existsSync(file)) { fs.rmSync(file, { force: true }); files++; }
-    }
+    files += archiveDatabase(row.db_file, archiveDir);
   }
 
   // A .db under database/ that no surviving row claims is an orphan too.
   for (const file of fs.readdirSync(DB_DIR)) {
     if (!/\.db$/.test(file) || file === 'master.db' || owned.has(file)) continue;
-    log(`  ${apply ? 'drop ' : 'would'} unclaimed file ${file}`);
-    if (!apply) continue;
-    for (const suffix of ['', '-wal', '-shm']) {
-      const full = path.join(DB_DIR, file + suffix);
-      if (fs.existsSync(full)) { fs.rmSync(full, { force: true }); files++; }
-    }
+    log(`  ${apply ? 'archive' : 'would archive'} unclaimed file ${file}`);
+    if (apply) files += archiveDatabase(path.join(DB_DIR, file), archiveDir);
   }
 
   master.close();
-  log(apply ? `\n${dangling.length} row(s), ${files} file(s) removed.\n` : '\nDry run — re-run with --apply to delete.\n');
+  log(apply
+    ? `\n${dangling.length} registry row(s) removed; ${files} file(s) moved to ${archiveDir}. No memory was deleted: move a file back into ${DB_DIR} to restore it, or delete the archive when you no longer need it.\n`
+    : '\nDry run — re-run with --apply to archive. Prune never deletes memory.\n');
 }
 
 function currentMode() {

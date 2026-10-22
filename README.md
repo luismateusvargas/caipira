@@ -171,12 +171,12 @@ Run via `~/.caipira/caipira.sh <command>` on Linux/macOS or `caipira.cmd <comman
 | :--- | :--- |
 | `install [--clients <list>] [--accept-risk]` | Provision pinned Node 22.23.4 and locked dependencies, synchronize the runtime and optional AST/UI assets, install the PATH launcher, and register detected or selected clients. |
 | `explore [flags]` | Incrementally index the target workspace and launch the local graph & symbol inspector UI (`--port 4777`, `--host 127.0.0.1`, `--workspace <path>`, `--no-open`). |
-| `doctor` | Verify deployed Node 22.23.4 and native SQLite, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, dangling registry rows, selected client configs, and active mode; warn when retained error logs are non-empty. |
+| `doctor` | Verify deployed Node 22.23.4 and native SQLite, ONNX model, `caipira-ast` binary, `explore-ui/dist` bundle, `master.db`, all workspace databases, selected client configs, and active mode; warn about dangling registry rows and non-empty error logs. |
 | `status` | Display current compression mode, retained error count, and aggregated counts of workspaces, observations, embeddings, facts, and recent sessions. |
 | `logs [--limit N] [--clear]` | Show the newest 20 errors (or N) with sanitized one-line reproduction commands; `--clear` removes the journal and backup. Works even when native SQLite cannot load. |
 | `mode <lite\|full\|ultra>` | Set the active prose compression intensity for newly recorded observations. |
-| `prune` | Dry-run report of dangling workspace registry rows (whose project root was deleted) and unclaimed `.db` files. |
-| `prune --apply` | Delete dangling workspace rows and their associated `.db` / `-wal` / `-shm` files. |
+| `prune` | Dry-run report of dangling workspace registry rows (whose project root is no longer found) and unclaimed `.db` files. `doctor` shows these as a warning. |
+| `prune --apply` | Remove dangling registry rows and move their `.db` / `-wal` / `-shm` files, and any unclaimed `.db` files, into `database/archive/<timestamp>/`. Nothing is deleted: a moved, renamed, or unmounted project also looks gone, so its memory stays recoverable. Move a file back into `database/` to restore it, or delete the archive yourself. |
 | `uninstall` | Remove Caipira MCP and hook registrations from Claude Code, Codex, and Antigravity (leaves `~/.caipira/database/` untouched). |
 
 ### Launching the Visual Explorer (`caipira explore`)

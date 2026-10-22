@@ -178,6 +178,48 @@ r = caipira('doctor');
 check('workspace databases verified', /\[ok\] +2 workspace database\(s\) open/.test(r.out), r.out);
 check('missing Codex config is a warning', /\[warn\] Codex not detected — checks skipped/.test(r.out) && !/\[FAIL\] Codex/.test(r.out), r.out);
 
+console.log('\n3a. a vanished workspace root is a doctor warning, and prune archives instead of deleting');
+const { openMaster, DB_DIR } = require(ROOT + '/workspace.js');
+const goneRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'caipira-gone-'));
+fs.writeFileSync(path.join(goneRoot, 'package.json'), '{}');
+const gone = ensureWorkspace(goneRoot);
+const goneStore = new MemoryStore({ dbPath: gone.dbFile });
+goneStore.startSession({ id: 'gone-session', ide: 'test', cwd: goneRoot });
+goneStore.addObservation({ session_id: 'gone-session', kind: 'note', content: 'memory that must survive pruning' });
+goneStore.close();
+const goneDb = openWorkspaceDb(gone.dbFile);
+try {
+  new FactStore(goneDb, { machine: machineId(), agent: 'test' }).record({ kind: 'decision', title: 'kept after prune', body: 'archived, never deleted' });
+} finally {
+  goneDb.close();
+}
+fs.rmSync(goneRoot, { recursive: true, force: true });
+const orphan = path.join(DB_DIR, 'orphan-0000.db');
+fs.writeFileSync(orphan, 'unclaimed database bytes');
+
+r = caipira('doctor');
+check('a vanished root is a warning naming it, not a failure',
+  r.out.includes(`[warn] 1 workspace root(s) no longer found (${goneRoot})`) && !/\[FAIL\].*dangling/.test(r.out), r.out);
+r = caipira('prune');
+check('prune dry run lists the archive plan and moves nothing', r.code === 0 && r.out.includes(`would archive #${gone.id}`) &&
+  r.out.includes('would archive unclaimed file orphan-0000.db') && fs.existsSync(gone.dbFile) && fs.existsSync(orphan), r.out);
+
+const digest = file => require('crypto').createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const goneFiles = ['', '-wal', '-shm'].map(suffix => gone.dbFile + suffix).filter(fs.existsSync);
+const archivedDigests = new Map([...goneFiles, orphan].map(file => [path.basename(file), digest(file)]));
+r = caipira('prune', '--apply');
+const archives = fs.existsSync(path.join(DB_DIR, 'archive')) ? fs.readdirSync(path.join(DB_DIR, 'archive')) : [];
+const archived = archives.length === 1 ? path.join(DB_DIR, 'archive', archives[0]) : '';
+check('prune --apply moves every database file byte-for-byte into one archive folder', r.code === 0 && archived &&
+  [...archivedDigests].every(([name, hash]) => fs.existsSync(path.join(archived, name)) && digest(path.join(archived, name)) === hash) &&
+  [...goneFiles, orphan].every(file => !fs.existsSync(file)), r.out);
+const master = openMaster();
+const remaining = master.prepare('SELECT root_path FROM workspaces').all().map(row => row.root_path);
+master.close();
+check('only the vanished registry row is removed', !remaining.includes(goneRoot) && remaining.filter(Boolean).length === 2, remaining);
+r = caipira('doctor');
+check('doctor is clean again after archiving', r.out.includes('[ok]   no dangling workspace registry rows'), r.out);
+
 console.log('\n4. launchers never leak CAIPIRA_HOME into the child');
 const cmd = fs.readFileSync(path.join(ROOT, 'caipira.cmd'), 'utf8');
 const sh = fs.readFileSync(path.join(ROOT, 'caipira.sh'), 'utf8');
