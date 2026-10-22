@@ -122,7 +122,7 @@ Aliases `claude` and `agy` are accepted. The list restricts registration to thos
 
 On Linux and macOS, installation creates `~/.local/bin/caipira`. If needed, add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc and open a new terminal. On Windows, installation adds the deployment directory (normally `%USERPROFILE%\.caipira`) to the User `PATH`; open a new terminal to use it. Then `caipira explore --no-open` works from any directory and selects that directory's workspace.
 
-Installing from a separate checkout synchronizes the core JavaScript runtime, hooks, installer, launchers, package metadata, built UI, and AST executable into `~/.caipira` (or `CAIPIRA_HOME`). Provision the bundled Node 22, dependencies, and model in both the build checkout and deployment first; downloading and packaging these prerequisites is separate from runtime synchronization. Existing databases, logs, models, and dependencies are preserved.
+Installing from a separate checkout synchronizes the core JavaScript runtime, hooks, installer, launchers, package metadata, built UI, and AST executable into `~/.caipira` (or `CAIPIRA_HOME`). Provision the bundled Node 22, dependencies, and model in both the build checkout and deployment first; downloading and packaging these prerequisites is separate from runtime synchronization. If the deployment interpreter or native dependency package is missing, installation exits with code 1 before deployment, launcher or client configuration writes and names the missing paths. Existing databases, logs, models, and dependencies are preserved.
 
 ### What `install` Does
 - Installs root npm dependencies (`better-sqlite3`, `@xenova/transformers`) using the bundled Node 22 runtime if not already present.
@@ -221,7 +221,7 @@ touch /path/to/workspace-root/.caipira-workspace
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `CAIPIRA_HOME` | `~/.caipira` | Redirects databases and logs to a custom directory; `install` also synchronizes the checkout runtime and points the PATH launcher there. |
+| `CAIPIRA_HOME` | `~/.caipira` | Redirects databases and logs to a custom directory. During install, it also selects the runtime deployment and launcher target. Hooks, MCP and the launcher read this variable from their own environment (default `~/.caipira`); install does not register it in client configurations. |
 | `CAIPIRA_AST_BIN` | `<root>/bin/caipira-ast` | Overrides the path to the `caipira-ast` executable. |
 | `CAIPIRA_MODEL_PATH` | `<root>/models` or `~/.caipira/models` | Overrides the directory containing `Xenova/all-MiniLM-L6-v2`. |
 | `CAIPIRA_DEBUG` | unset (`0`) | Set `CAIPIRA_DEBUG=1` to enable `<private>`-redacted MCP JSON-RPC traffic logging to `logs/mcp_traffic.log` (rotates to `.1` at 5 MB). |

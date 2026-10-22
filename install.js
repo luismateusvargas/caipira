@@ -27,6 +27,7 @@ const ROOT = __dirname;
 const HOME = os.homedir();
 const HOME_DIR = process.env.CAIPIRA_HOME ? path.resolve(process.env.CAIPIRA_HOME) : path.join(HOME, '.caipira');
 const IS_WINDOWS = process.platform === 'win32';
+const PATH_REGISTRY_TIMEOUT_MS = 15_000;
 const NODE_RELEASE = `node-v22.20.0-${IS_WINDOWS ? 'win' : process.platform}-${process.arch}`;
 const NODE_DIR = path.join(ROOT, 'node22', NODE_RELEASE);
 const NODE_BIN = IS_WINDOWS ? path.join(NODE_DIR, 'node.exe') : path.join(NODE_DIR, 'bin', 'node');
@@ -352,7 +353,7 @@ function registerPath() {
       '} finally { $key.Close() }'
     ].join('\n');
     execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      env: { ...process.env, CAIPIRA_PATH_TARGET: HOME_DIR }, stdio: 'pipe', timeout: 15000, windowsHide: true
+      env: { ...process.env, CAIPIRA_PATH_TARGET: HOME_DIR }, stdio: 'pipe', timeout: PATH_REGISTRY_TIMEOUT_MS, windowsHide: true
     });
     ok(`User PATH includes ${HOME_DIR} (open a new terminal)`);
     return;
@@ -360,8 +361,15 @@ function registerPath() {
   const bin = path.join(HOME, '.local', 'bin');
   const launcher = path.join(bin, 'caipira');
   const quoted = `'${path.join(HOME_DIR, 'caipira.sh').replace(/'/g, `'\\''`)}'`;
-  writeTextAtomic(launcher, `#!/bin/sh\nexec ${quoted} "$@"\n`);
-  fs.chmodSync(launcher, 0o755);
+  fs.mkdirSync(bin, { recursive: true });
+  const tmp = `${launcher}.caipira-tmp`;
+  try {
+    fs.writeFileSync(tmp, `#!/bin/sh\nexec ${quoted} "$@"\n`, 'utf8');
+    fs.chmodSync(tmp, 0o755);
+    fs.renameSync(tmp, launcher);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
   ok(`launcher installed at ${launcher}`);
   if (!(process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === bin)) {
     warn('add export PATH="$HOME/.local/bin:$PATH" to your shell rc, then open a new terminal');
@@ -384,7 +392,7 @@ function registerMcpServer(options) {
     type: 'stdio',
     command: runtime.node,
     args: [runtime.mcp],
-    env: { CAIPIRA_MODEL_PATH: runtime.models, CAIPIRA_HOME: HOME_DIR }
+    env: { CAIPIRA_MODEL_PATH: runtime.models }
   };
   writeJsonAtomic(CLAUDE_JSON, config);
   ok('MCP server "caipira" registered (user scope)');
@@ -434,7 +442,7 @@ function registerCodex(options) {
   let appended = '';
   if (!out.some(line => /^\[mcp_servers\.caipira\]/.test(line))) {
     appended += `\n[mcp_servers.caipira]\ncommand = ${JSON.stringify(runtime.node)}\nargs = [${JSON.stringify(runtime.mcp)}]\n`
-      + `env = { CAIPIRA_HOME = ${JSON.stringify(HOME_DIR)}, CAIPIRA_MODEL_PATH = ${JSON.stringify(runtime.models)} }\n`;
+      + `env = { CAIPIRA_MODEL_PATH = ${JSON.stringify(runtime.models)} }\n`;
   }
   for (const [toml, , lifecycle] of CODEX_HOOKS) {
     appended += `\n[[hooks.${toml}]]\n[[hooks.${toml}.hooks]]\ntype = "command"\n`
@@ -464,7 +472,7 @@ function registerAntigravity(options) {
   config.mcpServers.caipira = {
     command: runtime.node,
     args: [runtime.mcp],
-    env: { CAIPIRA_MODEL_PATH: runtime.models, CAIPIRA_HOME: HOME_DIR }
+    env: { CAIPIRA_MODEL_PATH: runtime.models }
   };
   writeJsonAtomic(ANTIGRAVITY_MCP, config);
   ok('MCP server "caipira" registered for Antigravity');
@@ -866,6 +874,16 @@ function logs() {
 async function install() {
   const options = await selectClients(process.argv.slice(3));
   if (!options) return;
+  if (realPath(HOME_DIR) !== realPath(ROOT)) {
+    const missing = [runtimePaths().node, path.join(HOME_DIR, 'node_modules', 'better-sqlite3', 'package.json')]
+      .filter(file => !fs.existsSync(file));
+    if (missing.length) {
+      for (const file of missing) fail(`deployment prerequisite missing: ${file}`);
+      fail(`Provision Node 22 and dependencies in ${HOME_DIR} before installing from a checkout.`);
+      process.exitCode = 1;
+      return;
+    }
+  }
   log('\nInstalling Caipira\n');
   installDependencies();
   buildAstEngine();

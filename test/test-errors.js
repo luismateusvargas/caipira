@@ -266,10 +266,19 @@ test('a closed output pipe preserves doctor failure status without changing the 
 });
 test('installer command failures are journaled without running installation steps', () => {
   readErrors({ clear: true });
+  // Satisfy the checkout deployment preflight; execFileSync below is still
+  // replaced before the installer can run any dependency/build command.
+  const release = `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`;
+  for (const rel of [`node22/${release}/${process.platform === 'win32' ? 'node.exe' : 'bin/node'}`,
+    'node_modules/better-sqlite3/package.json']) {
+    const marker = path.join(home, rel);
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, 'unused prerequisite fixture');
+  }
   const preload = path.join(home, 'installer-failure.cjs');
   fs.writeFileSync(preload, `
     const fs = require('fs'), exists = fs.existsSync;
-    fs.existsSync = file => /node_modules[\\\\/]better-sqlite3[\\\\/]package.json$/.test(String(file)) ? false : exists(file);
+    fs.existsSync = file => String(file) === ${JSON.stringify(path.join(ROOT, 'node_modules', 'better-sqlite3', 'package.json'))} ? false : exists(file);
     require('child_process').execFileSync = () => { throw Object.assign(new Error('synthetic install failure'), {code: 'ENOENT'}); };
   `);
   const child = cliWith({ NODE_OPTIONS: `--require=${JSON.stringify(preload)}` }, 'install');

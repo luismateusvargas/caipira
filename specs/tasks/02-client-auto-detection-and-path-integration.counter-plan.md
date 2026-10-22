@@ -2,7 +2,7 @@
 
 Original task spec: [02-client-auto-detection-and-path-integration.md](02-client-auto-detection-and-path-integration.md)
 Review evidence: independent review, 2026-10-22 (probes below).
-Status: ready
+Status: implemented — pending independent review
 
 Reviewed baseline: `d28c6a39231713238c87974751af518f308e4dbe`.
 Reviewed completion: `a9efe480f71795c3bf68ea4696889c5e93fe9e92`.
@@ -90,3 +90,16 @@ Also run `sh -n caipira.sh`. Rust and UI checks are not needed. Completion means
 ## Blockers
 
 None.
+
+## Implementation evidence
+
+- Baseline checkpoint: `956481061a7f47368da3064bfe6c7f5a3ef14a7c`.
+- K1: after client selection/consent and before any install step, checkout installs check the deployment interpreter and `better-sqlite3/package.json`. Missing prerequisites are named and installation returns exit 1. Tests cover both missing, only Node missing, and only dependencies missing, with no runtime/staging/log/launcher writes and byte-for-byte preservation of existing Claude configuration. Provisioned installs and same-home installs continue to pass.
+- K2: all three MCP environments retain only `CAIPIRA_MODEL_PATH`. The README distinguishes the install target from each process's inherited data root. With a custom deployment but no `CAIPIRA_HOME` in the new parent environment, the actual registered UserPromptSubmit command writes a session, the actual registered MCP command returns it through `list_sessions`, and PATH `status` counts the same session. No database is created in the custom install directory by these processes.
+- K3: the POSIX launcher uses a separate temporary write, chmod to `0o755`, and rename, with temporary cleanup and no backup. Repeated installs leave only `caipira` in the user bin directory; its content/mode and execution from another directory pass. Client configuration backups are unchanged.
+- K4: `PATH_REGISTRY_TIMEOUT_MS = 15_000` names the existing Windows limit. The adapter test observes 15000 ms and the installer has no plain `15000` literal.
+- Before the runtime corrections, the expanded installation suite reported **85 passed, 16 failed**, reproducing H1–H4. After correction it reported **101 passed, 0 failed**.
+- The first full run exposed an existing journal fixture that deliberately hid every dependency marker, including the deployment marker now required by K1. Updated that fixture to provide unused prerequisite markers and hide only the checkout dependency, preserving its synthetic command failure and all journal assertions. The journal suite then passed **20/0**.
+- Final verification: `TMPDIR=/var/tmp NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **930 checks, 0 failures** (20/33/87/100/90/167/101/141/191). `git diff --check` and `sh -n caipira.sh` passed. Successful integration runs used approved execution outside the sandbox and isolated temporary homes.
+- Changed paths: `install.js`, `README.md`, `test/test-install.js`, `test/test-errors.js`, and this counter-plan. The journal fixture is the additional affected test path; no implementation deviations from K1–K4. Task 03 remains untouched and untracked.
+- Limits: Linux with bundled Node 22 verified. Native Windows/macOS, real Windows registry writes, and a live user installation upgrade remain unverified. Optional assets, model handling, consent, hook payloads and launcher environment contracts remain unchanged. Independent review is pending; no approval tag, version bump, release or push.

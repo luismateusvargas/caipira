@@ -179,8 +179,9 @@ const CORE = ['mcp.js', 'store.js', 'facts.js', 'inject.js', 'ast.js', 'workspac
   'install.js', 'package.json', 'caipira.sh', 'caipira.cmd'];
 const NODE_MODULES = path.dirname(path.dirname(require.resolve('better-sqlite3/package.json')));
 const NODE_RELEASE = `node-v22.20.0-${process.platform === 'win32' ? 'win' : process.platform}-${process.arch}`;
+const MCP_SESSION_PROBE_TIMEOUT_MS = 10_000;
 
-function installFixture(markers = []) {
+function installFixture(markers = [], { provisionDeployment = true } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "caipira-install 'home-"));
   scratch.push(home);
   const source = path.join(home, 'checkout'), live = path.join(home, 'deployment');
@@ -189,7 +190,7 @@ function installFixture(markers = []) {
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     fs.copyFileSync(path.join(ROOT, rel), dest);
   }
-  for (const dir of [source, live]) {
+  for (const dir of provisionDeployment ? [source, live] : [source]) {
     fs.mkdirSync(path.join(dir, 'node22', NODE_RELEASE, process.platform === 'win32' ? '' : 'bin'), { recursive: true });
     const node = path.join(dir, 'node22', NODE_RELEASE, IS_WINDOWS ? 'node.exe' : 'bin/node');
     if (IS_WINDOWS) fs.linkSync(NODE, node);
@@ -234,6 +235,29 @@ function registered(fixture) {
   return ['.claude.json', '.codex/config.toml', '.gemini/config/mcp_config.json'].map(rel => fs.existsSync(path.join(fixture.home, rel)));
 }
 
+console.log('\n5a. checkout installs refuse missing deployment prerequisites before writes');
+for (const missing of [['node22', 'node_modules'], ['node22'], ['node_modules']]) {
+  const fixture = installFixture(['.claude'], { provisionDeployment: missing.length !== 2 });
+  if (missing.length === 1) fs.rmSync(path.join(fixture.live, missing[0]), { recursive: true, force: true });
+  const mcpFile = path.join(fixture.home, '.claude.json');
+  const hooksFile = path.join(fixture.home, '.claude/settings.json');
+  const originalMcp = '{"theme":"user-theme"}\n';
+  const originalHooks = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}\n';
+  fs.writeFileSync(mcpFile, originalMcp);
+  fs.writeFileSync(hooksFile, originalHooks);
+  const result = fixture.run('install');
+  const expectedPaths = missing.map(name => path.join(fixture.live, name === 'node22'
+    ? `node22/${NODE_RELEASE}/${IS_WINDOWS ? 'node.exe' : 'bin/node'}`
+    : 'node_modules/better-sqlite3/package.json'));
+  check(`missing ${missing.join(' and ')} refuses installation and names prerequisites`, result.code === 1 && expectedPaths.every(file => result.out.includes(file)) && /provision/i.test(result.out), result.out);
+  const deployed = fs.existsSync(fixture.live) ? fs.readdirSync(fixture.live) : [];
+  check(`missing ${missing.join(' and ')} creates no deployment, staging, logs or launcher`,
+    CORE.every(rel => !fs.existsSync(path.join(fixture.live, rel))) && !deployed.some(name => name.startsWith('.runtime-') || name === 'logs') && !fs.existsSync(path.join(fixture.home, '.local')));
+  check(`missing ${missing.join(' and ')} preserves client configs byte for byte`,
+    fs.readFileSync(mcpFile, 'utf8') === originalMcp && fs.readFileSync(hooksFile, 'utf8') === originalHooks &&
+    !fs.existsSync(`${mcpFile}.caipira-backup`) && !fs.existsSync(`${hooksFile}.caipira-backup`));
+}
+
 console.log('\n5. default detection creates no phantom client configuration');
 const empty = installFixture();
 r = empty.run('install');
@@ -276,8 +300,14 @@ for (const args of [['--clients'], ['--clients', ''], ['--clients', 'unknown'], 
 r = forced.run('install', '--clients', 'claude, codex, agy', '--accept-risk');
 check('aliases force all client configs with consent', r.code === 0 && registered(forced).every(Boolean), r.out);
 const forcedClaude = JSON.parse(fs.readFileSync(path.join(forced.home, '.claude.json')));
-check('MCP registration targets synchronized deployment', forcedClaude.mcpServers.caipira.args[0] === path.join(forced.live, 'mcp.js') && forcedClaude.mcpServers.caipira.env.CAIPIRA_HOME === forced.live);
+check('Claude MCP targets deployment without registering CAIPIRA_HOME', forcedClaude.mcpServers.caipira.args[0] === path.join(forced.live, 'mcp.js') &&
+  JSON.stringify(forcedClaude.mcpServers.caipira.env) === JSON.stringify({ CAIPIRA_MODEL_PATH: path.join(forced.live, 'models') }));
+const forcedAntigravity = JSON.parse(fs.readFileSync(path.join(forced.home, '.gemini/config/mcp_config.json')));
+check('Antigravity MCP preserves model path without registering CAIPIRA_HOME',
+  JSON.stringify(forcedAntigravity.mcpServers.caipira.env) === JSON.stringify({ CAIPIRA_MODEL_PATH: path.join(forced.live, 'models') }));
 const forcedCodex = fs.readFileSync(path.join(forced.home, '.codex/config.toml'), 'utf8');
+check('Codex MCP preserves model path without registering CAIPIRA_HOME', !forcedCodex.includes('CAIPIRA_HOME') &&
+  forcedCodex.includes(`env = { CAIPIRA_MODEL_PATH = ${JSON.stringify(path.join(forced.live, 'models'))} }`), forcedCodex);
 check('Codex SessionEnd keeps 3s timeout', /session-end[^\n]*\ntimeout = 3/.test(forcedCodex), forcedCodex);
 check('Codex TOML quotes paths containing apostrophes', forcedCodex.includes(`command = ${JSON.stringify(path.join(forced.live, 'node22', NODE_RELEASE, process.platform === 'win32' ? 'node.exe' : 'bin/node'))}`), forcedCodex);
 r = forced.run('doctor');
@@ -302,6 +332,7 @@ const AST_REL = `bin/caipira-ast${IS_WINDOWS ? '.exe' : ''}`;
 check('UI bundle and executable synchronized', fs.readFileSync(path.join(empty.live, 'explore-ui/dist/index.html'), 'utf8') === '<html>fixture UI</html>' && fs.readFileSync(path.join(empty.live, AST_REL), 'utf8').includes('exit 1'));
 check('launcher path recommendation is explicit', empty.run('install').out.includes(IS_WINDOWS ? 'open a new terminal' : 'export PATH="$HOME/.local/bin:$PATH"'));
 const launcher = IS_WINDOWS ? path.join(empty.live, 'caipira.cmd') : path.join(empty.home, '.local/bin/caipira');
+const launcherContent = fs.readFileSync(launcher, 'utf8');
 check('launcher executable exists', IS_WINDOWS ? fs.existsSync(launcher) : Boolean(fs.statSync(launcher).mode & 0o111));
 const workdir = path.join(empty.home, 'arbitrary workspace');
 fs.mkdirSync(workdir);
@@ -318,6 +349,11 @@ r = empty.run('install');
 check('reinstall refreshes core files and removes stale UI assets', r.code === 0 && fs.readFileSync(path.join(empty.live, 'facts.js')).equals(fs.readFileSync(path.join(empty.source, 'facts.js'))) && !fs.existsSync(path.join(empty.live, 'explore-ui/dist/obsolete.js')), r.out);
 check('runtime sync preserves user data and prerequisites', fs.readFileSync(path.join(empty.live, 'keep.db'), 'utf8') === 'user data' && fs.existsSync(path.join(empty.live, 'node_modules/better-sqlite3')));
 check('staging directories removed after success', !fs.readdirSync(empty.live).some(name => name.startsWith('.runtime-')));
+if (!IS_WINDOWS) {
+  check('reinstall leaves only executable caipira on user PATH with unchanged content',
+    JSON.stringify(fs.readdirSync(path.dirname(launcher))) === '["caipira"]' &&
+    Boolean(fs.statSync(launcher).mode & 0o111) && fs.readFileSync(launcher, 'utf8') === launcherContent);
+}
 
 // Private installer functions run in a VM for deterministic I/O failures,
 // TTY answers, and Windows adapter checks without touching the host registry.
@@ -331,6 +367,49 @@ function installerContext(fixture, overrides = {}) {
   const text = fs.readFileSync(path.join(ROOT, 'install.js'), 'utf8').split('const command = process.argv[2]')[0];
   vm.runInContext(text, context);
   return context;
+}
+
+// Drive the actual registered MCP process; only terminate after its sessions
+// response, and surface process/JSON/timeout failures instead of empty data.
+function registeredSessions(registration, env, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(registration.command, registration.args, {
+      env: { ...env, ...registration.env }, cwd, stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let buffer = '', stderr = '', sessions, failure;
+    const timer = setTimeout(() => {
+      failure = new Error('registered MCP session probe timed out');
+      child.kill('SIGKILL');
+    }, MCP_SESSION_PROBE_TIMEOUT_MS);
+    const abort = error => { failure = error; child.kill(); };
+    child.on('error', abort);
+    child.stdin.on('error', abort);
+    child.stderr.on('data', data => { stderr += data; });
+    child.stdout.on('data', data => {
+      buffer += data;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      try {
+        for (const line of lines.filter(line => line.trim())) {
+          const response = JSON.parse(line);
+          if (response.error) throw new Error(JSON.stringify(response.error));
+          if (response.id === 1) child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+            params: { name: 'list_sessions', arguments: { cwd } } }) + '\n');
+          if (response.id === 2) {
+            sessions = JSON.parse(response.result.content[0].text);
+            child.kill();
+          }
+        }
+      } catch (error) { abort(error); }
+    });
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (failure || code !== 0 || !Array.isArray(sessions)) reject(failure || new Error(`registered MCP exited ${code}: ${stderr}`));
+      else resolve(sessions);
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'install-probe', version: '1' } } }) + '\n');
+  });
 }
 
 async function remainingChecks() {
@@ -399,6 +478,29 @@ async function remainingChecks() {
   const script = windowsCall[1].at(-1);
   check('Windows PATH preserves raw entries and deduplicates expanded paths', script.includes('DoNotExpandEnvironmentNames') && script.includes('ExpandEnvironmentVariables') && script.includes('-ieq') && script.includes('ExpandString') && windowsCall[2].env.CAIPIRA_PATH_TARGET === win.live);
   check('Windows registry errors fail the install', script.includes("$ErrorActionPreference = 'Stop'"));
+  check('Windows PATH limit has no unnamed 15000 literal', !/\b15000\b/.test(fs.readFileSync(path.join(ROOT, 'install.js'), 'utf8')));
+
+  console.log('\n8a. registered entry points inherit one data root after custom deployment');
+  const shared = installFixture(['.claude', '.codex', '.gemini']);
+  const installed = shared.run('install');
+  check('custom deployment installs for data-root probe', installed.code === 0, installed.out);
+  const parentEnv = { ...shared.env };
+  delete parentEnv.CAIPIRA_HOME;
+  parentEnv.PATH = `${IS_WINDOWS ? shared.live : path.join(shared.home, '.local/bin')}${path.delimiter}${parentEnv.PATH || ''}`;
+  const workspace = path.join(shared.home, 'shared workspace');
+  fs.mkdirSync(workspace);
+  fs.writeFileSync(path.join(workspace, 'package.json'), '{}');
+  const registration = JSON.parse(fs.readFileSync(path.join(shared.home, '.claude.json'))).mcpServers.caipira;
+  const hook = JSON.parse(fs.readFileSync(path.join(shared.home, '.claude/settings.json'))).hooks.UserPromptSubmit[0].hooks[0].command;
+  const sessionId = 'installed-shared-session';
+  const captured = spawnSync(hook, { shell: IS_WINDOWS ? 'cmd.exe' : '/bin/sh', cwd: workspace, env: parentEnv,
+    input: JSON.stringify({ session_id: sessionId, cwd: workspace, prompt: 'shared memory probe' }), encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+  check('registered UserPromptSubmit captures session without inherited CAIPIRA_HOME', !captured.error && captured.status === 0 && fs.existsSync(path.join(shared.home, '.caipira/database/master.db')), captured.stderr || captured.error);
+  const sessions = await registeredSessions(registration, parentEnv, workspace);
+  check('registered MCP sees session captured by hook', sessions.length === 1 && sessions[0].id === sessionId, JSON.stringify(sessions));
+  const status = spawnSync(launchCommand, [...launchArgs, 'status'], { cwd: workspace, env: parentEnv, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS });
+  check('PATH status counts same hook and MCP session', !status.error && status.status === 0 && /workspaces:\s+1\b/.test(status.stdout) && /sessions:\s+1\b/.test(status.stdout) && status.stdout.includes(sessionId), status.stdout || status.stderr || status.error);
+  check('entry points do not populate custom install data root without inherited override', !fs.existsSync(path.join(shared.live, 'database')));
 
   console.log('\n9. installed explorer uses the current directory');
   const child = spawn(launchCommand, [...launchArgs, 'explore', '--no-open', '--port', '0'], { cwd: workdir, env: launcherEnv, stdio: ['ignore', 'pipe', 'pipe'] });
