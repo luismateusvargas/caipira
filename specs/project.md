@@ -142,8 +142,10 @@ sh -n caipira.sh && git diff --check
     1. Checks that the tag matches both manifests.
     2. Builds and tests the five AST targets and runs the Node suite on Node 22.23.4.
     3. Packs the tarball with the UI and checksum-verified model.
-    4. Publishes that tarball to npm (secret `NPM_TOKEN`).
+    4. Publishes that tarball to npm through trusted publishing (OIDC, `id-token: write`, npm 11.21.1 in that job only), with automatic provenance and no stored token. If that version is already on npm with the same integrity, the job skips publishing; a different tarball under the same version fails the job.
     5. Creates the GitHub release from the tarball, the AST binaries, and `SHA256SUMS`, using the tag message as the notes.
+  - **First release only.** npm accepts a trusted publisher only for an existing package. Publish the run's `release` tarball once by hand with `npm publish <tgz> --access public` (2FA). Then run `npm trust github @luismateusvargas/caipira --file release.yml --repo luismateusvargas/caipira --allow-publish`, and re-run the failed jobs.
+  - `package.json` `repository.url` must stay `git+https://github.com/luismateusvargas/caipira.git`; trusted publishing requires it to match the repository.
 - **Manual.** After a real install, `caipira doctor` should report no failures, and `caipira explore --no-open` should serve the invoking directory's workspace.
 
 ## Evidence and unknowns
@@ -162,8 +164,8 @@ sh -n caipira.sh && git diff --check
   - GitHub-hosted runner labels (`macos-15` arm64, `macos-15-intel` x64).
   - npm `package.json` `bin`/`files` documentation.
 - **Unknowns and open decisions.**
-  - macOS, Windows, and Linux arm64 have not been executed natively. The release workflow has not yet run on GitHub, and whether the repository has the `NPM_TOKEN` secret is not verified from here.
-  - npm trusted publishing (OIDC) needs npm ≥ 11.5.1, while the pinned Node 22.23.4 ships npm 10.9.9. Publishing therefore uses a token until the pin or the publish job's npm changes.
+  - macOS, Windows, and Linux arm64 have not been executed natively. The release workflow has not yet run on GitHub, and its OIDC publish path has not been exercised.
+  - npm no longer accepts direct publishing with tokens that bypass 2FA: such a token returned 401 for the user on 2026-10-22. npm is targeting January 2027 for removing that path entirely. Trusted publishing needs npm 11.5.1+ and Node 22.14.0+, and the publish job installs npm 11.21.1 because Node 22.23.4 ships npm 10.9.9. `npm trust` needs npm 11.15.0+, account 2FA, and an existing package. Sources: [trusted publishers](https://docs.npmjs.com/trusted-publishers), the npm 12.2.0 `npm-trust` command docs, and the [stage-only token changelog](https://github.blog/changelog/2026-09-18-stage-only-npm-tokens-for-safer-automation), all accessed 2026-10-22.
   - Node 22 maintenance ends in April 2027. Moving the pin means changing `NODE_VERSION`, the checksum table, and the launchers. `better-sqlite3` 12.9.0 already ships Node 24 prebuilds.
   - The user has not said how constitution rules may be revised. Until they do, treat every rule change as their decision and record it here.
   - Whether to add opt-in DEBUG tracing beyond MCP traffic (see the logging gaps) is not decided.

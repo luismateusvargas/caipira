@@ -284,7 +284,24 @@ git tag -a --cleanup=whitespace -F release-notes.md v2.2.0
 git push origin master v2.2.0
 ```
 
-The tag runs `.github/workflows/release.yml`. It first rejects a tag that does not match both manifests. It then builds and tests the five AST targets (the Linux binaries are static musl builds) and runs the Node suite on the pinned Node 22.23.4. Next it packs the npm tarball with the prebuilt UI and checksum-verified model, and publishes that tarball to npm (repository secret `NPM_TOKEN`). Last, it creates the GitHub release from the same tarball, the AST binaries, and a `SHA256SUMS` file, with the tag message as the release notes.
+The tag runs `.github/workflows/release.yml`:
+
+1. It rejects a tag that does not match both manifests.
+2. It builds and tests the five AST targets (the Linux binaries are static musl builds) and runs the Node suite on the pinned Node 22.23.4.
+3. It packs the npm tarball with the prebuilt UI and checksum-verified model.
+4. It publishes that tarball to npm with [trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC), so no npm token is stored, and npm adds provenance.
+5. It creates the GitHub release from the same tarball, the AST binaries, and a `SHA256SUMS` file, using the tag message as the release notes.
+
+npm accepts a trusted publisher only for a package that already exists, so the first release needs one manual step. The publish job fails with instructions, then:
+
+```sh
+# Download the run's `release` artifact, then publish its tarball once (prompts for 2FA):
+npm publish luismateusvargas-caipira-2.2.0.tgz --access public
+# Trust this repository's release workflow for later releases (npm 11.15.0+, 2FA):
+npm trust github @luismateusvargas/caipira --file release.yml --repo luismateusvargas/caipira --allow-publish
+```
+
+Re-run the failed jobs. The publish job sees that the same tarball is already on npm and skips it, and the GitHub release is created.
 
 ---
 

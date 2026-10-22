@@ -3,6 +3,10 @@
   "version": "2.2.0",
   "description": "Local-first cross-client memory, polyglot Rust AST symbol engine, prose compression, and interactive graph inspector.",
   "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luismateusvargas/caipira.git"
+  },
   "type": "commonjs",
   "main": "store.js",
   "bin": {
