@@ -3,7 +3,7 @@
 Original task spec: [02-client-auto-detection-and-path-integration.md](02-client-auto-detection-and-path-integration.md)
 Reviewed task: [Counter-plan 2, Q1–Q3](02-client-auto-detection-and-path-integration.counter-plan-2.md)
 Review evidence: independent review, 2026-10-22 (probes below).
-Status: ready
+Status: implemented — pending independent review and native Windows verification
 
 Reviewed baseline: `076bf3f37dae91fc6c2828e5711abf128f25ba65`.
 Reviewed completion: `504fb70e9ee533bbc4e6e3038c011058d4583fca`.
@@ -75,3 +75,16 @@ Every startup-file check must use a fake `HOME`. Completion means S1–S3 are fi
 ## Blockers
 
 - **Verification only (carried over from counter-plan 2, check 5):** the native Windows check needs a Windows machine. That check is: a new Start-menu `cmd` finds `caipira` after install without a sign-out, and stops finding it after uninstall. Without one, approval needs the user to accept contract-level Windows verification.
+
+## Implementation evidence
+
+- Baseline checkpoint: `af97713ac8456279da3369b5f6f952977b10ead8`.
+- Changed paths: `install.js`, `test/test-install.js`, `README.md`, and this counter-plan.
+- **T1:** startup writes now use a dedicated helper that resolves symlinks and atomically replaces their targets using a temporary file in the target directory. It preserves file permissions, keeps backups beside the startup path in HOME, and cleans temporary files after failure. Client configuration writers are unchanged. An explicit target-writability check also respects a read-only file inside a writable directory. `EACCES`, `EPERM` and `EROFS` produce per-file warnings; install keeps the launcher and prints the manual export line, while uninstall continues.
+- **T2:** macOS bash keeps `.bashrc` and selects the first existing `.bash_profile`, `.bash_login` or `.profile`. It creates `.bash_profile` only if none exists. Uninstall scans all three login paths, independently of the current shell.
+- **T3:** uninstall removes regular startup files that contain nothing after complete marked blocks are stripped. Existing content, CRLF, missing final newlines and unmarked files retain their existing behavior.
+- **Scope clarification:** an existing symlink with an originally empty target retains both its link and empty target after uninstall. Deleting that target would leave a dangling link and violate T1's restoration requirement; the regression suite explicitly covers this case.
+- Before the fix, the expanded installation suite reported **131 passed, 17 failed**, reproducing S1–S3. After the initial correction it reported **148 passed, 0 failed**; the final coverage includes six additional checks for login priority, empty linked targets and simulated `EPERM`/`EROFS` promotion failures.
+- Final verification: the specified bundled Node 22 command passed all nine suites, **983 checks, 0 failures** (20/33/87/100/90/167/**154**/141/191). `sh -n caipira.sh` and `git diff --check` passed.
+- Real `bash -ic` found the launcher and ran `caipira status` through a symlinked startup file. Real `bash -lc` retained `HOMEBREW_READY=1` through `.profile` and `.bash_login` and resolved `caipira`. The macOS selection used the specified darwin platform override on Linux. Real read-only target/directory permissions exercised `EACCES`; `EPERM` and `EROFS` were injected at target promotion. Every startup check used a fake HOME.
+- Native macOS and Windows sessions were not exercised. Windows registry/broadcast contract checks still pass; the adapter itself was unchanged. No real user startup files, client settings or registry entries were modified, and no approval tag, push, release or version bump was made. Independent review and the carried Windows verification limit remain pending.

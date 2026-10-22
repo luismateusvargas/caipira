@@ -37,7 +37,8 @@ const USER_BIN_DIR = path.join(HOME, '.local', 'bin');
 const USER_LAUNCHER = path.join(USER_BIN_DIR, 'caipira');
 const SHELL_STARTUP_FILES = {
   bash: path.join(HOME, '.bashrc'),
-  bashLogin: path.join(HOME, '.bash_profile'),
+  bashProfile: path.join(HOME, '.bash_profile'),
+  bashLogin: path.join(HOME, '.bash_login'),
   zsh: path.join(HOME, '.zshrc'),
   profile: path.join(HOME, '.profile'),
   fish: path.join(HOME, '.config', 'fish', 'conf.d', 'caipira.fish')
@@ -425,8 +426,12 @@ function updateWindowsPath(remove) {
 /** @returns {string[]} Startup files for the shell that will open next. */
 function shellStartupFiles() {
   switch (path.basename(process.env.SHELL || '')) {
-    case 'bash': return process.platform === 'darwin'
-      ? [SHELL_STARTUP_FILES.bash, SHELL_STARTUP_FILES.bashLogin] : [SHELL_STARTUP_FILES.bash];
+    case 'bash': {
+      if (process.platform !== 'darwin') return [SHELL_STARTUP_FILES.bash];
+      const login = [SHELL_STARTUP_FILES.bashProfile, SHELL_STARTUP_FILES.bashLogin, SHELL_STARTUP_FILES.profile]
+        .find(file => fs.existsSync(file)) || SHELL_STARTUP_FILES.bashProfile;
+      return [SHELL_STARTUP_FILES.bash, login];
+    }
     case 'zsh': return [SHELL_STARTUP_FILES.zsh];
     case 'fish': return [SHELL_STARTUP_FILES.fish];
     default: return [SHELL_STARTUP_FILES.profile];
@@ -437,6 +442,39 @@ function shellStartupFiles() {
 function readStartupFile(file) {
   try { return fs.readFileSync(file, 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+/**
+ * Replaces the resolved startup target, keeping dotfiles symlinks and home-side backups.
+ * @param {string} file Startup path under HOME.
+ * @param {string} text Replacement contents; empty removes a regular startup file.
+ * @returns {void}
+ * @throws {Error} For filesystem failures; callers recover from permission errors.
+ */
+function writeStartupFile(file, text) {
+  let entry = null;
+  try { entry = fs.lstatSync(file); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const linked = entry?.isSymbolicLink();
+  const target = linked ? fs.realpathSync(file) : file;
+  const mode = entry ? fs.statSync(target).mode & 0o777 : null;
+  // A writable directory alone would permit rename over a read-only file.
+  // Honor target permissions as well, including managed dotfiles stores.
+  if (entry) fs.accessSync(target, fs.constants.W_OK);
+  // Keep an empty linked target rather than leaving a managed link dangling.
+  if (text === '' && !linked) { fs.unlinkSync(target); return; }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = `${target}.caipira-tmp`;
+  const fd = fs.openSync(tmp, 'wx', mode ?? 0o666);
+  try {
+    try { fs.writeFileSync(fd, text, 'utf8'); }
+    finally { fs.closeSync(fd); }
+    if (mode !== null) fs.chmodSync(tmp, mode);
+    if (entry) fs.copyFileSync(target, `${file}.caipira-backup`);
+    fs.renameSync(tmp, target);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 /** Installs the user launcher without changing the caller's working directory. */
@@ -459,16 +497,21 @@ function registerPath() {
   ok(`launcher installed at ${USER_LAUNCHER}`);
   if ((process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === USER_BIN_DIR)) return;
   for (const file of shellStartupFiles()) {
-    const original = readStartupFile(file) || '';
-    if (!original.includes(PATH_BLOCK_START)) {
-      const command = file === SHELL_STARTUP_FILES.fish ? FISH_PATH_COMMAND : POSIX_PATH_COMMAND;
-      const block = `${PATH_BLOCK_START}\n${command}\n${PATH_BLOCK_END}\n`;
-      // Prepend when the original lacks a final newline: removal can then
-      // restore every original byte without inventing a separator newline.
-      const updated = original && !original.endsWith('\n') ? block + original : original + block;
-      writeTextAtomic(file, updated);
+    try {
+      const original = readStartupFile(file) || '';
+      if (!original.includes(PATH_BLOCK_START)) {
+        const command = file === SHELL_STARTUP_FILES.fish ? FISH_PATH_COMMAND : POSIX_PATH_COMMAND;
+        const block = `${PATH_BLOCK_START}\n${command}\n${PATH_BLOCK_END}\n`;
+        // Prepend when the original lacks a final newline: removal can then
+        // restore every original byte without inventing a separator newline.
+        const updated = original && !original.endsWith('\n') ? block + original : original + block;
+        writeStartupFile(file, updated);
+      }
+      ok(`PATH configured in ${file} — open a new terminal`);
+    } catch (error) {
+      if (!['EACCES', 'EPERM', 'EROFS'].includes(error.code)) throw error;
+      warn(`Cannot configure PATH in ${file} (${error.code}); add manually: export PATH="$HOME/.local/bin:$PATH"`);
     }
-    ok(`PATH configured in ${file} — open a new terminal`);
   }
 }
 
@@ -479,21 +522,25 @@ function unregisterPath() {
     return;
   }
   for (const file of Object.values(SHELL_STARTUP_FILES)) {
-    const original = readStartupFile(file);
-    if (original === null) continue;
-    let updated = original, from = 0;
-    while ((from = updated.indexOf(PATH_BLOCK_START, from)) !== -1) {
-      const end = updated.indexOf(PATH_BLOCK_END, from + PATH_BLOCK_START.length);
-      if (end === -1) break;
-      let after = end + PATH_BLOCK_END.length;
-      if (updated.slice(after, after + 2) === '\r\n') after += 2;
-      else if (updated[after] === '\n') after++;
-      updated = updated.slice(0, from) + updated.slice(after);
+    try {
+      const original = readStartupFile(file);
+      if (original === null) continue;
+      let updated = original, from = 0;
+      while ((from = updated.indexOf(PATH_BLOCK_START, from)) !== -1) {
+        const end = updated.indexOf(PATH_BLOCK_END, from + PATH_BLOCK_START.length);
+        if (end === -1) break;
+        let after = end + PATH_BLOCK_END.length;
+        if (updated.slice(after, after + 2) === '\r\n') after += 2;
+        else if (updated[after] === '\n') after++;
+        updated = updated.slice(0, from) + updated.slice(after);
+      }
+      if (updated === original) continue;
+      writeStartupFile(file, updated);
+      ok(`PATH block removed from ${file}`);
+    } catch (error) {
+      if (!['EACCES', 'EPERM', 'EROFS'].includes(error.code)) throw error;
+      warn(`Cannot remove PATH block from ${file} (${error.code}); continuing uninstall`);
     }
-    if (updated === original) continue;
-    if (file === SHELL_STARTUP_FILES.fish && updated === '') fs.unlinkSync(file);
-    else writeTextAtomic(file, updated);
-    ok(`PATH block removed from ${file}`);
   }
 }
 

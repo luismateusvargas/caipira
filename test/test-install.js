@@ -469,8 +469,7 @@ function automaticPathChecks() {
       check('new real sh login finds caipira', !login.error && login.status === 0 && login.stdout.trim() === path.join(fixture.home, '.local/bin/caipira'), login.stdout + login.stderr);
     }
     result = fixture.run('uninstall');
-    check(`${shellName} uninstall removes its block or owned fish file`, result.code === 0 &&
-      (shellName.endsWith('fish') ? !fs.existsSync(file) : !fs.existsSync(file) || fs.readFileSync(file, 'utf8') === ''), result.out);
+    check(`${shellName} uninstall removes the created startup file`, result.code === 0 && !fs.existsSync(file), result.out);
   }
 
   const noNewline = installFixture();
@@ -489,14 +488,17 @@ function automaticPathChecks() {
   const macRc = path.join(mac.home, '.bashrc'), macProfile = path.join(mac.home, '.bash_profile');
   fs.writeFileSync(macRc, 'bash rc\n');
   fs.writeFileSync(macProfile, 'bash login\n');
+  const lowerPriorityFiles = ['.bash_login', '.profile'].map(rel => path.join(mac.home, rel));
+  for (const file of lowerPriorityFiles) fs.writeFileSync(file, 'lower priority login\n');
   const macContext = installerContext(mac, { process: { platform: 'darwin' } });
   vm.runInContext('registerPath()', macContext);
   check('macOS bash covers rc and login startup', fs.readFileSync(macRc, 'utf8') === 'bash rc\n' + block && fs.readFileSync(macProfile, 'utf8') === 'bash login\n' + block);
+  check('macOS bash_profile wins without touching lower priority login files', lowerPriorityFiles.every(file => fs.readFileSync(file, 'utf8') === 'lower priority login\n'));
   vm.runInContext('unregister()', macContext);
   check('macOS uninstall restores both startup files', fs.readFileSync(macRc, 'utf8') === 'bash rc\n' && fs.readFileSync(macProfile, 'utf8') === 'bash login\n');
 
   const untouched = installFixture();
-  const userFiles = ['.bashrc', '.bash_profile', '.zshrc', '.profile', '.config/fish/conf.d/caipira.fish'];
+  const userFiles = ['.bashrc', '.bash_profile', '.bash_login', '.zshrc', '.profile', '.config/fish/conf.d/caipira.fish'];
   for (const rel of userFiles) {
     const file = path.join(untouched.home, rel);
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -530,9 +532,137 @@ function automaticPathChecks() {
   check('existing incomplete marker is never rewritten or truncated', fs.readFileSync(markedFile, 'utf8') === `${marker}\nuser incomplete block`);
 }
 
+function startupPreservationChecks() {
+  if (IS_WINDOWS) return;
+  const block = '# >>> caipira PATH >>>\ncase ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac\n# <<< caipira PATH <<<\n';
+  const original = '# dotfiles startup\nexport DOTFILE_READY=kept';
+  const linked = installFixture();
+  linked.env.PATH = '/usr/bin:/bin';
+  const rc = path.join(linked.home, '.bashrc');
+  const target = path.join(linked.home, 'dotfiles', 'bashrc');
+  fs.mkdirSync(path.dirname(target));
+  fs.writeFileSync(target, original, { mode: 0o600 });
+  fs.symlinkSync('dotfiles/bashrc', rc);
+  let result = linked.run('install');
+  check('install keeps the startup symlink and updates its target with original bytes', result.code === 0 &&
+    fs.lstatSync(rc).isSymbolicLink() && fs.readFileSync(target, 'utf8') === block + original, result.out);
+  check('startup backup stays beside the home symlink, outside the dotfiles directory',
+    fs.readFileSync(`${rc}.caipira-backup`, 'utf8') === original &&
+    JSON.stringify(fs.readdirSync(path.dirname(target))) === '["bashrc"]');
+  result = linked.run('install');
+  check('reinstall keeps the symlink and one block at its target', result.code === 0 &&
+    fs.lstatSync(rc).isSymbolicLink() && fs.readFileSync(target, 'utf8') === block + original, result.out);
+  const shell = spawnSync('/bin/bash', ['-ic', 'command -v caipira && caipira status'], {
+    env: linked.env, cwd: linked.home, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
+  });
+  check('new real bash loads the symlink target and runs caipira', !shell.error && shell.status === 0 &&
+    shell.stdout.includes(path.join(linked.home, '.local/bin/caipira')) && shell.stdout.includes('Caipira status'), shell.stdout + shell.stderr);
+  result = linked.run('uninstall');
+  check('uninstall keeps the symlink and restores target bytes and permissions', result.code === 0 &&
+    fs.lstatSync(rc).isSymbolicLink() && fs.readFileSync(target, 'utf8') === original &&
+    (fs.statSync(target).mode & 0o777) === 0o600, result.out);
+  fs.writeFileSync(target, '');
+  linked.run('install');
+  result = linked.run('uninstall');
+  check('uninstall preserves an originally empty symlink target without a dangling link', result.code === 0 &&
+    fs.lstatSync(rc).isSymbolicLink() && fs.readFileSync(target, 'utf8') === '', result.out);
+
+  for (const readOnlyDirectory of [false, true]) {
+    const fixture = installFixture();
+    fixture.env.PATH = '/usr/bin:/bin';
+    const link = path.join(fixture.home, '.bashrc');
+    const dir = path.join(fixture.home, 'readonly-dotfiles');
+    const destination = path.join(dir, 'bashrc');
+    fs.mkdirSync(dir);
+    fs.writeFileSync(destination, original);
+    fs.symlinkSync('readonly-dotfiles/bashrc', link);
+    const protect = () => fs.chmodSync(readOnlyDirectory ? dir : destination, readOnlyDirectory ? 0o555 : 0o444);
+    const unlock = () => fs.chmodSync(readOnlyDirectory ? dir : destination, readOnlyDirectory ? 0o755 : 0o644);
+    protect();
+    try {
+      result = fixture.run('install');
+      check(`unwritable ${readOnlyDirectory ? 'directory' : 'target'} leaves link and bytes intact while install succeeds`,
+        result.code === 0 && fs.lstatSync(link).isSymbolicLink() && fs.readFileSync(destination, 'utf8') === original &&
+        fs.existsSync(path.join(fixture.home, '.local/bin/caipira')) && result.out.includes('[warn]') &&
+        result.out.includes('export PATH="$HOME/.local/bin:$PATH"') && fs.readdirSync(dir).length === 1, result.out);
+    } finally { unlock(); }
+    // Test uninstall independently even against an implementation that broke
+    // the link during install, so both failure paths are reported.
+    if (!fs.lstatSync(link).isSymbolicLink()) { fs.unlinkSync(link); fs.symlinkSync('readonly-dotfiles/bashrc', link); }
+    fs.writeFileSync(destination, original + '\n' + block);
+    protect();
+    try {
+      result = fixture.run('uninstall');
+      check(`unwritable ${readOnlyDirectory ? 'directory' : 'target'} warns and continues uninstall without changing the link or bytes`,
+        result.code === 0 && result.out.includes('[warn]') && fs.lstatSync(link).isSymbolicLink() &&
+        fs.readFileSync(destination, 'utf8') === original + '\n' + block && fs.readdirSync(dir).length === 1, result.out);
+    } finally { unlock(); }
+  }
+
+  for (const code of ['EPERM', 'EROFS']) {
+    const fixture = installFixture();
+    fixture.env.PATH = '/usr/bin:/bin';
+    const link = path.join(fixture.home, '.bashrc');
+    const destination = path.join(fixture.home, 'dotfiles', 'bashrc');
+    fs.mkdirSync(path.dirname(destination));
+    fs.writeFileSync(destination, original);
+    fs.symlinkSync('dotfiles/bashrc', link);
+    let output = '';
+    const context = installerContext(fixture, {
+      process: { stdout: { on() {}, write: text => { output += text; } } },
+      fs: { ...fs, renameSync: (from, to) => {
+        if (to === destination) throw Object.assign(new Error('simulated target restriction'), { code });
+        return fs.renameSync(from, to);
+      } }
+    });
+    vm.runInContext('registerPath()', context);
+    check(`${code} during startup promotion warns, preserves target and cleans its temporary file`,
+      output.includes(`[warn]`) && output.includes(code) && output.includes('export PATH="$HOME/.local/bin:$PATH"') &&
+      fs.lstatSync(link).isSymbolicLink() && fs.readFileSync(destination, 'utf8') === original &&
+      fs.readdirSync(path.dirname(destination)).length === 1);
+    fs.writeFileSync(destination, original + '\n' + block);
+    output = '';
+    vm.runInContext('unregisterPath()', context);
+    check(`${code} during uninstall warns and continues with target and link intact`,
+      output.includes('[warn]') && output.includes(code) && fs.lstatSync(link).isSymbolicLink() &&
+      fs.readFileSync(destination, 'utf8') === original + '\n' + block && fs.readdirSync(path.dirname(destination)).length === 1);
+  }
+
+  const fresh = installFixture();
+  fresh.env.PATH = '/usr/bin:/bin';
+  result = fresh.run('install');
+  const created = result.code === 0 && fs.existsSync(path.join(fresh.home, '.bashrc'));
+  result = fresh.run('uninstall');
+  check('install then uninstall returns an absent bashrc to absent', created && result.code === 0 && !fs.existsSync(path.join(fresh.home, '.bashrc')), result.out);
+
+  for (const loginName of ['.profile', '.bash_login', null]) {
+    const fixture = installFixture();
+    fixture.env.PATH = '/usr/bin:/bin';
+    delete fixture.env.HOMEBREW_READY;
+    const login = path.join(fixture.home, loginName || '.bash_profile');
+    const contents = 'export HOMEBREW_READY=1\n';
+    if (loginName) fs.writeFileSync(login, contents);
+    const context = installerContext(fixture, { process: { platform: 'darwin' } });
+    vm.runInContext('registerPath()', context);
+    check(`macOS bash selects ${loginName || 'new .bash_profile'} without shadowing existing login files`,
+      fs.readFileSync(login, 'utf8') === (loginName ? contents : '') + block &&
+      (loginName === null || !fs.existsSync(path.join(fixture.home, '.bash_profile'))));
+    const loginShell = spawnSync('/bin/bash', ['-lc', 'printf "%s\\n" "$HOMEBREW_READY"; command -v caipira'], {
+      env: fixture.env, cwd: fixture.home, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
+    });
+    check(`real bash login preserves settings and finds caipira via ${loginName || 'new .bash_profile'}`,
+      !loginShell.error && loginShell.status === 0 && loginShell.stdout === `${loginName ? '1' : ''}\n${path.join(fixture.home, '.local/bin/caipira')}\n`, loginShell.stdout + loginShell.stderr);
+    vm.runInContext('unregisterPath()', context);
+    check(`macOS uninstall restores ${loginName || 'absent .bash_profile'} and removes the created bashrc`,
+      (loginName ? fs.readFileSync(login, 'utf8') === contents : !fs.existsSync(login)) && !fs.existsSync(path.join(fixture.home, '.bashrc')));
+  }
+}
+
 async function remainingChecks() {
   console.log('\n7a. automatic PATH startup files and uninstall');
   automaticPathChecks();
+  console.log('\n7b. dotfiles symlinks, login selection and startup cleanup');
+  startupPreservationChecks();
   console.log('\n8. interactive consent and failed deployment recovery');
   for (const [answer, agreed] of [['yes', true], ['', false], ['n', false]]) {
     let prompt = '';
