@@ -658,11 +658,136 @@ function startupPreservationChecks() {
   }
 }
 
+function startupRecoveryChecks() {
+  if (IS_WINDOWS) return;
+  const marker = '# >>> caipira PATH >>>';
+  const block = `${marker}\ncase ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac\n# <<< caipira PATH <<<\n`;
+
+  const dangling = installFixture(['.claude']);
+  dangling.env.PATH = '/usr/bin:/bin';
+  const danglingLink = path.join(dangling.home, '.bashrc');
+  fs.symlinkSync('dotfiles-moved/bashrc', danglingLink);
+  let result = dangling.run('install');
+  check('dangling startup link warns without creating its target or blocking client registration', result.code === 0 &&
+    fs.lstatSync(danglingLink).isSymbolicLink() && !fs.existsSync(path.join(dangling.home, 'dotfiles-moved')) &&
+    fs.existsSync(path.join(dangling.home, '.local/bin/caipira')) && fs.existsSync(path.join(dangling.home, '.claude.json')) &&
+    fs.readFileSync(path.join(dangling.home, '.claude/settings.json'), 'utf8').includes('universal-hook.js') &&
+    result.out.includes('[warn]') && result.out.includes('.bashrc') && result.out.includes('export PATH="$HOME/.local/bin:$PATH"'), result.out);
+  result = dangling.run('uninstall');
+  check('dangling startup link remains unchanged and silent during uninstall', result.code === 0 &&
+    fs.lstatSync(danglingLink).isSymbolicLink() && !fs.existsSync(path.join(dangling.home, 'dotfiles-moved')) && !result.out.includes('[warn]'), result.out);
+
+  const looping = installFixture(['.claude']);
+  looping.env.PATH = '/usr/bin:/bin';
+  const loopingLink = path.join(looping.home, '.bashrc');
+  fs.symlinkSync('.bashrc', loopingLink);
+  result = looping.run('install');
+  check('looping startup link warns without blocking runtime and client setup', result.code === 0 &&
+    fs.lstatSync(loopingLink).isSymbolicLink() && fs.existsSync(path.join(looping.home, '.local/bin/caipira')) &&
+    fs.existsSync(path.join(looping.home, '.claude.json')) && result.out.includes('[warn]') &&
+    result.out.includes('.bashrc') && result.out.includes('export PATH="$HOME/.local/bin:$PATH"'), result.out);
+  result = looping.run('uninstall');
+  check('looping startup link warns while client uninstall completes', result.code === 0 &&
+    fs.lstatSync(loopingLink).isSymbolicLink() && fs.existsSync(path.join(looping.home, '.claude.json')) &&
+    !readJsonFor(looping.home, '.claude.json').mcpServers?.caipira && result.out.includes('[warn]'), result.out);
+
+  for (const relative of ['.bashrc', 'dotfiles/bashrc']) {
+    const fixture = installFixture();
+    fixture.env.PATH = '/usr/bin:/bin';
+    let target = path.join(fixture.home, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    if (relative !== '.bashrc') {
+      fs.writeFileSync(target, 'user startup\n');
+      fs.symlinkSync('dotfiles/bashrc', path.join(fixture.home, '.bashrc'));
+      target = path.join(fixture.home, 'dotfiles/bashrc');
+    } else fs.writeFileSync(target, 'user startup\n');
+    if (relative === '.bashrc') fs.writeFileSync(`${target}.caipira-tmp`, 'interrupted write');
+    else {
+      fs.writeFileSync(`${target}.link-target`, 'safe');
+      fs.symlinkSync('bashrc.link-target', `${target}.caipira-tmp`);
+    }
+    result = fixture.run('install');
+    check(`install replaces stale ${relative === '.bashrc' ? 'regular-file' : 'symlink'} temporary and adds one block`,
+      result.code === 0 && fs.readFileSync(target, 'utf8') === 'user startup\n' + block &&
+      !fs.existsSync(`${target}.caipira-tmp`) &&
+      (relative === '.bashrc' || fs.readFileSync(`${target}.link-target`, 'utf8') === 'safe'), result.out);
+  }
+
+  for (const [relative, shell, platform] of [
+    ['.bashrc', '/bin/bash', 'linux'], ['.zshrc', '/usr/bin/zsh', 'linux'], ['.bash_profile', '/bin/bash', 'darwin']
+  ]) {
+    const fixture = installFixture();
+    fixture.env.SHELL = shell;
+    fixture.env.PATH = '/usr/bin:/bin';
+    const startup = path.join(fixture.home, relative);
+    fs.writeFileSync(startup, '', { mode: 0o640 });
+    if (platform === 'darwin') {
+      fs.writeFileSync(path.join(fixture.home, '.profile'), 'export PROFILE_ONLY=1\n');
+      delete fixture.env.PROFILE_ONLY;
+    }
+    const context = installerContext(fixture, { process: { platform } });
+    const loginValue = () => spawnSync('/bin/bash', ['-lc', 'printf "%s\\n" "$PROFILE_ONLY"'], {
+      env: fixture.env, cwd: fixture.home, encoding: 'utf8', timeout: MCP_SESSION_PROBE_TIMEOUT_MS
+    });
+    const before = platform === 'darwin' ? loginValue() : null;
+    vm.runInContext('registerPath()', context);
+    const state = path.join(fixture.live, '.caipira-startup-files.json');
+    const recordedFiles = fs.existsSync(state) ? JSON.parse(fs.readFileSync(state, 'utf8')) : [];
+    check(`install records created startup file but leaves pre-existing empty ${relative} intact`,
+      fs.readFileSync(startup, 'utf8') === block && (fs.statSync(startup).mode & 0o777) === 0o640 &&
+      !recordedFiles.includes(startup) &&
+      (platform === 'darwin' ? recordedFiles.length === 1 && recordedFiles[0] === path.join(fixture.home, '.bashrc') : recordedFiles.length === 0));
+    vm.runInContext('unregisterPath()', context);
+    const after = platform === 'darwin' ? loginValue() : null;
+    check(`uninstall retains pre-existing empty ${relative} and removes its empty tracking state`,
+      fs.existsSync(startup) && fs.readFileSync(startup, 'utf8') === '' && (fs.statSync(startup).mode & 0o777) === 0o640 &&
+      !fs.existsSync(path.join(fixture.live, '.caipira-startup-files.json')) &&
+      (platform !== 'darwin' || (fs.readFileSync(path.join(fixture.home, '.profile'), 'utf8') === 'export PROFILE_ONLY=1\n' &&
+        before.status === 0 && after.status === 0 && before.stdout === '\n' && after.stdout === before.stdout)));
+  }
+
+  const created = installFixture();
+  created.env.PATH = '/usr/bin:/bin';
+  result = created.run('install');
+  const state = path.join(created.live, '.caipira-startup-files.json');
+  const createdRc = path.join(created.home, '.bashrc');
+  check('created regular startup file and ownership path are recorded once', result.code === 0 &&
+    fs.readFileSync(createdRc, 'utf8') === block && JSON.parse(fs.readFileSync(state, 'utf8')).filter(file => file === createdRc).length === 1, result.out);
+  result = created.run('install');
+  check('reinstall never records a startup path twice', result.code === 0 &&
+    JSON.parse(fs.readFileSync(state, 'utf8')).filter(file => file === createdRc).length === 1, result.out);
+  fs.rmSync(state);
+  result = created.run('uninstall');
+  check('missing ownership state keeps a newly empty regular startup file safely', result.code === 0 &&
+    fs.existsSync(createdRc) && fs.readFileSync(createdRc, 'utf8') === '', result.out);
+
+  const unreadable = installFixture();
+  unreadable.env.PATH = '/usr/bin:/bin';
+  result = unreadable.run('install');
+  const unreadableState = path.join(unreadable.live, '.caipira-startup-files.json');
+  const unreadableRc = path.join(unreadable.home, '.bashrc');
+  const context = installerContext(unreadable, {
+    fs: { ...fs, readFileSync: (file, ...args) => {
+      if (path.resolve(file) === unreadableState) throw Object.assign(new Error('simulated unreadable state'), { code: 'EACCES' });
+      return fs.readFileSync(file, ...args);
+    } }
+  });
+  vm.runInContext('unregisterPath()', context);
+  check('unreadable state is treated as empty, keeps the startup file and uninstall continues',
+    fs.existsSync(unreadableRc) && fs.readFileSync(unreadableRc, 'utf8') === '' && fs.existsSync(unreadableState));
+}
+
+function readJsonFor(home, relative) {
+  return JSON.parse(fs.readFileSync(path.join(home, relative), 'utf8'));
+}
+
 async function remainingChecks() {
   console.log('\n7a. automatic PATH startup files and uninstall');
   automaticPathChecks();
   console.log('\n7b. dotfiles symlinks, login selection and startup cleanup');
   startupPreservationChecks();
+  console.log('\n7c. dangling links, stale temporaries and startup ownership');
+  startupRecoveryChecks();
   console.log('\n8. interactive consent and failed deployment recovery');
   for (const [answer, agreed] of [['yes', true], ['', false], ['n', false]]) {
     let prompt = '';

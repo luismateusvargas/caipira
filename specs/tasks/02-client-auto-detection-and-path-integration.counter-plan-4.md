@@ -3,7 +3,7 @@
 Original task spec: [02-client-auto-detection-and-path-integration.md](02-client-auto-detection-and-path-integration.md)
 Reviewed task: [Counter-plan 3, T1–T3](02-client-auto-detection-and-path-integration.counter-plan-3.md)
 Review evidence: independent review, 2026-10-22 (probes below).
-Status: ready
+Status: implemented — pending independent review
 
 Reviewed baseline: `af97713ac8456279da3369b5f6f952977b10ead8`.
 Reviewed completion: `abce83dad1a163c2fc55dc54a4005761827e217a`.
@@ -85,3 +85,15 @@ Every startup-file check must use a fake `HOME`. Completion means V1–V3 are fi
 - Not blockers, recorded for later:
   - **Spec decision:** `doctor` fails a detected client that `--clients` deliberately excluded.
   - **Task 03:** npm's global `caipira` bin and `~/.local/bin/caipira` can shadow each other depending on PATH order.
+
+## Implementation evidence
+
+- Baseline checkpoint: `7a4c9f6253e38d194ec0bd4b5ca401a353c6f9e3`.
+- Changed paths: `install.js`, `test/test-install.js`, `README.md`, and this counter-plan.
+- **W1:** startup `ENOENT`, `ELOOP`, permission and temporary-file race errors are handled through one named recoverable-code list. Install retains the launcher, warns with the manual export line and continues client registration. A dangling link stays silent during uninstall; a loop warns and uninstall continues. Resolving a link never creates its missing target or parent directory.
+- **W2:** startup-target writes unlink a stale `.caipira-tmp` entry before opening it exclusively. A stale symlink is unlinked without touching its referent. The new temporary is closed and removed after failed promotion.
+- **W3:** `.caipira-startup-files.json` in the deployment stores unique absolute paths for startup files absent before a successful install write. Uninstall removes empty regular files only when recorded (plus the existing Caipira-owned fish file), retains unowned empty files and their modes, forgets processed paths atomically, and removes empty state plus its backup. Missing, malformed or unreadable state is treated as empty so it cannot authorize file deletion.
+- The pre-fix installation suite reproduced the reported `ENOENT`, `ELOOP` and `EEXIST` failures; a follow-up full install run after the fixes passed **170 checks, 0 failures**. Focused cases cover registration continuing with `.claude`, silent dangling-link cleanup, loop cleanup, stale regular and symlink temporary entries, no duplicate state paths across reinstalls, the state-file deletion recovery case, and unreadable state.
+- Final verification: `TMPDIR=/var/tmp NODE_PATH=/home/htxzz77/.caipira/node_modules /home/htxzz77/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **999 checks, 0 failures** (20/33/87/100/90/167/**170**/141/191). `sh -n caipira.sh` and `git diff --check` passed.
+- The empty `.bashrc`, `.zshrc` and macOS `.bash_profile` scenarios preserve `0640` modes. With an empty `.bash_profile` shadowing `.profile`, real `bash -lc` has the same empty `PROFILE_ONLY` before and after uninstall. All startup tests use fake HOME directories. Contract-level platform verification was accepted by the user; Windows adapter code is unchanged and its existing mock contract checks pass.
+- No user startup files, client settings or registry entries were modified. No version change, push, release or approval tag was made. Independent review remains pending.

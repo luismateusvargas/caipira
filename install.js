@@ -33,6 +33,8 @@ const PATH_CHANGED_MARKER = 'CAIPIRA_PATH_CHANGED';
 const PATH_BROADCAST_FAILED_MARKER = 'CAIPIRA_PATH_BROADCAST_FAILED';
 const PATH_BLOCK_START = '# >>> caipira PATH >>>';
 const PATH_BLOCK_END = '# <<< caipira PATH <<<';
+const PATH_STARTUP_STATE_FILE = path.join(HOME_DIR, '.caipira-startup-files.json');
+const PATH_STARTUP_RECOVERABLE_CODES = Object.freeze(['EACCES', 'EPERM', 'EROFS', 'ENOENT', 'ELOOP', 'EEXIST']);
 const USER_BIN_DIR = path.join(HOME, '.local', 'bin');
 const USER_LAUNCHER = path.join(USER_BIN_DIR, 'caipira');
 const SHELL_STARTUP_FILES = {
@@ -444,14 +446,45 @@ function readStartupFile(file) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
+/** @param {string} file Startup path. @returns {boolean} Whether its directory entry exists. */
+function startupEntryExists(file) {
+  try { fs.lstatSync(file); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+/** @returns {string[]|null} Saved paths, or null when state cannot be read safely. */
+function readOwnedStartupFiles() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(PATH_STARTUP_STATE_FILE, 'utf8'));
+    if (!Array.isArray(saved)) return null;
+    const candidates = Object.values(SHELL_STARTUP_FILES);
+    return [...new Set(saved.filter(file => typeof file === 'string' && candidates.includes(file)))];
+  // Unreadable or malformed ownership state must never authorize file deletion.
+  } catch (error) { return error.code === 'ENOENT' ? [] : null; }
+}
+
+/** @param {string[]} files Paths of startup files still owned by the installation. */
+function writeOwnedStartupFiles(files) {
+  const candidates = Object.values(SHELL_STARTUP_FILES);
+  const unique = [...new Set(files.filter(file => candidates.includes(file)))].sort();
+  if (unique.length) {
+    writeJsonAtomic(PATH_STARTUP_STATE_FILE, unique);
+    return;
+  }
+  fs.rmSync(PATH_STARTUP_STATE_FILE, { force: true });
+  fs.rmSync(`${PATH_STARTUP_STATE_FILE}.caipira-backup`, { force: true });
+  fs.rmSync(`${PATH_STARTUP_STATE_FILE}.caipira-tmp`, { force: true });
+}
+
 /**
  * Replaces the resolved startup target, keeping dotfiles symlinks and home-side backups.
  * @param {string} file Startup path under HOME.
  * @param {string} text Replacement contents; empty removes a regular startup file.
+ * @param {boolean} [removeEmpty=true] Whether an empty regular target may be removed.
  * @returns {void}
  * @throws {Error} For filesystem failures; callers recover from permission errors.
  */
-function writeStartupFile(file, text) {
+function writeStartupFile(file, text, removeEmpty = true) {
   let entry = null;
   try { entry = fs.lstatSync(file); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -462,9 +495,10 @@ function writeStartupFile(file, text) {
   // Honor target permissions as well, including managed dotfiles stores.
   if (entry) fs.accessSync(target, fs.constants.W_OK);
   // Keep an empty linked target rather than leaving a managed link dangling.
-  if (text === '' && !linked) { fs.unlinkSync(target); return; }
+  if (text === '' && removeEmpty && !linked) { fs.unlinkSync(target); return; }
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const tmp = `${target}.caipira-tmp`;
+  fs.rmSync(tmp, { force: true });
   const fd = fs.openSync(tmp, 'wx', mode ?? 0o666);
   try {
     try { fs.writeFileSync(fd, text, 'utf8'); }
@@ -496,6 +530,7 @@ function registerPath() {
   }
   ok(`launcher installed at ${USER_LAUNCHER}`);
   if ((process.env.PATH || '').split(path.delimiter).some(entry => entry && path.resolve(entry) === USER_BIN_DIR)) return;
+  const ownedStartupFiles = new Set(readOwnedStartupFiles() || []);
   for (const file of shellStartupFiles()) {
     try {
       const original = readStartupFile(file) || '';
@@ -505,11 +540,24 @@ function registerPath() {
         // Prepend when the original lacks a final newline: removal can then
         // restore every original byte without inventing a separator newline.
         const updated = original && !original.endsWith('\n') ? block + original : original + block;
-        writeStartupFile(file, updated);
+        const addedOwnership = !startupEntryExists(file) && !ownedStartupFiles.has(file);
+        if (addedOwnership) {
+          ownedStartupFiles.add(file);
+          writeOwnedStartupFiles([...ownedStartupFiles]);
+        }
+        try { writeStartupFile(file, updated); }
+        catch (error) {
+          if (addedOwnership) {
+            ownedStartupFiles.delete(file);
+            try { writeOwnedStartupFiles([...ownedStartupFiles]); }
+            catch (rollbackError) { journal('restore PATH ownership', rollbackError); }
+          }
+          throw error;
+        }
       }
       ok(`PATH configured in ${file} — open a new terminal`);
     } catch (error) {
-      if (!['EACCES', 'EPERM', 'EROFS'].includes(error.code)) throw error;
+      if (!PATH_STARTUP_RECOVERABLE_CODES.includes(error.code)) throw error;
       warn(`Cannot configure PATH in ${file} (${error.code}); add manually: export PATH="$HOME/.local/bin:$PATH"`);
     }
   }
@@ -521,10 +569,15 @@ function unregisterPath() {
     if (updateWindowsPath(true)) ok(`User PATH entry removed: ${HOME_DIR}`);
     return;
   }
+  const savedStartupFiles = readOwnedStartupFiles();
+  const ownedStartupFiles = new Set(savedStartupFiles || []);
   for (const file of Object.values(SHELL_STARTUP_FILES)) {
     try {
       const original = readStartupFile(file);
-      if (original === null) continue;
+      if (original === null) {
+        forgetOwnedStartupFile(file, ownedStartupFiles);
+        continue;
+      }
       let updated = original, from = 0;
       while ((from = updated.indexOf(PATH_BLOCK_START, from)) !== -1) {
         const end = updated.indexOf(PATH_BLOCK_END, from + PATH_BLOCK_START.length);
@@ -534,14 +587,27 @@ function unregisterPath() {
         else if (updated[after] === '\n') after++;
         updated = updated.slice(0, from) + updated.slice(after);
       }
-      if (updated === original) continue;
-      writeStartupFile(file, updated);
-      ok(`PATH block removed from ${file}`);
+      if (updated !== original) {
+        const removeEmpty = ownedStartupFiles.has(file) || file === SHELL_STARTUP_FILES.fish;
+        writeStartupFile(file, updated, removeEmpty);
+        ok(`PATH block removed from ${file}`);
+      }
+      forgetOwnedStartupFile(file, ownedStartupFiles);
     } catch (error) {
-      if (!['EACCES', 'EPERM', 'EROFS'].includes(error.code)) throw error;
+      if (error.code === 'ENOENT') continue;
+      if (!PATH_STARTUP_RECOVERABLE_CODES.includes(error.code)) throw error;
       warn(`Cannot remove PATH block from ${file} (${error.code}); continuing uninstall`);
     }
   }
+  if (savedStartupFiles !== null && ownedStartupFiles.size === 0) writeOwnedStartupFiles([]);
+}
+
+/** Drops a processed startup path from install's ownership state. */
+function forgetOwnedStartupFile(file, ownedStartupFiles) {
+  if (!ownedStartupFiles.has(file)) return;
+  const remaining = [...ownedStartupFiles].filter(candidate => candidate !== file);
+  writeOwnedStartupFiles(remaining);
+  ownedStartupFiles.delete(file);
 }
 
 function ensureDirectories() {
