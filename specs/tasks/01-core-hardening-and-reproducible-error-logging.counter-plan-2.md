@@ -3,7 +3,7 @@
 Original task spec: [01-core-hardening-and-reproducible-error-logging.md](01-core-hardening-and-reproducible-error-logging.md)
 Reviewed task: [Counter-plan 1, C1–C5](01-core-hardening-and-reproducible-error-logging.counter-plan.md)
 Review evidence: independent review, 2026-10-22 (probes below).
-Status: ready
+Status: implemented — pending independent review
 
 Reviewed baseline: `78f228eb0e67f939341f04ea022936e22387e9fa`.
 Reviewed completion: `12dc6f0ef031ced8b1edef6fb2fa27a08ffc7f8d`.
@@ -60,3 +60,13 @@ Rust and UI checks are not needed. Completion means G1 and G2 are fixed and thes
 ## Blockers
 
 None.
+
+## Implementation evidence
+
+- Baseline checkpoint: `d0c9c09cf5084727392c51225531574f025c5ecf`.
+- D1: the stdout EPIPE handler now uses `process.exit()` to preserve the command's existing exit status. The regression helper pipes into `true` and captures the producer's own `PIPESTATUS`: logs exits 0, corrupt-registry doctor exits 1, stderr stays empty, and the error journal stays unchanged.
+- D2: all three AST entry points initialize `binary` from `opts.bin` alone, allowing `journal()` to resolve the actual candidate when input validation or database preparation fails. The new check unsets `CAIPIRA_AST_BIN`, triggers `SQLITE_NOTADB` in index/update preparation and `invalid_argument` before parsing, and compares each hint with that process's resolved executable (or installed candidate if resolution fails). Existing missing/resolved override tests also pass.
+- Before the four runtime-line corrections, the journal suite reported **18 passed, 2 failed**, reproducing G1 and G2. Afterward it reported **20 passed, 0 failed**.
+- Final verification: `TMPDIR=/var/tmp NODE_PATH=~/.caipira/node_modules ~/.caipira/node22/node-v22.20.0-linux-x64/bin/node test/run-all.js` passed all nine suites: **850 checks, 0 failures** (20/33/87/100/90/167/21/141/191). `git diff --check` passed.
+- Changed implementation/test paths: `install.js`, `ast.js`, and `test/test-errors.js`. No scope deviations. Rust/UI checks were not needed for this correction.
+- Limits: Linux with bundled Node 22 verified; Windows/macOS execution and live runtime deployment remain untested. Independent review remains pending; the implementation checkpoint is not an approval tag.

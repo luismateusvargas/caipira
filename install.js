@@ -15,7 +15,7 @@ const { execFileSync } = require('child_process');
 const { logError, readErrors, DEFAULT_LOG_LIMIT } = require('./errors');
 
 process.stdout.on('error', error => {
-  if (error.code === 'EPIPE') process.exit(0);
+  if (error.code === 'EPIPE') process.exit();
   throw error;
 });
 

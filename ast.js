@@ -213,7 +213,7 @@ function prepareDb(dbFile) {
  * @throws {AstEngineError}
  */
 function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
-  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
+  let binary = opts.bin;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('dbFile', dbFile);
@@ -247,7 +247,7 @@ function syncWorkspaceAst(workspaceRoot, dbFile, opts = {}) {
  *   through a symlink, io when it is missing and was never indexed.
  */
 function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
-  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
+  let binary = opts.bin;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('dbFile', dbFile);
@@ -272,7 +272,7 @@ function updateFileAst(workspaceRoot, dbFile, filePath, opts = {}) {
  * @throws {AstEngineError} invalid_argument for a path through a symlink.
  */
 function parseFileAst(workspaceRoot, filePath, opts = {}) {
-  let binary = opts.bin || process.env.CAIPIRA_AST_BIN || INSTALLED_BIN;
+  let binary = opts.bin;
   try {
     requireText('workspaceRoot', workspaceRoot);
     requireText('filePath', filePath);

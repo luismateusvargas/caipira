@@ -26,6 +26,12 @@ function cliWith(env, ...args) {
   });
 }
 function cli(...args) { return cliWith({}, ...args); }
+function pipeCli(env, ...args) {
+  return spawnSync('/bin/bash', ['-c', '"$@" | true; exit "${PIPESTATUS[0]}"',
+    'pipe-check', process.execPath, path.join(ROOT, 'install.js'), ...args], {
+    encoding: 'utf8', env: { ...process.env, CAIPIRA_HOME: home, ...env }, timeout: 10000
+  });
+}
 
 test('empty journal is empty and creates no directory', () => {
   assert.deepEqual(readErrors(), []);
@@ -162,6 +168,35 @@ test('AST reproduction commands retain a resolved executable and quote spaces an
     }
   }
 });
+test('AST failures before engine resolution name the executable the bridge would resolve', () => {
+  readErrors({ clear: true });
+  const database = path.join(home, 'pre-resolution.db');
+  fs.writeFileSync(database, 'corrupt database');
+  const env = { ...process.env, CAIPIRA_TEST_DATABASE: database };
+  delete env.CAIPIRA_AST_BIN;
+  const child = spawnSync(process.execPath, ['-e', `
+    const ast = require('./ast');
+    let binary;
+    try { binary = ast.resolveBinary(); } catch { binary = ast.INSTALLED_BIN; }
+    process.stdout.write(JSON.stringify({ binary }));
+    for (const operation of [
+      () => ast.syncWorkspaceAst(process.cwd(), process.env.CAIPIRA_TEST_DATABASE),
+      () => ast.updateFileAst(process.cwd(), process.env.CAIPIRA_TEST_DATABASE, 'errors.js'),
+      () => ast.parseFileAst('', 'errors.js')
+    ]) {
+      try { operation(); process.exitCode = 1; }
+      catch (error) { if (!['SQLITE_NOTADB', 'invalid_argument'].includes(error.code)) process.exitCode = 1; }
+    }
+  `], { cwd: ROOT, encoding: 'utf8', env, timeout: 10000 });
+  assert.equal(child.status, 0, child.stderr);
+  const binary = path.resolve(JSON.parse(child.stdout).binary);
+  const quoted = `'${binary.replace(/'/g, "'\\''")}'`;
+  const entries = readErrors();
+  assert.deepEqual(entries.map(entry => [entry.operation, entry.error.code]), [
+    ['parse-file', 'invalid_argument'], ['update-file', 'SQLITE_NOTADB'], ['index', 'SQLITE_NOTADB']
+  ]);
+  for (const entry of entries) assert.ok(entry.repro.startsWith(quoted + ' '), entry.repro);
+});
 test('doctor probes do not create errors for a missing optional AST engine', () => {
   readErrors({ clear: true });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -208,16 +243,26 @@ test('logs defaults to 20 entries and quietly accepts a closed output pipe', () 
   assert.equal(readErrors().length, 20);
   assert.equal(cli('logs').stdout.split('\n').filter(line => line.includes('Reproduce:')).length, 20);
   if (process.platform !== 'win32') {
-    // A real head consumer closes its pipe after one line. The producer's
-    // individual status is saved by bash's PIPESTATUS rather than hidden by head.
-    const child = spawnSync('/bin/bash', ['-c',
-      '"$1" "$2" logs | head -1; exit "${PIPESTATUS[0]}"', 'pipe-check', process.execPath, path.join(ROOT, 'install.js')], {
-      encoding: 'utf8', env: process.env, timeout: 10000
-    });
+    // true closes immediately; PIPESTATUS captures the producer's own status.
+    const child = pipeCli({}, 'logs');
     assert.equal(child.status, 0, child.stderr);
     assert.equal(child.stderr, '');
   }
   assert.equal(readErrors({ limit: 100 }).length, 25);
+});
+test('a closed output pipe preserves doctor failure status without changing the journal', () => {
+  if (process.platform === 'win32') return;
+  const corruptHome = path.join(home, 'piped-corrupt-registry');
+  fs.mkdirSync(path.join(corruptHome, 'database'), { recursive: true });
+  fs.mkdirSync(path.join(corruptHome, 'logs'));
+  fs.writeFileSync(path.join(corruptHome, 'database', 'master.db'), 'corrupt registry');
+  const journal = path.join(corruptHome, 'logs', 'errors.jsonl');
+  const before = JSON.stringify(record('retained error before doctor')) + '\n';
+  fs.writeFileSync(journal, before);
+  const child = pipeCli({ CAIPIRA_HOME: corruptHome }, 'doctor');
+  assert.equal(child.status, 1, child.stderr);
+  assert.equal(child.stderr, '');
+  assert.equal(fs.readFileSync(journal, 'utf8'), before);
 });
 test('installer command failures are journaled without running installation steps', () => {
   readErrors({ clear: true });
